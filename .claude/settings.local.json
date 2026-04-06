@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs -0 ls -1)",
+      "Bash(grep -rn \"def.*/$\\\\|def.*/, \" /e/Code/TexGen-master --include=\"*.py\")",
+      "Bash(find /e/Code/TexGen-master -name \"*.py\" -exec grep -l \"typing\\\\|Type\\\\|Optional\\\\|List\\\\|Dict\\\\|Tuple\" {} \\\\;)",
+      "Bash(grep -rn \"\\\\.pyi$\\\\|__annotations__\" /e/Code/TexGen-master --include=\"*.py\")"
+    ]
+  }
+}

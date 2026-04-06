@@ -1,0 +1,2 @@
+ADD_LIBRARY(LatinHypercube STATIC latin_random.cpp latin_random.hpp)
+SET_TARGET_PROPERTIES(LatinHypercube PROPERTIES POSITION_INDEPENDENT_CODE ON)

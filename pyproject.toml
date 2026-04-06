@@ -1,0 +1,96 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pytexgen"
+version = "1.0.0"
+description = "Python bindings for the TexGen textile geometry modeller"
+readme = "README_pypi.md"
+license = {text = "GPL-2.0-or-later"}
+requires-python = ">=3.7"
+authors = [
+    {name = "TexGen Contributors"},
+]
+keywords = ["textile", "geometry", "weave", "knit", "mesh", "simulation", "FEA"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/TexGen"
+Documentation = "https://texgen.readthedocs.io"
+Repository = "https://github.com/your-org/TexGen"
+Issues = "https://github.com/your-org/TexGen/issues"
+
+# ---------------------------------------------------------------------------
+# scikit-build-core configuration
+# ---------------------------------------------------------------------------
+[tool.scikit-build]
+# CMake configuration
+cmake.build-type = "Release"
+cmake.args = [
+    "-DBUILD_PYTHON_INTERFACE=ON",
+    "-DBUILD_RENDERER=OFF",
+    "-DBUILD_GUI=OFF",
+    "-DBUILD_CASCADE_EXPORT=OFF",
+    "-DBUILD_EXAMPLES=OFF",
+    "-DBUILD_UNIT_TESTS=OFF",
+    "-DBUILD_DOCUMENTATION=OFF",
+    "-DBUILD_PROFILE=OFF",
+    "-DBUILD_SHARED=OFF",
+]
+
+# Tell scikit-build-core where our Python package source is
+wheel.packages = ["src/pytexgen"]
+
+# Minimum CMake version required
+cmake.version = ">=3.17"
+
+# ---------------------------------------------------------------------------
+# cibuildwheel configuration
+# ---------------------------------------------------------------------------
+[tool.cibuildwheel]
+# Build for CPython 3.8 through 3.13
+build = "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*"
+
+# Skip musllinux (Alpine) and 32-bit builds to keep matrix manageable
+skip = "*-musllinux* *-win32 *_i686"
+
+# Test the wheel after building
+test-command = "python -c \"import pytexgen; print('pytexgen', pytexgen.__version__, 'loaded OK')\""
+
+[tool.cibuildwheel.linux]
+# Install SWIG in the manylinux container before building
+before-all = "yum install -y swig || (apt-get update && apt-get install -y swig)"
+archs = ["x86_64", "aarch64"]
+
+# Use manylinux2014 for broader compatibility
+manylinux-x86_64-image = "manylinux2014"
+manylinux-aarch64-image = "manylinux2014"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+# Install SWIG via Homebrew
+before-all = "brew install swig"
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+# SWIG must be available on PATH; install via choco in the CI workflow
+before-all = "choco install swig -y"
