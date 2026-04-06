@@ -34,10 +34,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/TexGen"
-Documentation = "https://texgen.readthedocs.io"
-Repository = "https://github.com/your-org/TexGen"
-Issues = "https://github.com/your-org/TexGen/issues"
+Homepage = "https://github.com/yufangjie1643/pytexgen"
+Documentation = "https://github.com/yufangjie1643/pytexgen#readme"
+Repository = "https://github.com/yufangjie1643/pytexgen"
+Issues = "https://github.com/yufangjie1643/pytexgen/issues"
 
 # ---------------------------------------------------------------------------
 # scikit-build-core configuration
@@ -92,5 +92,4 @@ before-all = "brew install swig"
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
-# SWIG must be available on PATH; install via choco in the CI workflow
-before-all = "choco install swig -y"
+# SWIG must be av
