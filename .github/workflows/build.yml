@@ -29,8 +29,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-13, macos-14, windows-2022]
-        # macos-13 = Intel x86_64
+        os: [ubuntu-22.04, macos-15, macos-14, windows-2022]
+        # macos-15 = Apple Silicon (通过 CIBW_ARCHS 构建 x86_64)
         # macos-14 = Apple Silicon arm64
 
     steps:
@@ -66,23 +66,20 @@ jobs:
       # ── 使用 cibuildwheel 构建 ──
       - uses: pypa/cibuildwheel@v2.21
         env:
-          # macOS: 根据 runner 选择架构
+          # macOS: macos-14 构建 arm64，macos-15 构建 x86_64（交叉编译）
           CIBW_ARCHS_MACOS: ${{ matrix.os == 'macos-14' && 'arm64' || 'x86_64' }}
 
           # Linux: x86_64 + aarch64（通过 QEMU 模拟）
           CIBW_ARCHS_LINUX: "x86_64 aarch64"
 
-          # ── 确保 SWIG 在 cibuildwheel 构建容器内可用 ──
-          # Linux: manylinux 容器内安装 SWIG
+          # ── 在每个 Python 环境构建前通过 pip 安装 swig ──
+          # 这样 swig 会直接装到当前构建用的 Python 环境中，所有平台通用
+          CIBW_BEFORE_BUILD: "pip install swig"
+
+          # Linux: manylinux 容器内也需要系统级 swig 作为后备
           CIBW_BEFORE_ALL_LINUX: >-
             yum install -y swig ||
             (apt-get update && apt-get install -y swig)
-
-          # macOS: 通过 Homebrew 安装
-          CIBW_BEFORE_ALL_MACOS: "brew install swig"
-
-          # Windows: 通过 Chocolatey 安装
-          CIBW_BEFORE_ALL_WINDOWS: "choco install swig -y"
 
       # ── 上传构建产物 ──
       - uses: actions/upload-artifact@v4
