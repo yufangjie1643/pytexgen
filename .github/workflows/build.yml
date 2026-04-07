@@ -1,0 +1,143 @@
+# ============================================================================
+# GitHub Actions: 跨平台构建 pytexgen wheel
+# 使用 cibuildwheel 为 Linux / macOS / Windows 编译 Python wheel 包
+# ============================================================================
+
+name: Build wheels
+
+on:
+  # 推送到 main 分支时触发
+  push:
+    branches: [main, master]
+    tags:
+      - "v*"          # 带版本标签时也触发（用于发布）
+
+  # Pull Request 时触发（仅构建，不上传）
+  pull_request:
+    branches: [main, master]
+
+  # 手动触发
+  workflow_dispatch:
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. 构建 wheel（Linux / macOS / Windows）
+  # ──────────────────────────────────────────────────────────────────────────
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-13, macos-14, windows-2022]
+        # macos-13 = Intel x86_64
+        # macos-14 = Apple Silicon arm64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── QEMU：用于 Linux aarch64 交叉编译 ──
+      - name: Set up QEMU (Linux aarch64)
+        if: runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      # ── 安装 SWIG（宿主机层面）──
+      # cibuildwheel 的 before-all（pyproject.toml）会在容器/环境内再装一次
+      - name: Install SWIG (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y swig
+
+      - name: Install SWIG (macOS)
+        if: runner.os == 'macOS'
+        run: brew install swig
+
+      - name: Install SWIG (Windows)
+        if: runner.os == 'Windows'
+        run: choco install swig -y
+
+      # ── 验证 SWIG 已安装 ──
+      - name: Verify SWIG
+        run: swig -version
+
+      # ── 使用 cibuildwheel 构建 ──
+      - uses: pypa/cibuildwheel@v2.21
+        env:
+          # macOS: 根据 runner 选择架构
+          CIBW_ARCHS_MACOS: ${{ matrix.os == 'macos-14' && 'arm64' || 'x86_64' }}
+
+          # Linux: x86_64 + aarch64（通过 QEMU 模拟）
+          CIBW_ARCHS_LINUX: "x86_64 aarch64"
+
+          # ── 确保 SWIG 在 cibuildwheel 构建容器内可用 ──
+          # Linux: manylinux 容器内安装 SWIG
+          CIBW_BEFORE_ALL_LINUX: >-
+            yum install -y swig ||
+            (apt-get update && apt-get install -y swig)
+
+          # macOS: 通过 Homebrew 安装
+          CIBW_BEFORE_ALL_MACOS: "brew install swig"
+
+          # Windows: 通过 Chocolatey 安装
+          CIBW_BEFORE_ALL_WINDOWS: "choco install swig -y"
+
+      # ── 上传构建产物 ──
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. 构建 sdist 源码包
+  # ──────────────────────────────────────────────────────────────────────────
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build sdist
+        run: pipx run build --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. 上传到 PyPI（仅在打 tag 时触发）
+  # ──────────────────────────────────────────────────────────────────────────
+  upload_pypi:
+    name: Upload to PyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-22.04
+    # 仅在推送版本标签时执行
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    # 使用 GitHub 的 Trusted Publisher（推荐方式）
+    permissions:
+      id-token: write
+
+    # 如果你在 GitHub 配置了 pypi 环境保护规则，取消下面的注释：
+    # environment:
+    #   name: pypi
+    #   url: https://pypi.org/p/pytexgen
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 方式 A：使用 Trusted Publisher（无需 token，推荐）
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+      # 方式 B：使用 API token（如果不用 Trusted Publisher，替换上面的步骤）
+      # - uses: pypa/gh-action-pypi-publish@release/v1
+      #   with:
+      #     password: ${{ secrets.PYPI_API_TOKEN }}
