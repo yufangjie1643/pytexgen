@@ -21,3 +21,15 @@ Thumbs.db
 # Generated SWIG files
 Python/Core_wrap.cxx
 Python/Core.py
+
+# Test output / generated mesh files
+*.inp
+_gpu_test/
+test_output/
+_test_one/
+
+# Python virtual env
+.venv/
+
+# Claude settings
+.claude/

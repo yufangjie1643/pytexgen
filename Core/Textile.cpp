@@ -22,6 +22,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "Domain.h"
 #include "TexGen.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 using namespace TexGen;
 
 #define TOL 1e-10
@@ -440,22 +444,29 @@ void CTextile::GetPointInformation(const vector<XYZ> &Points, vector<POINT_INFO>
 	CDomainPlanes DomainPlanes(Min, Max);
 	vector<CYarn>::iterator itYarn;
 	int iIndex;
+	const int nPoints = static_cast<int>(Points.size());
+	// Warm up each yarn serially: PointInsideYarn lazily triggers
+	// BuildSlaveNodes/BuildSections/BuildSectionMeshes via mutable state,
+	// which is not thread-safe. Force the build once up-front.
+	for (itYarn = m_Yarns.begin(); itYarn != m_Yarns.end(); ++itYarn)
+		itYarn->BuildYarnIfNeeded(CYarn::SURFACE | CYarn::VOLUME | CYarn::LINE);
 	for (itYarn = m_Yarns.begin(), iIndex=0; itYarn != m_Yarns.end(); ++itYarn, ++iIndex)
 	{
 		vector<XYZ> Translations = DomainPlanes.GetTranslations(*itYarn);
-		for (itPoint = Points.begin(), itInfo = PointsInfo.begin(); itPoint != Points.end(); ++itPoint, ++itInfo)
+		CYarn& Yarn = *itYarn;
+		#pragma omp parallel for schedule(dynamic, 256) firstprivate(Translations)
+		for (int i = 0; i < nPoints; ++i)
 		{
-			if (itYarn->PointInsideYarn(*itPoint, Translations, &Info.YarnTangent, 
-				&Info.Location, &Info.dVolumeFraction, &Info.dSurfaceDistance, dTolerance, &Info.Orientation, &Info.Up))
+			POINT_INFO LocalInfo;
+			if (Yarn.PointInsideYarn(Points[i], Translations, &LocalInfo.YarnTangent,
+				&LocalInfo.Location, &LocalInfo.dVolumeFraction, &LocalInfo.dSurfaceDistance, dTolerance, &LocalInfo.Orientation, &LocalInfo.Up))
 			{
-				// If the point is inside several yarns, either because the yarns overlap or because
-				// the tolerance is set too high, the point is assigned the yarn which it lies deepest
-				// within. I.e. the one with the lowest surface distance (note that negative surface
-				// distance represents a point lying below the yarn surface).
-				if (itInfo->iYarnIndex == -1 || Info.dSurfaceDistance < itInfo->dSurfaceDistance)
+				// If the point is inside several yarns, keep the yarn with the lowest
+				// (most negative) surface distance. Each i is written only by this thread.
+				if (PointsInfo[i].iYarnIndex == -1 || LocalInfo.dSurfaceDistance < PointsInfo[i].dSurfaceDistance)
 				{
-					*itInfo = Info;
-					itInfo->iYarnIndex = iIndex;
+					PointsInfo[i] = LocalInfo;
+					PointsInfo[i].iYarnIndex = iIndex;
 				}
 			}
 		}
@@ -495,27 +506,25 @@ void CTextile::GetPointInformation(const vector<XYZ> &Points, vector<POINT_INFO>
 	CDomainPlanes DomainPlanes(Min, Max);
 	vector<CYarn>::iterator itYarn;
 	
+	// Pre-build to avoid concurrent lazy builds inside PointInsideYarn.
+	m_Yarns[iYarn].BuildYarnIfNeeded(CYarn::SURFACE | CYarn::VOLUME | CYarn::LINE);
 	vector<XYZ> Translations = DomainPlanes.GetTranslations(m_Yarns[iYarn]);
-	for (itPoint = Points.begin(), itInfo = PointsInfo.begin(); itPoint != Points.end(); ++itPoint, ++itInfo)
+	CYarn& Yarn = m_Yarns[iYarn];
+	const int nPoints = static_cast<int>(Points.size());
+	#pragma omp parallel for schedule(dynamic, 256) firstprivate(Translations)
+	for (int i = 0; i < nPoints; ++i)
 	{
-		if (m_Yarns[iYarn].PointInsideYarn(*itPoint, Translations, &Info.YarnTangent, 
-			&Info.Location, &Info.dVolumeFraction, &Info.dSurfaceDistance, dTolerance, &Info.Orientation, &Info.Up, bSurface))
+		POINT_INFO LocalInfo;
+		if (Yarn.PointInsideYarn(Points[i], Translations, &LocalInfo.YarnTangent,
+			&LocalInfo.Location, &LocalInfo.dVolumeFraction, &LocalInfo.dSurfaceDistance, dTolerance, &LocalInfo.Orientation, &LocalInfo.Up, bSurface))
 		{
-			// If the point is inside several yarns, either because the yarns overlap or because
-			// the tolerance is set too high, the point is assigned the yarn which it lies deepest
-			// within. I.e. the one with the lowest surface distance (note that negative surface
-			// distance represents a point lying below the yarn surface).
-			if (itInfo->iYarnIndex == -1 )//|| Info.dSurfaceDistance < itInfo->dSurfaceDistance)
+			if (PointsInfo[i].iYarnIndex == -1)
 			{
-				*itInfo = Info;
-				itInfo->iYarnIndex = iYarn;
+				PointsInfo[i] = LocalInfo;
+				PointsInfo[i].iYarnIndex = iYarn;
 			}
 		}
-		else
-		{
-		}
 	}
-	
 }
 
 void CTextile::SavePointInformationToVTK(string Filename, const CMesh &Mesh, double dTolerance)

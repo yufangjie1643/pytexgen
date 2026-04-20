@@ -58,6 +58,11 @@ endif()
 # ============================================================================
 TARGET_LINK_LIBRARIES(TexGenCore triangle triangle-api Octree TinyXML CSparse tetgenlib)
 
+# Link OpenMP if available (parallelizes CTextile::GetPointInformation hot loop)
+IF(OpenMP_CXX_FOUND)
+    TARGET_LINK_LIBRARIES(TexGenCore OpenMP::OpenMP_CXX)
+ENDIF()
+
 TARGET_INCLUDE_DIRECTORIES(TexGenCore PUBLIC ../OctreeRefinement/include)
 
 # ============================================================================
