@@ -282,6 +282,9 @@ The `script/` directory contains ready-to-run examples for shallow-cross
 layer-to-layer textiles and layer-aware RVE exports. The SiC/SiC example uses
 default parameters, exports layer windows from the model domain instead of
 hard-coded absolute z limits, and can read overrides from `@params.json`.
+By default, RVE z windows are cut between neighbouring flat yarn centre planes
+instead of equally splitting the padded domain box. Each RVE can save the
+matching clipped `.tg3` model and Abaqus `.inp` mesh with the same layer label.
 
 Generate the default SiC/SiC shallow-cross straight model and all default RVE
 layers:
@@ -294,6 +297,25 @@ Override parameters with a JSON file:
 
 ```bash
 uv run python script/sic_sic_shallow_cross_straight.py @params.json
+```
+
+Minimal `params.json` example for one `128x128x128` RVE and its matching TG3:
+
+```json
+{
+  "rve_export": {
+    "enabled": true,
+    "save_dir": "Saved_SiC_SiC_Shallow_Cross_Straight/RVE",
+    "file_prefix": "sic_sic_shallow_cross_straight_rve",
+    "layer_count": 5,
+    "layers": [1],
+    "layers_per_rve": 1,
+    "window_mode": "yarn_centres",
+    "save_tg3": true,
+    "mesh_boundary": "CPeriodicBoundaries",
+    "mesh_resolutions": [[128, 128, 128]]
+  }
+}
 ```
 
 Render yarn elements from the latest generated INP file. This defaults to

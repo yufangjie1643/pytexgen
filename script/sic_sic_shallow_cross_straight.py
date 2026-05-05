@@ -125,6 +125,7 @@ DEFAULT_PARAMS = {
         "layers": "all",
         "layers_per_rve": 1,
         "layer_index_base": 0,
+        "window_mode": "yarn_centres",
         "z_padding": 0.0,
         "save_tg3": True,
         "mesh_boundary": "CPeriodicBoundaries",

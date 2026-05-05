@@ -1,8 +1,8 @@
 """Generic layer-aware RVE export helpers for TexGen scripts.
 
 The exporter avoids hard-coded absolute z windows. It first builds an
-unclipped probe textile, reads the model z extent, then maps layer indices to
-z-clip windows for one or more RVE mesh exports.
+unclipped probe textile, reads the model z extent and flat yarn centre planes,
+then maps layer indices to z-clip windows for one or more RVE mesh exports.
 
 Usage:
     Import export_rve_layers(...) from model scripts. For a ready-to-run
@@ -57,6 +57,41 @@ def _normalise_layers(layers, layer_count, layer_index_base=0):
     return normalised
 
 
+def _unique_sorted(values, tolerance=1.0e-6):
+    unique = []
+    for value in sorted(float(item) for item in values):
+        if not unique or abs(value - unique[-1]) > tolerance:
+            unique.append(value)
+    return unique
+
+
+def _collect_yarn_z_levels(weave, tolerance=1.0e-6):
+    flat_centres = []
+    node_levels = []
+    for yarn_index in range(weave.GetNumYarns()):
+        yarn = weave.GetYarn(yarn_index)
+        try:
+            node_count = yarn.GetNumNodes()
+        except AttributeError:
+            continue
+
+        z_values = []
+        for node_index in range(node_count):
+            position = yarn.GetNode(node_index).GetPosition()
+            z_values.append(float(position.z))
+        if not z_values:
+            continue
+
+        node_levels.extend(z_values)
+        if max(z_values) - min(z_values) <= tolerance:
+            flat_centres.append(sum(z_values) / len(z_values))
+
+    return {
+        "flat_yarn_centres": _unique_sorted(flat_centres, tolerance),
+        "node_levels": _unique_sorted(node_levels, tolerance),
+    }
+
+
 def _make_layer_windows(z_min, z_max, layer_count, layers, layers_per_rve=1, padding=0.0):
     step = (float(z_max) - float(z_min)) / int(layer_count)
     windows = []
@@ -80,8 +115,34 @@ def _make_layer_windows(z_min, z_max, layer_count, layers, layers_per_rve=1, pad
     return windows
 
 
+def _make_layer_windows_from_planes(planes, z_min, z_max, layers, layers_per_rve=1, padding=0.0):
+    windows = []
+    for start in layers:
+        end = int(start) + int(layers_per_rve)
+        if end >= len(planes):
+            raise ValueError(
+                f"not enough z planes for layer {start} with layers_per_rve={layers_per_rve}"
+            )
+        clip_min = float(planes[int(start)]) - float(padding)
+        clip_max = float(planes[end]) + float(padding)
+        clip_min = max(float(z_min), clip_min)
+        clip_max = min(float(z_max), clip_max)
+        label = f"L{start:02d}" if end == int(start) + 1 else f"L{start:02d}_L{end - 1:02d}"
+        windows.append(
+            {
+                "label": label,
+                "layer_start": int(start),
+                "layer_end": int(end - 1),
+                "z_clip_min": clip_min,
+                "z_clip_max": clip_max,
+                "z_clip_thickness": clip_max - clip_min,
+            }
+        )
+    return windows
+
+
 def probe_model_domain(create_textile, model_params):
-    """Build an unclipped model once and return its default domain bounds."""
+    """Build an unclipped model once and return default domain and z levels."""
     probe_params = _without_export_keys(model_params)
     weave, result = create_textile(probe_params)
     try:
@@ -89,10 +150,13 @@ def probe_model_domain(create_textile, model_params):
         min_point = XYZ()
         max_point = XYZ()
         domain.GetBoxLimits(min_point, max_point)
+        z_levels = _collect_yarn_z_levels(weave)
         return {
             "min": (float(min_point.x), float(min_point.y), float(min_point.z)),
             "max": (float(max_point.x), float(max_point.y), float(max_point.z)),
             "textile_name": result.get("textile_name"),
+            "flat_yarn_centres": z_levels["flat_yarn_centres"],
+            "node_z_levels": z_levels["node_levels"],
         }
     finally:
         textile_name = result.get("textile_name")
@@ -127,18 +191,41 @@ def resolve_rve_windows(create_textile, model_params, export_config):
     if z_max <= z_min:
         raise ValueError("RVE z extent must have z_max > z_min")
 
-    windows = _make_layer_windows(
-        z_min,
-        z_max,
-        layer_count,
-        layers,
-        layers_per_rve=layers_per_rve,
-        padding=float(export_config.get("z_padding", 0.0)),
+    window_mode = str(export_config.get("window_mode", "yarn_centres")).lower()
+    use_yarn_planes = (
+        z_bounds is None
+        and window_mode in ("auto", "yarn_centres", "yarn_centers", "flat_yarn_centres", "flat_yarn_centers")
+        and len(domain.get("flat_yarn_centres", [])) >= layer_count + 1
     )
+    if use_yarn_planes:
+        z_planes = domain["flat_yarn_centres"][: layer_count + 1]
+        windows = _make_layer_windows_from_planes(
+            z_planes,
+            z_min,
+            z_max,
+            layers,
+            layers_per_rve=layers_per_rve,
+            padding=float(export_config.get("z_padding", 0.0)),
+        )
+        resolved_mode = "yarn_centres"
+    else:
+        windows = _make_layer_windows(
+            z_min,
+            z_max,
+            layer_count,
+            layers,
+            layers_per_rve=layers_per_rve,
+            padding=float(export_config.get("z_padding", 0.0)),
+        )
+        z_planes = None
+        resolved_mode = "domain_equal"
+
     return {
         "domain": domain,
         "layer_count": layer_count,
         "layers_per_rve": layers_per_rve,
+        "window_mode": resolved_mode,
+        "z_planes": z_planes,
         "windows": windows,
     }
 
@@ -214,5 +301,7 @@ def export_rve_layers(create_textile, model_params, export_config):
         "source_domain": resolved["domain"],
         "layer_count": resolved["layer_count"],
         "layers_per_rve": resolved["layers_per_rve"],
+        "window_mode": resolved["window_mode"],
+        "z_planes": resolved["z_planes"],
         "exports": exports,
     }
