@@ -43,9 +43,11 @@ def _normalise_resolution(resolution):
     return value, value, value
 
 
-def _normalise_layers(layers, layer_count, layer_index_base=0):
+def _normalise_layers(layers, layer_count, layer_index_base=0, layers_per_rve=1):
     if layers is None or str(layers).lower() == "all":
         return list(range(layer_count))
+    if isinstance(layers, str) and layers.strip().lower() in ("center", "centre", "central", "middle"):
+        return [max(0, (int(layer_count) - int(layers_per_rve)) // 2)]
     if isinstance(layers, int):
         layers = [layers]
     normalised = []
@@ -171,14 +173,18 @@ def resolve_rve_windows(create_textile, model_params, export_config):
     if layer_count < 1:
         raise ValueError("RVE layer_count must be >= 1")
 
+    layers_per_rve = int(export_config.get("layers_per_rve", 1))
+    if layers_per_rve < 1:
+        raise ValueError("RVE layers_per_rve must be >= 1")
+    if layers_per_rve > layer_count:
+        raise ValueError("RVE layers_per_rve must be <= layer_count")
+
     layers = _normalise_layers(
         export_config.get("layers", "all"),
         layer_count,
         export_config.get("layer_index_base", 0),
+        layers_per_rve=layers_per_rve,
     )
-    layers_per_rve = int(export_config.get("layers_per_rve", 1))
-    if layers_per_rve < 1:
-        raise ValueError("RVE layers_per_rve must be >= 1")
 
     z_bounds = export_config.get("z_bounds")
     if z_bounds is None:

@@ -1,8 +1,8 @@
 {
   "num_x_yarns": 2,
   "num_y_yarns": 4,
-  "z_layers": 1,
-  "binder_depth": 1,
+  "z_layers": 5,
+  "binder_depth": 3,
   "warp_yarn_width": 1.2,
   "weft_yarn_width": 1.5,
   "binder_yarn_width": 0.6,
@@ -51,15 +51,13 @@
   ],
   "save_tg3": true,
   "save_dir": "Saved_SiC_SiC_Shallow_Cross_Straight",
-  "file_prefix": "sic_sic_x4_y2_z1_test",
+  "file_prefix": "sic_sic_x4_y2_z1_center_test",
   "rve_export": {
     "enabled": true,
-    "save_dir": "Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_test",
-    "file_prefix": "sic_sic_x4_y2_z1_test_rve",
-    "layer_count": 1,
-    "layers": [
-      0
-    ],
+    "save_dir": "Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_center_test",
+    "file_prefix": "sic_sic_x4_y2_z1_center_test_rve",
+    "layer_count": 5,
+    "layers": "center",
     "layers_per_rve": 1,
     "window_mode": "yarn_centres",
     "z_padding": 0.0,

@@ -313,7 +313,7 @@ Minimal `params.json` example for one `128x128x128` RVE and its matching TG3:
     "save_dir": "Saved_SiC_SiC_Shallow_Cross_Straight/RVE",
     "file_prefix": "sic_sic_shallow_cross_straight_rve",
     "layer_count": 5,
-    "layers": [1],
+    "layers": "center",
     "layers_per_rve": 1,
     "window_mode": "yarn_centres",
     "save_tg3": true,
@@ -329,19 +329,21 @@ multiple of 2, and `num_y_yarns` is the x-direction yarn count and must be a
 multiple of 4. `rve_export.layer_count` must match `z_layers`.
 
 An alternate x4/y2/z1 layout is committed as
-`script/params_sic_sic_x4_y2_z1_rve.json`. It exports `L00` at `64x32x16`,
-saves the matching clipped TG3 file, and writes output under
-`Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_test`.
+`script/params_sic_sic_x4_y2_z1_rve.json`. The parent model keeps 5 z layers,
+then the RVE export selects one central z window with `"layers": "center"`.
+For 5 layers this exports `L02` at `64x32x16`, saves the matching clipped TG3
+file, and writes output under
+`Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_center_test`.
 
 ```bash
 uv run python script/sic_sic_shallow_cross_straight.py @script/params_sic_sic_x4_y2_z1_rve.json
 ```
 
-Preview the x4/y2/z1 `L00` output:
+Preview the x4/y2/z1 central `L02` output:
 
 ```bash
 pip install plotly
-uv run python script/inp_viewer.py Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_test/sic_sic_x4_y2_z1_test_rve_L00_mesh_64x32x16.inp --backend plotly --output build/rve_x4_y2_z1_L00.html --background white
+uv run python script/inp_viewer.py Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_center_test/sic_sic_x4_y2_z1_center_test_rve_L02_mesh_64x32x16.inp --backend plotly --output build/rve_x4_y2_z1_L02.html --background white
 ```
 
 Render yarn elements from the latest generated INP file. This defaults to
