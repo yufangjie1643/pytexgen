@@ -26,7 +26,7 @@ namespace TexGen
 	#ifndef CLASS_DECLSPEC
 		#ifdef WIN32
 			#pragma warning(disable:4251)
-			#ifdef EXPORT
+			#ifdef TEXGEN_CORE_EXPORTS
 				#define CLASS_DECLSPEC __declspec(dllexport)
 			#else
 				#define CLASS_DECLSPEC __declspec(dllimport)

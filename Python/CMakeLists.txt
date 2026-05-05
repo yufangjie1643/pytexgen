@@ -3,21 +3,24 @@ IF(BUILD_PYTHON_INTERFACE)
     # ========================================================================
     # Find Python - use modern FindPython for scikit-build-core compatibility
     # ========================================================================
-    if(DEFINED SKBUILD)
-        # scikit-build-core already called find_package(Python) in the root
-        # Just use the variables it provides
-        set(PYTHON_INCLUDE_DIRS ${Python_INCLUDE_DIRS})
-        set(PYTHON_LIBRARIES ${Python_LIBRARIES})
-    else()
-        # Legacy mode: use the old FindPythonLibs
-        FIND_PACKAGE(PythonLibs REQUIRED)
-        INCLUDE(FindPythonSitePackages.cmake)
+    if(NOT DEFINED SKBUILD)
+        find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+        if(NOT DEFINED PYTHON_SITEPACKAGES_DIR)
+            execute_process(
+                COMMAND "${Python_EXECUTABLE}" -c "import sysconfig; print(sysconfig.get_paths()['platlib'])"
+                OUTPUT_VARIABLE PYTHON_SITEPACKAGES_DIR
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE TEXGEN_PYTHON_SITEPACKAGES_RESULT)
+            if(NOT TEXGEN_PYTHON_SITEPACKAGES_RESULT EQUAL 0)
+                message(FATAL_ERROR "Failed to query Python site-packages directory")
+            endif()
+        endif()
     endif()
 
     # ========================================================================
     # Include directories
     # ========================================================================
-    INCLUDE_DIRECTORIES(${PYTHON_INCLUDE_DIRS})
+    INCLUDE_DIRECTORIES(${Python_INCLUDE_DIRS})
     INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../OctreeRefinement/include)
 
     # ========================================================================
@@ -111,15 +114,7 @@ IF(BUILD_PYTHON_INTERFACE)
 
     # Link to TexGenCore and Python
     TARGET_LINK_LIBRARIES(_Core TexGenCore)
-    if(DEFINED SKBUILD)
-        # In SKBUILD mode, use the modern Python target
-        TARGET_LINK_LIBRARIES(_Core Python::Module)
-    else()
-        TARGET_LINK_LIBRARIES(_Core optimized ${PYTHON_LIBRARIES})
-        IF(PYTHON_DEBUG_LIBRARIES)
-            TARGET_LINK_LIBRARIES(_Core debug ${PYTHON_DEBUG_LIBRARIES})
-        ENDIF()
-    endif()
+    TARGET_LINK_LIBRARIES(_Core Python::Module)
 
     # ========================================================================
     # Python utility modules list
@@ -232,10 +227,7 @@ IF(BUILD_PYTHON_INTERFACE)
         TARGET_LINK_LIBRARIES(_Renderer
             TexGenRenderer
             ${VTK_LIBRARIES}
-            optimized ${PYTHON_LIBRARIES})
-        IF(PYTHON_DEBUG_LIBRARIES)
-            TARGET_LINK_LIBRARIES(_Renderer debug ${PYTHON_DEBUG_LIBRARIES})
-        ENDIF()
+            Python::Module)
 
         INSTALL(TARGETS _Renderer
             LIBRARY DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
@@ -278,10 +270,7 @@ IF(BUILD_PYTHON_INTERFACE)
 
         TARGET_LINK_LIBRARIES(_Export
             TexGenExport
-            optimized ${PYTHON_LIBRARIES})
-        IF(PYTHON_DEBUG_LIBRARIES)
-            TARGET_LINK_LIBRARIES(_Export debug ${PYTHON_DEBUG_LIBRARIES})
-        ENDIF()
+            Python::Module)
 
         INSTALL(TARGETS _Export
             LIBRARY DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)

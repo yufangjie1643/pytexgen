@@ -150,7 +150,7 @@ bool CSimulationAbaqus::CreateAbaqusInputFile(CTextile &Textile, string Filename
 			m_TextileMesh.InsertMesh(m_YarnMeshes[i]);
 		}
 #ifdef _DEBUG
-		m_YarnMeshes[i].SaveToVTK( "c:\\Program Files\\TexGen\\AdjustedMesh" + stringify(i) );
+		m_YarnMeshes[i].SaveToVTK( "AdjustedMesh" + stringify(i) );
 #endif
 	}
 	

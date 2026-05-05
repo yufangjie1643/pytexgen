@@ -43,7 +43,7 @@ def ImportTexGenv2(filename):
     Returns the name of the textile imported."""
 
     # Open the file
-    File = open(filename, 'r')
+    File = open(filename, 'r', encoding="utf-8", errors="replace")
     # Read the first line
     NumVectors = int(GetNextLine(File))
     # Read the second line
@@ -167,5 +167,6 @@ def ImportTexGenv2(filename):
         Domain = CDomainPlanes(*DomainSize)
         Textile.AssignDomain(Domain)
 
+    File.close()
     return AddTextile(Textile)
 

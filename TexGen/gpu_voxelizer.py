@@ -378,9 +378,10 @@ def _point_in_polygon_batch(points_uv: torch.Tensor,
         query point is inside the polygon.
     """
     torch_mod = _require_torch()
-    poly = polygon[:poly_len]                          # (N, 2)
-    p_next = torch_mod.roll(poly, shifts=-1, dims=0)   # (N, 2)
-    # Broadcast: points (..., 1, 2)  vs edges (N, 2)
+    vertices = polygon[:poly_len]                      # (N, 2), closed
+    poly = vertices[:-1]                               # valid polygon edges
+    p_next = vertices[1:]
+    # Broadcast: points (..., 1, 2)  vs edges (N-1, 2)
     u = points_uv[..., None, 0]                        # (..., 1)
     v = points_uv[..., None, 1]
     x1 = poly[:, 0]; y1 = poly[:, 1]
@@ -611,8 +612,9 @@ def _point_in_polygon_batch_numpy(points_uv: np.ndarray,
     numpy.ndarray
         Boolean array of shape ``(N,)``. ``True`` means the point is inside.
     """
-    poly = polygon[:poly_len]
-    p_next = np.roll(poly, shift=-1, axis=0)
+    vertices = polygon[:poly_len]
+    poly = vertices[:-1]
+    p_next = vertices[1:]
 
     u = points_uv[:, None, 0]
     v = points_uv[:, None, 1]

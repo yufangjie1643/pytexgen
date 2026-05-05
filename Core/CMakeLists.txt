@@ -39,8 +39,8 @@ ENDIF()
 # ============================================================================
 # Symbol visibility: CLASS_DECLSPEC handling
 #
-# In legacy shared-library builds, -DEXPORT makes CLASS_DECLSPEC resolve to
-# __declspec(dllexport) inside TexGenCore, while consumers (without EXPORT
+# In legacy shared-library builds, TEXGEN_CORE_EXPORTS makes CLASS_DECLSPEC resolve to
+# __declspec(dllexport) inside TexGenCore, while consumers (without that define
 # defined) see __declspec(dllimport).  This is correct for DLLs.
 #
 # In SKBUILD (wheel) mode TexGenCore is STATIC, so there must be NO
@@ -50,7 +50,7 @@ ENDIF()
 if(DEFINED SKBUILD)
     target_compile_definitions(TexGenCore PUBLIC "CLASS_DECLSPEC=")
 else()
-    ADD_DEFINITIONS(-DEXPORT)
+    target_compile_definitions(TexGenCore PRIVATE TEXGEN_CORE_EXPORTS)
 endif()
 
 # ============================================================================

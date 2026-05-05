@@ -58,7 +58,7 @@ def SetupBinders( Str ):
 	return NumBinders, Vector
 
 def ImportWeavePattern( Filename ):
-	file = open(Filename,'r')
+	file = open(Filename, 'r', encoding="utf-8", errors="replace")
 	Pattern = CPatternDraft()
 
 	firstLine = True

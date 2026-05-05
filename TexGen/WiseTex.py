@@ -27,7 +27,7 @@ def ImportWiseTex(filename):
     exactly the same.
     Returns the name of the textile imported."""
     # Open file
-    File = open(filename, 'r')
+    File = open(filename, 'r', encoding="utf-8", errors="replace")
 
     # Get cell size
     CellSize = XYZ(*[float(item) for item in File.readline().split()])
@@ -194,4 +194,5 @@ def ImportWiseTex(filename):
     # Add domain to textile
     Textile.AssignDomain(Domain)
 
+    File.close()
     return AddTextile(Textile)

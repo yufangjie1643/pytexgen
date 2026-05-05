@@ -24,7 +24,7 @@ from io import StringIO
 def ExportAnsys(Filename, TextileName):
 	""" Export a textile as an Ansys Parametric Design Language script. """
 	# Open file for writing
-	File = open(Filename, 'w')
+	File = open(Filename, 'w', encoding="utf-8", newline="\n")
 	
 	Textile = GetTextile(TextileName)
 	Domain = Textile.GetDomain()
@@ -59,8 +59,9 @@ def ExportAnsys(Filename, TextileName):
 
 		for Nodes in Yarn.GetSlaveNodes(Yarn.SURFACE):
 			NumSectionPoints = len(Nodes.GetSectionPoints())
-			TopPoints = list(Nodes.GetSectionPoints()[:NumSectionPoints/2])
-			BottomPoints = list(Nodes.GetSectionPoints()[NumSectionPoints/2:])
+			MidPoint = NumSectionPoints // 2
+			TopPoints = list(Nodes.GetSectionPoints()[:MidPoint])
+			BottomPoints = list(Nodes.GetSectionPoints()[MidPoint:])
 
 			LineCommands.write('FLST,3,%d,3\n' % (len(TopPoints)+1))
 			for Point in TopPoints:
@@ -119,6 +120,7 @@ def ExportAnsys(Filename, TextileName):
 	File.write(BooleanCommands.getvalue())
 
 	File.write('FINISH\n')
+	File.close()
 
 if __name__ == '__main__':
 	weave = CTextileWeave2D(2, 2, 1, 0.2, True)

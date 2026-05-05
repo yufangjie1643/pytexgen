@@ -1538,11 +1538,19 @@ bool CYarn::PointInsideYarn(const XYZ &Point, XYZ *pTangent, XY *pLoc, double* p
 
 bool CYarn::PointInsideYarn(const XYZ &Point, const vector<XYZ> &Translations, XYZ *pTangent, XY* pLoc, double *pVolumeFraction, double* pDistanceToSurface, double dTolerance, XYZ *pOrientation, XYZ *pUp, bool bSurface) const
 {
-	// TODO OPTIMISE THIS
+	if (Translations.empty())
+		return false;
+
+	if (!BuildYarnIfNeeded(SURFACE))
+		return false;
+
 	vector<XYZ>::const_iterator itXYZ;
 	for (itXYZ = Translations.begin(); itXYZ != Translations.end(); ++itXYZ)
 	{
-		if (PointInsideYarn(Point - *itXYZ, pTangent, pLoc, pVolumeFraction, pDistanceToSurface, dTolerance, pOrientation, pUp, bSurface))
+		const XYZ LocalPoint = Point - *itXYZ;
+		if (!PointInsideBox(LocalPoint, m_AABB.first, m_AABB.second, dTolerance))
+			continue;
+		if (PointInsideYarn(LocalPoint, pTangent, pLoc, pVolumeFraction, pDistanceToSurface, dTolerance, pOrientation, pUp, bSurface))
 			return true;
 	}
 	return false;

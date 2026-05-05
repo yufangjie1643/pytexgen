@@ -732,7 +732,7 @@ int CGeometrySolver::SolveSystem()
 
 		/*if (m_bDebug && iIteration == 1)
 		{
-			SaveToVTK("c://Program Files//TexGen//GeometrySolver//Initial");
+			SaveToVTK("GeometrySolver_Initial");
 		}*/
 
 		// Solve this sucker with CSparse
@@ -764,7 +764,7 @@ int CGeometrySolver::SolveSystem()
 		if (m_bDebug)
 		{
 			stringstream IterFileName;
-			IterFileName << "c://Program Files//TexGen//GeometrySolver//iter." << setfill('0') << setw(4) << iIteration;
+			IterFileName << "GeometrySolver_iter." << setfill('0') << setw(4) << iIteration;
 			SaveToVTK(IterFileName.str());
 		}
 	} while (iIteration == 1 || iNumSwitches > 0);

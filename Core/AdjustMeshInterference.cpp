@@ -94,7 +94,7 @@ bool CAdjustMeshInterference::AdjustMesh( CTextile &Textile, vector<CMesh> &Yarn
 #ifdef _DEBUG
 			for (int i = 0; i < (int)YarnMeshes.size(); ++i)
 			{
-				YarnMeshes[i].SaveToVTK("c:\\Program Files\\TexGen\\InitialAdjustedMesh" + stringify(i));
+				YarnMeshes[i].SaveToVTK("InitialAdjustedMesh" + stringify(i));
 			}
 #endif
 			if (!AdjustIntersections(YarnMeshes))
@@ -224,7 +224,7 @@ bool CAdjustMeshInterference::AdjustInitialIntersections( vector<CMesh> &YarnMes
 	for ( itMesh = m_IntersectionMeshes.begin(), i=0; itMesh != m_IntersectionMeshes.end(); ++itMesh, ++i )
 	{
 #ifdef _DEBUG		
-		itMesh->SaveToVTK( "c:\\Program Files\\TexGen\\IntersectionMesh" + stringify(i) );
+		itMesh->SaveToVTK( "IntersectionMesh" + stringify(i) );
 #endif
 		itMesh->MergeNodes();
 		itMesh->Convert3Dto2D();
@@ -340,7 +340,7 @@ void CAdjustMeshInterference::AdjustSectionMeshes( CTextile &Textile, vector<CMe
 	// Convert polygon element lists to vectors so that can use indices to access matching elements in original and adjusted meshes
 	
 
-	for ( itMesh = YarnMeshes.begin(), itTempMesh = m_TempYarnMeshes.begin(); itMesh != YarnMeshes.end(), itTempMesh != m_TempYarnMeshes.end(); ++itMesh, ++itTempMesh )
+	for ( itMesh = YarnMeshes.begin(), itTempMesh = m_TempYarnMeshes.begin(); itMesh != YarnMeshes.end() && itTempMesh != m_TempYarnMeshes.end(); ++itMesh, ++itTempMesh )
 	{
 		vector<int> ElementIndices;
 		ElementIndices.clear();

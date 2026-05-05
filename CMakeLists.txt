@@ -15,13 +15,13 @@ endif()
 # ============================================================================
 # Compiler flags
 # ============================================================================
-ADD_DEFINITIONS(-DSWIG_NO_CRT_SECURE_NO_DEPRECATE)
+ADD_COMPILE_DEFINITIONS(SWIG_NO_CRT_SECURE_NO_DEPRECATE)
 IF(MSVC)
-    ADD_DEFINITIONS(-D_CRT_SECURE_NO_DEPRECATE)
+    ADD_COMPILE_DEFINITIONS(_CRT_SECURE_NO_DEPRECATE)
 ENDIF()
 
 IF(UNIX)
-    ADD_DEFINITIONS(-Wno-deprecated)
+    ADD_COMPILE_OPTIONS($<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated>)
     # Ensure all static libs are built with PIC so they can link into shared _Core
     SET(CMAKE_POSITION_INDEPENDENT_CODE ON)
 ENDIF()
@@ -52,27 +52,28 @@ IF(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 ENDIF()
 
 IF(MSVC)
-    # /O2 is MSVC's max speed; /fp:fast relaxes FP for vectorization; /GL enables LTCG
-    SET(CMAKE_CXX_FLAGS_RELEASE "/O2 /Ob2 /Oi /Ot /GL /fp:fast /DNDEBUG"
-        CACHE STRING "Release C++ flags" FORCE)
-    SET(CMAKE_C_FLAGS_RELEASE "/O2 /Ob2 /Oi /Ot /GL /fp:fast /DNDEBUG"
-        CACHE STRING "Release C flags" FORCE)
-    SET(CMAKE_EXE_LINKER_FLAGS_RELEASE "/LTCG" CACHE STRING "" FORCE)
-    SET(CMAKE_SHARED_LINKER_FLAGS_RELEASE "/LTCG" CACHE STRING "" FORCE)
-    SET(CMAKE_STATIC_LINKER_FLAGS_RELEASE "/LTCG" CACHE STRING "" FORCE)
+    # Keep wheel builds fast without replacing user/toolchain defaults.
+    ADD_COMPILE_OPTIONS(
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/Ob2>
+        $<$<CONFIG:Release>:/Oi>
+        $<$<CONFIG:Release>:/Ot>
+        $<$<CONFIG:Release>:/fp:fast>
+    )
+    SET(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 ELSE()
-    SET(_TEXGEN_OPT_FLAGS "-O3 -DNDEBUG -ffast-math -fno-finite-math-only")
+    ADD_COMPILE_OPTIONS(
+        $<$<CONFIG:Release>:-O3>
+        $<$<CONFIG:Release>:-ffast-math>
+        $<$<CONFIG:Release>:-fno-finite-math-only>
+    )
     IF(TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS)
         INCLUDE(CheckCXXCompilerFlag)
         CHECK_CXX_COMPILER_FLAG("-march=native" TEXGEN_HAS_MARCH_NATIVE)
         IF(TEXGEN_HAS_MARCH_NATIVE)
-            SET(_TEXGEN_OPT_FLAGS "${_TEXGEN_OPT_FLAGS} -march=native")
+            ADD_COMPILE_OPTIONS($<$<CONFIG:Release>:-march=native>)
         ENDIF()
     ENDIF()
-    SET(CMAKE_CXX_FLAGS_RELEASE "${_TEXGEN_OPT_FLAGS}"
-        CACHE STRING "Release C++ flags" FORCE)
-    SET(CMAKE_C_FLAGS_RELEASE "${_TEXGEN_OPT_FLAGS}"
-        CACHE STRING "Release C flags" FORCE)
 ENDIF()
 
 # ============================================================================

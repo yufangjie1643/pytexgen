@@ -22,8 +22,13 @@ try:
 except ImportError:
 	from TexGen.Core import *
 import os, shutil
+import subprocess
 from tempfile import mkdtemp
-from glob import glob
+
+def _iter_text_lines(filename):
+	"""Yield lines from a text file and close the handle when iteration ends."""
+	with open(filename, encoding="utf-8", errors="replace") as file:
+		yield from file
 
 class TemporaryDirectoryRedirect(object):
 	'''Class used to change the current working directory to a new temporary
@@ -79,7 +84,6 @@ class TextileDeformerAbaqus(CTextileDeformerVolumeMesh, CSimulationAbaqus):
 		
 		These three are returned as tuple (nodes, elements, elsets)
 		'''
-		file = open(inpFilename)
 		unknownElementTypes = {}
 		elemType = None
 		section = None
@@ -87,7 +91,7 @@ class TextileDeformerAbaqus(CTextileDeformerVolumeMesh, CSimulationAbaqus):
 		elements = {}
 		nodes = {}
 		elsets = {}
-		for line in file:
+		for line in _iter_text_lines(inpFilename):
 			if line.startswith('**'):
 				continue
 			if line.startswith('*'):
@@ -182,12 +186,11 @@ class TextileDeformerAbaqus(CTextileDeformerVolumeMesh, CSimulationAbaqus):
 		nodeOutputStart = True
 		columnHeaders = None
 		nodeCount = 0
-		file = open(datFilename)
 		parseHeader = re.compile(r'[\w\.-]+(?: [\w\.-]+)*')
 		parseNumbers = re.compile(r'[\w\.-]+')
 		nodeDisplacements = {}
 
-		for line in file:
+		for line in _iter_text_lines(datFilename):
 		#	print line,
 #			if not nodeOutputStart:
 #				result = re.search('N O D E   O U T P U T', line)
@@ -303,17 +306,20 @@ class TextileDeformerAbaqus(CTextileDeformerVolumeMesh, CSimulationAbaqus):
 			name = self._simulationFilesPrefix
 		if not self.CreateAbaqusInputFile(textile, name + '.inp', False):
 			raise RuntimeError('Unable to create ABAQUS input file')
-		command = 'abaqus job="%s"' % name
+		command = [shutil.which('abaqus') or 'abaqus', 'job=%s' % name]
 		if fortranProg:
-			command += ' user="%s"' % fortranProg
-		command += ' ask_delete=off -interactive'
-		print('Launching ABAQUS:', command)
-		result = os.system(command)
-		if result == 0:
+			command.append('user=%s' % fortranProg)
+		command.extend(['ask_delete=off', '-interactive'])
+		print('Launching ABAQUS:', subprocess.list2cmdline(command))
+		try:
+			result = subprocess.run(command, check=False)
+		except OSError as exc:
+			raise RuntimeError('Unable to launch ABAQUS: %s' % exc)
+		if result.returncode == 0:
 			print('ABAQUS seems to have completed successfully')
 			self.DeformTextileFromAbaqusResults(textile, name, deformDomain)
 		else:
-			raise RuntimeError('ABAQUS has failed with error code: %d' % result)
+			raise RuntimeError('ABAQUS has failed with error code: %d' % result.returncode)
 
 	def SetFortranProgram(self, filename):
 		self._fortranProgram = filename

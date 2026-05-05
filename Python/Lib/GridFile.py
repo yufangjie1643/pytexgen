@@ -33,9 +33,6 @@ def AverageZComparison(x, y):
 
 def ExportGridFile(Filename, TextileName, NumPoints):
     """ Export a textile as a grid file. """
-    # Open file for writing
-    File = open(Filename, 'w')
-
     # Get the textile
     Textile = GetTextile(TextileName)
 
@@ -44,14 +41,6 @@ def ExportGridFile(Filename, TextileName, NumPoints):
 
     # Get the limits of the domain
     Min, Max = Domain.GetMesh().GetAABB()
-
-    # Write out the grid size
-    File.write('** GRID SIZE: MinX, MinY, MinZ, MaxX, MaxY, MaxZ\n')
-    File.write('%g,\t%g,\t%g,\t%g,\t%g,\t%g\n' % (Min.x, Min.y, Min.z, Max.x, Max.y, Max.z))
-
-    # Write out the divisions
-    File.write('** DIVISIONS: X, Y\n')
-    File.write('%d,\t%d\n' % NumPoints)
 
     # Calculate spacing based on domain size and number of points
     Spacing = [0,0]
@@ -103,34 +92,43 @@ def ExportGridFile(Filename, TextileName, NumPoints):
             else:
                 Intersections.append((i, ZMin, ZMax))
 
-    # Write out the points to file now
-    File.write('** GRID POINTS: NUMVOLUMES { VOLUME NUMBER, BOTTOM Z, TOP Z, DIRECTION (X, Y, Z) }\n')
-    for Intersections, Point in zip(IntersectionsList, Points):
-        # Sort the intersections in ascending order of the average of ZMin and ZMax
-        Intersections.sort(key=lambda item: item[1] + item[2])
-        # Write out the number of volumes
-        File.write(str(1+2*len(Intersections)) + '\n')
-        # Store the Z coordinate of the previous volume
-        PrevZ = Min.z
-        # Output all the volumes
-        for Intersection in Intersections:
-            # Unpack tuple
-            YarnID, ZMin, ZMax = Intersection
-            # Write a domain volume
-            File.write('0,\t%g,\t%g,\t0,\t0,\t0\n' % (PrevZ, ZMin))
-            # Get the yarn associated with the yarn volume
-            Yarn = Textile.GetYarn(YarnID)
-            # Get the midpoint of the yarn volume
-            MidPt = XYZ(Point.x, Point.y, (ZMin+ZMax)/2)
-            # Get the tangent for this point, allow a certain tolerance because we already
-            # know the point inside the yarn we just want to get its tangent
-            Tangent = XYZ()
-            bInside = Yarn.PointInsideYarn(MidPt, TranslationsList[YarnID], Tangent, None, None, None, 0.01)
-            assert bInside
-            # Write a yarn volume with yarn tangent
-            File.write('%d,\t%g,\t%g,\t%g,\t%g,\t%g\n' % (YarnID+1, ZMin, ZMax, Tangent.x, Tangent.y, Tangent.z))
-            # Updated previous Z coordinate
-            PrevZ = ZMax
-        # Write the top domain volume
-        File.write('0,\t%g,\t%g,\t0,\t0,\t0\n' % (PrevZ, Max.z))
+    with open(Filename, 'w', encoding="utf-8", newline="\n") as File:
+        # Write out the grid size
+        File.write('** GRID SIZE: MinX, MinY, MinZ, MaxX, MaxY, MaxZ\n')
+        File.write('%g,\t%g,\t%g,\t%g,\t%g,\t%g\n' % (Min.x, Min.y, Min.z, Max.x, Max.y, Max.z))
+
+        # Write out the divisions
+        File.write('** DIVISIONS: X, Y\n')
+        File.write('%d,\t%d\n' % tuple(NumPoints))
+
+        # Write out the points to file now
+        File.write('** GRID POINTS: NUMVOLUMES { VOLUME NUMBER, BOTTOM Z, TOP Z, DIRECTION (X, Y, Z) }\n')
+        for Intersections, Point in zip(IntersectionsList, Points):
+            # Sort the intersections in ascending order of the average of ZMin and ZMax
+            Intersections.sort(key=lambda item: item[1] + item[2])
+            # Write out the number of volumes
+            File.write(str(1+2*len(Intersections)) + '\n')
+            # Store the Z coordinate of the previous volume
+            PrevZ = Min.z
+            # Output all the volumes
+            for Intersection in Intersections:
+                # Unpack tuple
+                YarnID, ZMin, ZMax = Intersection
+                # Write a domain volume
+                File.write('0,\t%g,\t%g,\t0,\t0,\t0\n' % (PrevZ, ZMin))
+                # Get the yarn associated with the yarn volume
+                Yarn = Textile.GetYarn(YarnID)
+                # Get the midpoint of the yarn volume
+                MidPt = XYZ(Point.x, Point.y, (ZMin+ZMax)/2)
+                # Get the tangent for this point, allow a certain tolerance because we already
+                # know the point inside the yarn we just want to get its tangent
+                Tangent = XYZ()
+                bInside = Yarn.PointInsideYarn(MidPt, TranslationsList[YarnID], Tangent, None, None, None, 0.01)
+                assert bInside
+                # Write a yarn volume with yarn tangent
+                File.write('%d,\t%g,\t%g,\t%g,\t%g,\t%g\n' % (YarnID+1, ZMin, ZMax, Tangent.x, Tangent.y, Tangent.z))
+                # Updated previous Z coordinate
+                PrevZ = ZMax
+            # Write the top domain volume
+            File.write('0,\t%g,\t%g,\t0,\t0,\t0\n' % (PrevZ, Max.z))
 
