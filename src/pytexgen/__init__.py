@@ -18,9 +18,9 @@ except ImportError:  # pragma: no cover - Python < 3.8 compatibility guard
     _dist_version = None
 
 try:
-    __version__ = _dist_version("pytexgen") if _dist_version else "1.0.1"
+    __version__ = _dist_version("pytexgen") if _dist_version else "1.1.0"
 except _PackageNotFoundError:
-    __version__ = "1.0.1"
+    __version__ = "1.1.0"
 
 # Import the SWIG-generated Core module (the compiled C++ bindings)
 # This makes all Core classes/functions available directly on pytexgen,
