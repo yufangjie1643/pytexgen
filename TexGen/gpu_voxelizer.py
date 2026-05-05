@@ -15,6 +15,7 @@ Design goals:
   * Works with any ``CTextile`` subclass (2D/3D/sheared/orthogonal/...).
   * Numpy backend: portable CPU vectorization with no compiler/runtime OpenMP.
   * Adaptive numpy mode: lightweight linear-octree refinement without p4est.
+  * Conservative AABB pruning avoids testing yarns that cannot hit a voxel chunk.
   * Torch backend: optional CUDA, Metal (MPS), or CPU acceleration.
 
 Usage:
@@ -94,6 +95,17 @@ class AdaptiveVoxelCells:
     sizes: np.ndarray      # (E, 3) cell dimensions
     levels: np.ndarray     # (E,) refinement level relative to the base grid
     yarn_id: np.ndarray    # (E,) owning yarn index (-1 = matrix)
+
+
+@dataclass
+class BackendSelection:
+    """Resolved numerical backend settings."""
+    backend: str
+    device: str
+    workers: int
+    np_dtype: Optional[type] = None
+    torch_dtype: Optional[object] = None
+    torch_module: Optional[object] = None
 
 
 def _xyz(v) -> np.ndarray:
@@ -225,6 +237,8 @@ def _pack_yarns(snapshots: List[YarnSnapshot], device, dtype):
     N_len = torch_mod.zeros(num_yarns, device=device, dtype=torch_mod.int32)
     Tr = torch_mod.zeros((num_yarns, K_max, 3), device=device, dtype=dtype)
     K_len = torch_mod.zeros(num_yarns, device=device, dtype=torch_mod.int32)
+    BoundsLo = torch_mod.zeros((num_yarns, K_max, 3), device=device, dtype=dtype)
+    BoundsHi = torch_mod.zeros((num_yarns, K_max, 3), device=device, dtype=dtype)
 
     for i, s in enumerate(snapshots):
         m = s.positions.shape[0]
@@ -239,8 +253,14 @@ def _pack_yarns(snapshots: List[YarnSnapshot], device, dtype):
         k = s.translations.shape[0]
         Tr[i, :k] = torch_mod.from_numpy(s.translations).to(device=device, dtype=dtype)
         K_len[i] = k
+        bounds_lo, bounds_hi = _snapshot_translation_bounds(s)
+        BoundsLo[i, :k] = torch_mod.from_numpy(bounds_lo).to(device=device, dtype=dtype)
+        BoundsHi[i, :k] = torch_mod.from_numpy(bounds_hi).to(device=device, dtype=dtype)
 
-    return dict(P=P, T=T, U=U, S=S, M=M_len, Sec=Sec, N=N_len, Tr=Tr, K=K_len)
+    return dict(
+        P=P, T=T, U=U, S=S, M=M_len, Sec=Sec, N=N_len, Tr=Tr, K=K_len,
+        BoundsLo=BoundsLo, BoundsHi=BoundsHi,
+    )
 
 
 def _point_in_polygon_batch(points_uv: torch.Tensor,
@@ -274,7 +294,8 @@ def _point_in_polygon_batch(points_uv: torch.Tensor,
 
 def _classify_voxels_torch(centers: torch.Tensor,
                            packed: dict,
-                           chunk: int = 65536) -> torch.Tensor:
+                           chunk: int = 65536,
+                           aabb_pruning: bool = True) -> torch.Tensor:
     """For every voxel center, return owning yarn index (-1 = matrix/none).
 
     centers: (V, 3)
@@ -289,6 +310,8 @@ def _classify_voxels_torch(centers: torch.Tensor,
     M_len = packed["M"]
     Sec, N_len = packed["Sec"], packed["N"]
     Tr, K_len = packed["Tr"], packed["K"]
+    BoundsLo = packed.get("BoundsLo")
+    BoundsHi = packed.get("BoundsHi")
     num_yarns = P.shape[0]
 
     # Process voxels in chunks to cap VRAM.
@@ -313,15 +336,25 @@ def _classify_voxels_torch(centers: torch.Tensor,
             for t_idx in range(k):
                 offset = Tr[y_idx, t_idx]               # (3,)
                 Pt = Py + offset                        # (M, 3)
+                active_idx = None
+                active_pts = pts
+                if aabb_pruning and BoundsLo is not None and BoundsHi is not None:
+                    lo = BoundsLo[y_idx, t_idx]
+                    hi = BoundsHi[y_idx, t_idx]
+                    candidate = ((pts >= lo) & (pts <= hi)).all(dim=1)
+                    if not bool(candidate.any().item()):
+                        continue
+                    active_idx = candidate.nonzero(as_tuple=False).flatten()
+                    active_pts = pts[active_idx]
 
                 # Find closest slave node per point: (C, M) distance matrix.
                 # Break into sub-chunks if memory tight.
-                diff = pts[:, None, :] - Pt[None, :, :] # (C, M, 3)
+                diff = active_pts[:, None, :] - Pt[None, :, :] # (C, M, 3)
                 d2 = (diff * diff).sum(-1)              # (C, M)
                 nn = d2.argmin(dim=1)                   # (C,)
 
                 # Project point into local frame of nearest slave node.
-                rel = pts - Pt[nn]                      # (C, 3)
+                rel = active_pts - Pt[nn]               # (C, 3)
                 tan = Ty[nn]
                 up  = Uy[nn]
                 sid = Sy[nn]
@@ -342,9 +375,16 @@ def _classify_voxels_torch(centers: torch.Tensor,
                 # Also penalise large longitudinal offset (out-of-section slab).
                 dist = dist + t_coord.abs() * 0.1
 
-                upd = inside & (dist < best_dist)
-                best_dist = torch_mod.where(upd, dist, best_dist)
-                best_yarn = torch_mod.where(upd, torch_mod.full_like(best_yarn, y_idx), best_yarn)
+                if active_idx is None:
+                    upd = inside & (dist < best_dist)
+                    best_dist = torch_mod.where(upd, dist, best_dist)
+                    best_yarn = torch_mod.where(upd, torch_mod.full_like(best_yarn, y_idx), best_yarn)
+                else:
+                    upd = inside & (dist < best_dist[active_idx])
+                    if bool(upd.any().item()):
+                        target = active_idx[upd]
+                        best_dist[target] = dist[upd]
+                        best_yarn[target] = y_idx
 
         yarn_id[v0:v1] = best_yarn
 
@@ -364,6 +404,26 @@ def _snapshots_as_dtype(snapshots: List[YarnSnapshot], dtype) -> List[YarnSnapsh
         )
         for s in snapshots
     ]
+
+
+def _snapshot_search_radius(snap: YarnSnapshot) -> float:
+    """Conservative radius around slave-node positions for AABB pruning."""
+    section_radius = float(np.sqrt(np.max(np.einsum("ij,ij->i", snap.section, snap.section))))
+    if snap.positions.shape[0] > 1:
+        segment_lengths = np.linalg.norm(np.diff(snap.positions, axis=0), axis=1)
+        segment_margin = float(segment_lengths.max(initial=0.0)) * 0.5
+    else:
+        segment_margin = 0.0
+    return section_radius + segment_margin + 1e-6
+
+
+def _snapshot_translation_bounds(snap: YarnSnapshot) -> Tuple[np.ndarray, np.ndarray]:
+    """Return per-periodic-image conservative AABB for one snapshot."""
+    radius = _snapshot_search_radius(snap)
+    base_lo = snap.positions.min(axis=0) - radius
+    base_hi = snap.positions.max(axis=0) + radius
+    translations = np.asarray(snap.translations, dtype=snap.positions.dtype)
+    return base_lo[None, :] + translations, base_hi[None, :] + translations
 
 
 def _point_in_polygon_batch_numpy(points_uv: np.ndarray,
@@ -389,7 +449,9 @@ def _point_in_polygon_batch_numpy(points_uv: np.ndarray,
 
 
 def _classify_voxel_chunk_numpy(pts: np.ndarray,
-                                snapshots: List[YarnSnapshot]) -> np.ndarray:
+                                snapshots: List[YarnSnapshot],
+                                bounds: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+                                aabb_pruning: bool = True) -> np.ndarray:
     """Classify one contiguous voxel-center chunk."""
     C = pts.shape[0]
     best_dist = np.full(C, np.inf, dtype=pts.dtype)
@@ -402,15 +464,27 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
         Sy = snap.sides
         poly = snap.section
         n = snap.section.shape[0]
+        bounds_lo = bounds_hi = None
+        if aabb_pruning and bounds is not None:
+            bounds_lo, bounds_hi = bounds[y_idx]
 
-        for offset in snap.translations:
+        for t_idx, offset in enumerate(snap.translations):
             Pt = Py + offset
+            active_idx = None
+            active_pts = pts
+            if bounds_lo is not None and bounds_hi is not None:
+                mask = np.all((pts >= bounds_lo[t_idx]) & (pts <= bounds_hi[t_idx]), axis=1)
+                if not np.any(mask):
+                    continue
+                active_idx = np.nonzero(mask)[0]
+                active_pts = pts[active_idx]
 
-            diff = pts[:, None, :] - Pt[None, :, :]
+            local_count = active_pts.shape[0]
+            diff = active_pts[:, None, :] - Pt[None, :, :]
             d2 = np.einsum("cmd,cmd->cm", diff, diff)
             nn = np.argmin(d2, axis=1)
 
-            rel = pts - Pt[nn]
+            rel = active_pts - Pt[nn]
             tan = Ty[nn]
             up = Uy[nn]
             sid = Sy[nn]
@@ -421,11 +495,17 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
             uv = np.stack([u_coord, v_coord], axis=-1)
             inside = _point_in_polygon_batch_numpy(uv, poly, n)
 
-            nearest_d2 = d2[np.arange(C), nn]
+            nearest_d2 = d2[np.arange(local_count), nn]
             dist = np.sqrt(nearest_d2) + np.abs(t_coord) * 0.1
-            update = inside & (dist < best_dist)
-            best_dist[update] = dist[update]
-            best_yarn[update] = y_idx
+            if active_idx is None:
+                update = inside & (dist < best_dist)
+                best_dist[update] = dist[update]
+                best_yarn[update] = y_idx
+            else:
+                update = inside & (dist < best_dist[active_idx])
+                target = active_idx[update]
+                best_dist[target] = dist[update]
+                best_yarn[target] = y_idx
 
     return best_yarn
 
@@ -437,24 +517,28 @@ def _default_numpy_workers() -> int:
 def _classify_voxels_numpy(centers: np.ndarray,
                            snapshots: List[YarnSnapshot],
                            chunk: int = 65536,
-                           workers: Optional[int] = None) -> np.ndarray:
+                           workers: Optional[int] = None,
+                           aabb_pruning: bool = True) -> np.ndarray:
     """For every voxel center, return owning yarn index (-1 = matrix/none)."""
     V = centers.shape[0]
     yarn_id = np.full(V, -1, dtype=np.int32)
     ranges = [(v0, min(v0 + chunk, V)) for v0 in range(0, V, chunk)]
+    bounds_list = [_snapshot_translation_bounds(s) for s in snapshots] if aabb_pruning else None
 
     worker_count = _default_numpy_workers() if workers is None else workers
     if worker_count < 1:
         raise ValueError("workers must be >= 1")
     worker_count = min(worker_count, len(ranges))
 
-    def classify_range(bounds):
-        v0, v1 = bounds
-        return v0, v1, _classify_voxel_chunk_numpy(centers[v0:v1], snapshots)
+    def classify_range(range_bounds):
+        v0, v1 = range_bounds
+        return v0, v1, _classify_voxel_chunk_numpy(
+            centers[v0:v1], snapshots, bounds=bounds_list, aabb_pruning=aabb_pruning
+        )
 
     if worker_count == 1:
-        for bounds in ranges:
-            v0, v1, ids = classify_range(bounds)
+        for range_bounds in ranges:
+            v0, v1, ids = classify_range(range_bounds)
             yarn_id[v0:v1] = ids
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -550,7 +634,8 @@ def _refine_adaptive_cells(lows: np.ndarray,
                            adaptive_levels: int,
                            chunk_voxels: int,
                            workers: Optional[int],
-                           max_adaptive_cells: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                           max_adaptive_cells: int,
+                           aabb_pruning: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Refine cells whose center/corners do not agree on yarn ownership."""
     sample_count = _ADAPTIVE_SAMPLE_OFFSETS.shape[0]
     cell_chunk = max(1, chunk_voxels // sample_count)
@@ -561,7 +646,8 @@ def _refine_adaptive_cells(lows: np.ndarray,
             c1 = min(c0 + cell_chunk, lows.shape[0])
             samples = _cell_sample_points(lows[c0:c1], sizes[c0:c1])
             sample_ids = _classify_voxels_numpy(
-                samples, snapshots, chunk=chunk_voxels, workers=workers
+                samples, snapshots, chunk=chunk_voxels, workers=workers,
+                aabb_pruning=aabb_pruning
             )
             labels = sample_ids.reshape((c1 - c0, sample_count))
             refine_parts.append(np.any(labels != labels[:, :1], axis=1))
@@ -593,10 +679,14 @@ def _classify_adaptive_cells_numpy(lows: np.ndarray,
                                    sizes: np.ndarray,
                                    snapshots: List[YarnSnapshot],
                                    chunk_voxels: int,
-                                   workers: Optional[int]) -> np.ndarray:
+                                   workers: Optional[int],
+                                   aabb_pruning: bool = True) -> np.ndarray:
     """Classify adaptive leaf cells by their centers."""
     centers = lows + sizes * np.asarray(0.5, dtype=sizes.dtype)
-    return _classify_voxels_numpy(centers, snapshots, chunk=chunk_voxels, workers=workers)
+    return _classify_voxels_numpy(
+        centers, snapshots, chunk=chunk_voxels, workers=workers,
+        aabb_pruning=aabb_pruning
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +808,98 @@ def _write_adaptive_inp(path: Path,
 # ---------------------------------------------------------------------------
 
 
+def _validate_voxelizer_args(nx: int, ny: int, nz: int,
+                             backend: str, dtype: str, chunk_voxels: int,
+                             adaptive_levels: int,
+                             max_adaptive_cells: int) -> int:
+    """Validate common public API parameters and return base cell count."""
+    if backend not in {"auto", "numpy", "torch"}:
+        raise ValueError('backend must be one of "auto", "numpy", or "torch"')
+    if dtype not in {"float32", "float64"}:
+        raise ValueError('dtype must be "float32" or "float64"')
+    if min(nx, ny, nz) < 1:
+        raise ValueError("nx, ny, and nz must be >= 1")
+    if chunk_voxels < 1:
+        raise ValueError("chunk_voxels must be >= 1")
+    if adaptive_levels < 0:
+        raise ValueError("adaptive_levels must be >= 0")
+    base_cell_count = nx * ny * nz
+    if max_adaptive_cells < base_cell_count:
+        raise ValueError("max_adaptive_cells must be at least nx*ny*nz")
+    return base_cell_count
+
+
+def _resolve_backend(backend: str,
+                     device: Optional[str],
+                     dtype: str,
+                     workers: Optional[int],
+                     adaptive: bool) -> BackendSelection:
+    """Resolve auto/numpy/torch settings into concrete backend parameters."""
+    if adaptive:
+        if backend == "torch":
+            raise ValueError("adaptive=True currently supports only the numpy backend")
+        if backend == "auto":
+            backend = "numpy"
+
+    torch_mod = torch
+    if backend == "auto":
+        if device is not None:
+            backend = "torch"
+        elif torch_mod is not None:
+            has_cuda = torch_mod.cuda.is_available()
+            has_mps = getattr(torch_mod.backends, "mps", None) and torch_mod.backends.mps.is_available()
+            backend = "torch" if (has_cuda or has_mps) else "numpy"
+        else:
+            backend = "numpy"
+
+    if backend == "torch":
+        torch_mod = _require_torch()
+        if device is None:
+            if torch_mod.cuda.is_available():
+                device = "cuda"
+            elif getattr(torch_mod.backends, "mps", None) and torch_mod.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        torch_dtype = {"float32": torch_mod.float32, "float64": torch_mod.float64}[dtype]
+        return BackendSelection(
+            backend="torch", device=device, workers=1,
+            torch_dtype=torch_dtype, torch_module=torch_mod,
+        )
+
+    workers_used = _default_numpy_workers() if workers is None else workers
+    if workers_used < 1:
+        raise ValueError("workers must be >= 1")
+    np_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
+    return BackendSelection(
+        backend="numpy", device="cpu", workers=workers_used, np_dtype=np_dtype
+    )
+
+
+def _structured_voxel_centers(lo: np.ndarray, hi: np.ndarray,
+                              nx: int, ny: int, nz: int) -> np.ndarray:
+    """Build structured voxel centers in TexGen row-major element order."""
+    dx = (hi[0] - lo[0]) / nx
+    dy = (hi[1] - lo[1]) / ny
+    dz = (hi[2] - lo[2]) / nz
+    xs = lo[0] + (np.arange(nx, dtype=np.float64) + 0.5) * dx
+    ys = lo[1] + (np.arange(ny, dtype=np.float64) + 0.5) * dy
+    zs = lo[2] + (np.arange(nz, dtype=np.float64) + 0.5) * dz
+    gz, gy, gx = np.meshgrid(zs, ys, xs, indexing="ij")  # outer-to-inner: z,y,x
+    return np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
+
+
+def _textile_name(textile: CTextile) -> str:
+    return getattr(textile, "GetName", lambda: "Textile")()
+
+
+def _sync_torch_backend(torch_mod, device: Optional[str]) -> None:
+    if device == "cuda":
+        torch_mod.cuda.synchronize()
+    elif device == "mps" and hasattr(torch_mod, "mps"):
+        torch_mod.mps.synchronize()
+
+
 def voxelize_textile(textile: CTextile,
                      nx: int = 64, ny: int = 64, nz: int = 64,
                      out_inp: str = "out.inp",
@@ -729,7 +911,8 @@ def voxelize_textile(textile: CTextile,
                      verbose: bool = True,
                      adaptive: bool = False,
                      adaptive_levels: int = 1,
-                     max_adaptive_cells: int = 2_000_000) -> dict:
+                     max_adaptive_cells: int = 2_000_000,
+                     aabb_pruning: bool = True) -> dict:
     """Voxelize a built CTextile and write an Abaqus .inp.
 
     Parameters
@@ -763,6 +946,9 @@ def voxelize_textile(textile: CTextile,
         Maximum number of center/corner disagreement refinement passes.
     max_adaptive_cells : int
         Safety cap on generated adaptive leaf cells.
+    aabb_pruning : bool
+        Skip yarn/translation candidates whose conservative bounding boxes do
+        not overlap the current voxel chunk. Enabled by default.
 
     Returns
     -------
@@ -770,55 +956,11 @@ def voxelize_textile(textile: CTextile,
     ``aabb`` (2x3), backend/device, and timing info.
     """
     backend = backend.lower()
-    if backend not in {"auto", "numpy", "torch"}:
-        raise ValueError('backend must be one of "auto", "numpy", or "torch"')
-    if dtype not in {"float32", "float64"}:
-        raise ValueError('dtype must be "float32" or "float64"')
-    if min(nx, ny, nz) < 1:
-        raise ValueError("nx, ny, and nz must be >= 1")
-    if chunk_voxels < 1:
-        raise ValueError("chunk_voxels must be >= 1")
-    if adaptive_levels < 0:
-        raise ValueError("adaptive_levels must be >= 0")
-    base_cell_count = nx * ny * nz
-    if max_adaptive_cells < base_cell_count:
-        raise ValueError("max_adaptive_cells must be at least nx*ny*nz")
-
-    if adaptive:
-        if backend == "torch":
-            raise ValueError("adaptive=True currently supports only the numpy backend")
-        if backend == "auto":
-            backend = "numpy"
-
-    torch_mod = torch
-    if backend == "auto":
-        if device is not None:
-            backend = "torch"
-        elif torch_mod is not None:
-            has_cuda = torch_mod.cuda.is_available()
-            has_mps = getattr(torch_mod.backends, "mps", None) and torch_mod.backends.mps.is_available()
-            backend = "torch" if (has_cuda or has_mps) else "numpy"
-        else:
-            backend = "numpy"
-
-    if backend == "torch":
-        torch_mod = _require_torch()
-        if device is None:
-            if torch_mod.cuda.is_available():
-                device = "cuda"
-            elif getattr(torch_mod.backends, "mps", None) and torch_mod.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        backend_device = device
-        workers_used = 1
-        torch_dtype = {"float32": torch_mod.float32, "float64": torch_mod.float64}[dtype]
-    else:
-        backend_device = "cpu"
-        workers_used = _default_numpy_workers() if workers is None else workers
-        if workers_used < 1:
-            raise ValueError("workers must be >= 1")
-        np_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
+    _validate_voxelizer_args(
+        nx, ny, nz, backend, dtype, chunk_voxels,
+        adaptive_levels, max_adaptive_cells
+    )
+    backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive)
 
     def log(msg):
         if verbose:
@@ -829,7 +971,7 @@ def voxelize_textile(textile: CTextile,
     t_extract = time.perf_counter() - t0
     log(
         f"extracted {len(snapshots)} yarns, AABB={aabb.tolist()}, "
-        f"backend={backend}, workers={workers_used}, {t_extract:.3f}s"
+        f"backend={backend_cfg.backend}, workers={backend_cfg.workers}, {t_extract:.3f}s"
     )
 
     if len(snapshots) == 0:
@@ -839,14 +981,14 @@ def voxelize_textile(textile: CTextile,
 
     if adaptive:
         t0 = time.perf_counter()
-        snapshots_np = _snapshots_as_dtype(snapshots, np_dtype)
-        lows, sizes, levels = _structured_cell_lows_sizes(lo, hi, nx, ny, nz, np_dtype)
+        snapshots_np = _snapshots_as_dtype(snapshots, backend_cfg.np_dtype)
+        lows, sizes, levels = _structured_cell_lows_sizes(lo, hi, nx, ny, nz, backend_cfg.np_dtype)
         t_pack = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         lows, sizes, levels = _refine_adaptive_cells(
             lows, sizes, levels, snapshots_np, adaptive_levels, chunk_voxels,
-            workers_used, max_adaptive_cells
+            backend_cfg.workers, max_adaptive_cells, aabb_pruning=aabb_pruning
         )
         t_refine = time.perf_counter() - t0
         log(
@@ -856,12 +998,13 @@ def voxelize_textile(textile: CTextile,
 
         t0 = time.perf_counter()
         yarn_id = _classify_adaptive_cells_numpy(
-            lows, sizes, snapshots_np, chunk_voxels, workers_used
+            lows, sizes, snapshots_np, chunk_voxels, backend_cfg.workers,
+            aabb_pruning=aabb_pruning
         )
         t_classify = time.perf_counter() - t0
         log(
             f"classified {lows.shape[0]:,} adaptive cells with numpy/"
-            f"{workers_used} workers in {t_classify:.3f}s"
+            f"{backend_cfg.workers} workers in {t_classify:.3f}s"
         )
 
         t0 = time.perf_counter()
@@ -869,7 +1012,7 @@ def voxelize_textile(textile: CTextile,
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cells = AdaptiveVoxelCells(lows=lows, sizes=sizes, levels=levels, yarn_id=yarn_id)
         mesh_counts = _write_adaptive_inp(
-            out_path, cells, textile_name=getattr(textile, "GetName", lambda: "Textile")()
+            out_path, cells, textile_name=_textile_name(textile)
         )
         t_write = time.perf_counter() - t0
         log(
@@ -880,10 +1023,11 @@ def voxelize_textile(textile: CTextile,
         return dict(
             yarn_id=yarn_id,
             aabb=aabb,
-            backend=backend,
-            device=backend_device,
-            workers=workers_used,
+            backend=backend_cfg.backend,
+            device=backend_cfg.device,
+            workers=backend_cfg.workers,
             adaptive=True,
+            aabb_pruning=aabb_pruning,
             levels=levels,
             num_cells=int(lows.shape[0]),
             mesh=mesh_counts,
@@ -893,55 +1037,61 @@ def voxelize_textile(textile: CTextile,
             ),
         )
 
-    # Build voxel centers (row-major: ix varies fastest).
-    dx = (hi[0] - lo[0]) / nx
-    dy = (hi[1] - lo[1]) / ny
-    dz = (hi[2] - lo[2]) / nz
-    xs = lo[0] + (np.arange(nx, dtype=np.float64) + 0.5) * dx
-    ys = lo[1] + (np.arange(ny, dtype=np.float64) + 0.5) * dy
-    zs = lo[2] + (np.arange(nz, dtype=np.float64) + 0.5) * dz
-    gz, gy, gx = np.meshgrid(zs, ys, xs, indexing="ij")  # outer-to-inner: z,y,x
-    centers_np = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
+    centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz)
 
     t0 = time.perf_counter()
-    if backend == "torch":
-        packed = _pack_yarns(snapshots, device=device, dtype=torch_dtype)
-        centers = torch_mod.from_numpy(centers_np).to(device=device, dtype=torch_dtype)
+    if backend_cfg.backend == "torch":
+        torch_mod = backend_cfg.torch_module
+        packed = _pack_yarns(
+            snapshots, device=backend_cfg.device, dtype=backend_cfg.torch_dtype
+        )
+        centers = torch_mod.from_numpy(centers_np).to(
+            device=backend_cfg.device, dtype=backend_cfg.torch_dtype
+        )
         t_pack = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        yarn_id_tensor = _classify_voxels_torch(centers, packed, chunk=chunk_voxels)
-        if device == "cuda":
-            torch_mod.cuda.synchronize()
+        yarn_id_tensor = _classify_voxels_torch(
+            centers, packed, chunk=chunk_voxels, aabb_pruning=aabb_pruning
+        )
+        _sync_torch_backend(torch_mod, backend_cfg.device)
         t_classify = time.perf_counter() - t0
-        log(f"classified {centers.shape[0]:,} voxels with torch/{device} in {t_classify:.3f}s")
+        log(
+            f"classified {centers.shape[0]:,} voxels with torch/"
+            f"{backend_cfg.device} in {t_classify:.3f}s"
+        )
         yarn_id = yarn_id_tensor.detach().cpu().numpy()
     else:
-        snapshots_np = _snapshots_as_dtype(snapshots, np_dtype)
-        centers_np = centers_np.astype(np_dtype, copy=False)
+        snapshots_np = _snapshots_as_dtype(snapshots, backend_cfg.np_dtype)
+        centers_np = centers_np.astype(backend_cfg.np_dtype, copy=False)
         t_pack = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         yarn_id = _classify_voxels_numpy(
-            centers_np, snapshots_np, chunk=chunk_voxels, workers=workers_used
+            centers_np, snapshots_np, chunk=chunk_voxels, workers=backend_cfg.workers,
+            aabb_pruning=aabb_pruning
         )
         t_classify = time.perf_counter() - t0
         log(
             f"classified {centers_np.shape[0]:,} voxels with numpy/"
-            f"{workers_used} workers in {t_classify:.3f}s"
+            f"{backend_cfg.workers} workers in {t_classify:.3f}s"
         )
 
     t0 = time.perf_counter()
     out_path = Path(out_inp)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _write_inp(out_path, lo, hi, nx, ny, nz, yarn_id,
-               textile_name=getattr(textile, "GetName", lambda: "Textile")())
+               textile_name=_textile_name(textile))
     t_write = time.perf_counter() - t0
     log(f"wrote {out_path} ({t_write:.3f}s)")
 
     return dict(
-        yarn_id=yarn_id, aabb=aabb, backend=backend, device=backend_device, workers=workers_used,
-        adaptive=False,
+        yarn_id=yarn_id,
+        aabb=aabb,
+        backend=backend_cfg.backend,
+        device=backend_cfg.device,
+        workers=backend_cfg.workers,
+        adaptive=False, aabb_pruning=aabb_pruning,
         timings=dict(extract=t_extract, pack=t_pack, classify=t_classify, write=t_write),
     )
 

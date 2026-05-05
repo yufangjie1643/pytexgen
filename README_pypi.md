@@ -441,6 +441,7 @@ voxelize_textile(
     out_inp="mesh_numpy.inp",
     backend="numpy",  # or "torch" for CUDA/MPS/torch CPU
     workers=4,        # numpy backend only
+    aabb_pruning=True,
 )
 
 voxelize_textile(
@@ -457,6 +458,13 @@ voxelize_textile(
 writes non-uniform C3D8R cells. It does not generate p4est-style 2:1 balancing or
 hanging-node constraints; use a local p4est-enabled `COctreeVoxelMesh` build when
 those conforming adaptive FEM features are required.
+`aabb_pruning=True` skips yarn/translation candidates whose conservative bounding
+boxes cannot overlap the current voxel chunk. For backend development, run
+`python bench_gpu_voxelizer_backends.py` to compare pruned and unpruned numpy
+classification on a synthetic workload.
+
+See `docs/voxel_backends.md` in the source repository for backend selection,
+adaptive-mode limits, torch/CUDA notes, and the advanced p4est build path.
 
 ### Math Utilities
 
@@ -532,6 +540,11 @@ python -m build
 | `TEXGEN_ENABLE_OPENMP` | OFF | Enable optional C++ OpenMP point-classification loops |
 | `TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS` | OFF | Enable local CPU-specific flags such as `-march=native` |
 | `TEXGEN_REGENERATE_SWIG` | OFF | Regenerate Python bindings from `Python/Core.i` |
+
+`COctreeVoxelMesh` is disabled in default wheel/SKBUILD builds. To expose it,
+provide local p4est/sc libraries and configure a legacy CMake build with
+`-DTEXGEN_REGENERATE_SWIG=ON`; see `docs/voxel_backends.md` in the source
+repository.
 
 ---
 

@@ -111,6 +111,32 @@ class VoxelizerBackendTest(unittest.TestCase):
             self.assertEqual(int((info["yarn_id"] >= 0).sum()), 16)
             self.assertIn("*Element, type=C3D8R", out.read_text())
 
+    def test_aabb_pruning_matches_unpruned_numpy(self):
+        self.patch_extract_snapshots()
+        with tempfile.TemporaryDirectory() as tmp:
+            pruned = self.voxelizer.voxelize_textile(
+                FakeTextile(),
+                nx=6, ny=6, nz=6,
+                out_inp=str(Path(tmp) / "pruned.inp"),
+                backend="numpy",
+                workers=1,
+                chunk_voxels=32,
+                aabb_pruning=True,
+                verbose=False,
+            )
+            unpruned = self.voxelizer.voxelize_textile(
+                FakeTextile(),
+                nx=6, ny=6, nz=6,
+                out_inp=str(Path(tmp) / "unpruned.inp"),
+                backend="numpy",
+                workers=1,
+                chunk_voxels=32,
+                aabb_pruning=False,
+                verbose=False,
+            )
+
+            np.testing.assert_array_equal(pruned["yarn_id"], unpruned["yarn_id"])
+
     def test_numpy_adaptive_public_path(self):
         self.patch_extract_snapshots()
         with tempfile.TemporaryDirectory() as tmp:
