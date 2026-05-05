@@ -6,6 +6,7 @@ numpy, adaptive numpy, and torch when torch is installed.
 """
 
 import importlib.util
+import inspect
 import sys
 import tempfile
 import types
@@ -210,6 +211,13 @@ class VoxelizerBackendTest(unittest.TestCase):
                     adaptive=True,
                     verbose=False,
                 )
+
+    def test_top_level_functions_have_docstrings(self):
+        missing = []
+        for name, obj in inspect.getmembers(self.voxelizer, inspect.isfunction):
+            if obj.__module__ == self.voxelizer.__name__ and not inspect.getdoc(obj):
+                missing.append(name)
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

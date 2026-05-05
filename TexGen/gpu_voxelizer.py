@@ -64,6 +64,18 @@ except AttributeError:
 
 
 def _require_torch():
+    """Return the imported torch module or raise a user-facing install hint.
+
+    Returns
+    -------
+    module
+        The already-imported PyTorch module.
+
+    Raises
+    ------
+    ImportError
+        If PyTorch is not installed and the torch backend was requested.
+    """
     if torch is None:
         raise ImportError(
             'Torch backend requested but PyTorch is not installed. '
@@ -109,15 +121,56 @@ class BackendSelection:
 
 
 def _xyz(v) -> np.ndarray:
+    """Convert a TexGen 3D point/vector object to a float64 array.
+
+    Parameters
+    ----------
+    v : object
+        SWIG object exposing ``x``, ``y`` and ``z`` attributes.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of shape ``(3,)`` with dtype ``float64``.
+    """
     return np.array([v.x, v.y, v.z], dtype=np.float64)
 
 
 def _xy(v) -> np.ndarray:
+    """Convert a TexGen 2D point/vector object to a float64 array.
+
+    Parameters
+    ----------
+    v : object
+        SWIG object exposing ``x`` and ``y`` attributes.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of shape ``(2,)`` with dtype ``float64``.
+    """
     return np.array([v.x, v.y], dtype=np.float64)
 
 
 def _extract_yarn(yarn: CYarn, translations_xyz) -> Optional[YarnSnapshot]:
-    """Pull slave-node frame + 2D section polygon out of a fully-built CYarn."""
+    """Extract one TexGen yarn into array-friendly geometry.
+
+    Parameters
+    ----------
+    yarn : CYarn
+        TexGen yarn object. The function asks TexGen to build line, surface and
+        volume data when the SWIG build exposes ``BuildYarnIfNeeded``.
+    translations_xyz : array-like of shape ``(K, 3)``
+        Periodic image translations for this yarn. The origin translation
+        should be included by the caller when no repeats are present.
+
+    Returns
+    -------
+    YarnSnapshot or None
+        Snapshot containing slave-node frames, section polygon and periodic
+        translations. ``None`` is returned for degenerate yarns with fewer than
+        two slave nodes.
+    """
     # Some SWIG builds do not expose BuildYarnIfNeeded; GetSlaveNodes and
     # section access still trigger/return built geometry for normal textiles.
     build_if_needed = getattr(yarn, "BuildYarnIfNeeded", None)
@@ -184,7 +237,26 @@ def _extract_yarn(yarn: CYarn, translations_xyz) -> Optional[YarnSnapshot]:
 
 
 def extract_snapshots(textile: CTextile) -> Tuple[List[YarnSnapshot], np.ndarray]:
-    """Snapshot all yarns + domain AABB from a built textile."""
+    """Snapshot all yarns and the textile domain bounding box.
+
+    Parameters
+    ----------
+    textile : CTextile
+        Built TexGen textile object with an assigned domain.
+
+    Returns
+    -------
+    snapshots : list of YarnSnapshot
+        One array snapshot per non-degenerate yarn.
+    aabb : numpy.ndarray
+        Domain axis-aligned bounding box with shape ``(2, 3)``. ``aabb[0]`` is
+        the lower corner and ``aabb[1]`` is the upper corner.
+
+    Notes
+    -----
+    Domain translations are pulled from TexGen for each yarn so periodic images
+    are tested by the numpy/torch classifiers.
+    """
     domain = textile.GetDomain()
     # Domain translations are per-yarn (periodic images).
     snapshots: List[YarnSnapshot] = []
@@ -221,7 +293,27 @@ def extract_snapshots(textile: CTextile) -> Tuple[List[YarnSnapshot], np.ndarray
 
 
 def _pack_yarns(snapshots: List[YarnSnapshot], device, dtype):
-    """Pack yarn arrays into padded tensors for torch kernels."""
+    """Pack yarn snapshots into padded torch tensors.
+
+    Parameters
+    ----------
+    snapshots : list of YarnSnapshot
+        Yarn snapshots returned by :func:`extract_snapshots`.
+    device : str or torch.device
+        Torch device used for the packed tensors, for example ``"cuda"`` or
+        ``"cpu"``.
+    dtype : torch.dtype
+        Floating point dtype used for positions, frames and polygons.
+
+    Returns
+    -------
+    dict
+        Padded tensor bundle. Keys ``P``, ``T``, ``U`` and ``S`` store
+        positions, tangents, up vectors and side vectors with shape
+        ``(num_yarns, max_nodes, 3)``. ``Sec`` stores section polygons,
+        ``Tr`` stores translations, and ``BoundsLo``/``BoundsHi`` store
+        per-translation pruning boxes.
+    """
     torch_mod = _require_torch()
     num_yarns = len(snapshots)
     M_max = max(s.positions.shape[0] for s in snapshots)
@@ -266,12 +358,24 @@ def _pack_yarns(snapshots: List[YarnSnapshot], device, dtype):
 def _point_in_polygon_batch(points_uv: torch.Tensor,
                             polygon: torch.Tensor,
                             poly_len: int) -> torch.Tensor:
-    """Ray-casting point-in-polygon test.
+    """Classify torch points against a 2D polygon with ray casting.
 
-    points_uv:  (..., 2)  query points in local (u, v)
-    polygon:    (N_max, 2)
-    poly_len:   int, actual polygon length (N_max >= poly_len)
-    returns:    (...,)  bool
+    Parameters
+    ----------
+    points_uv : torch.Tensor
+        Query points in local section coordinates. Shape is ``(..., 2)`` where
+        the last axis is ``(u, v)``.
+    polygon : torch.Tensor
+        Padded polygon vertex array with shape ``(N_max, 2)``.
+    poly_len : int
+        Number of valid vertices in ``polygon``. The polygon is expected to be
+        closed by repeating the first point.
+
+    Returns
+    -------
+    torch.Tensor
+        Boolean tensor of shape ``points_uv.shape[:-1]``. ``True`` means the
+        query point is inside the polygon.
     """
     torch_mod = _require_torch()
     poly = polygon[:poly_len]                          # (N, 2)
@@ -296,10 +400,26 @@ def _classify_voxels_torch(centers: torch.Tensor,
                            packed: dict,
                            chunk: int = 65536,
                            aabb_pruning: bool = True) -> torch.Tensor:
-    """For every voxel center, return owning yarn index (-1 = matrix/none).
+    """Classify voxel centers with the torch backend.
 
-    centers: (V, 3)
-    returns: (V,) int32 yarn index
+    Parameters
+    ----------
+    centers : torch.Tensor
+        Voxel center coordinates with shape ``(V, 3)``.
+    packed : dict
+        Tensor bundle returned by :func:`_pack_yarns`.
+    chunk : int, default=65536
+        Number of voxel centers processed at once. Increase for faster large
+        GPU runs when memory allows; decrease to reduce VRAM/RAM usage.
+    aabb_pruning : bool, default=True
+        Skip yarn/translation candidates whose conservative bounding boxes
+        cannot contain the current chunk.
+
+    Returns
+    -------
+    torch.Tensor
+        ``int32`` yarn index for each voxel center, shape ``(V,)``. ``-1`` is
+        matrix/background.
     """
     torch_mod = _require_torch()
     device = centers.device
@@ -319,6 +439,8 @@ def _classify_voxels_torch(centers: torch.Tensor,
         v1 = min(v0 + chunk, V)
         pts = centers[v0:v1]                           # (C, 3)
         C = pts.shape[0]
+        chunk_lo = pts.amin(dim=0)
+        chunk_hi = pts.amax(dim=0)
         best_dist = torch_mod.full((C,), float("inf"), device=device)
         best_yarn = torch_mod.full((C,), -1, device=device, dtype=torch_mod.int32)
 
@@ -341,16 +463,21 @@ def _classify_voxels_torch(centers: torch.Tensor,
                 if aabb_pruning and BoundsLo is not None and BoundsHi is not None:
                     lo = BoundsLo[y_idx, t_idx]
                     hi = BoundsHi[y_idx, t_idx]
+                    if bool(((chunk_hi < lo) | (chunk_lo > hi)).any().item()):
+                        continue
                     candidate = ((pts >= lo) & (pts <= hi)).all(dim=1)
                     if not bool(candidate.any().item()):
                         continue
                     active_idx = candidate.nonzero(as_tuple=False).flatten()
                     active_pts = pts[active_idx]
 
-                # Find closest slave node per point: (C, M) distance matrix.
-                # Break into sub-chunks if memory tight.
-                diff = active_pts[:, None, :] - Pt[None, :, :] # (C, M, 3)
-                d2 = (diff * diff).sum(-1)              # (C, M)
+                # Find closest slave node per point without materialising a
+                # (C, M, 3) tensor.
+                d2 = (
+                    active_pts.square().sum(dim=1, keepdim=True)
+                    + Pt.square().sum(dim=1).unsqueeze(0)
+                    - 2.0 * (active_pts @ Pt.transpose(0, 1))
+                ).clamp_min_(0.0)                       # (C, M)
                 nn = d2.argmin(dim=1)                   # (C,)
 
                 # Project point into local frame of nearest slave node.
@@ -392,7 +519,21 @@ def _classify_voxels_torch(centers: torch.Tensor,
 
 
 def _snapshots_as_dtype(snapshots: List[YarnSnapshot], dtype) -> List[YarnSnapshot]:
-    """Return snapshots with arrays cast once for the selected numerical backend."""
+    """Cast snapshot arrays once for a selected backend dtype.
+
+    Parameters
+    ----------
+    snapshots : list of YarnSnapshot
+        Original float64 geometry snapshots.
+    dtype : numpy dtype
+        Target dtype, usually ``np.float32`` or ``np.float64``.
+
+    Returns
+    -------
+    list of YarnSnapshot
+        New snapshot objects whose arrays use ``dtype`` where possible. NumPy
+        may reuse the original arrays when the dtype already matches.
+    """
     return [
         YarnSnapshot(
             positions=s.positions.astype(dtype, copy=False),
@@ -407,7 +548,19 @@ def _snapshots_as_dtype(snapshots: List[YarnSnapshot], dtype) -> List[YarnSnapsh
 
 
 def _snapshot_search_radius(snap: YarnSnapshot) -> float:
-    """Conservative radius around slave-node positions for AABB pruning."""
+    """Estimate a conservative search radius for one yarn snapshot.
+
+    Parameters
+    ----------
+    snap : YarnSnapshot
+        Yarn geometry snapshot.
+
+    Returns
+    -------
+    float
+        Radius used to inflate the slave-node position bounding box. It covers
+        the section polygon radius plus half the longest slave-node segment.
+    """
     section_radius = float(np.sqrt(np.max(np.einsum("ij,ij->i", snap.section, snap.section))))
     if snap.positions.shape[0] > 1:
         segment_lengths = np.linalg.norm(np.diff(snap.positions, axis=0), axis=1)
@@ -418,7 +571,19 @@ def _snapshot_search_radius(snap: YarnSnapshot) -> float:
 
 
 def _snapshot_translation_bounds(snap: YarnSnapshot) -> Tuple[np.ndarray, np.ndarray]:
-    """Return per-periodic-image conservative AABB for one snapshot."""
+    """Build per-translation AABBs for fast candidate pruning.
+
+    Parameters
+    ----------
+    snap : YarnSnapshot
+        Yarn geometry snapshot containing positions and periodic translations.
+
+    Returns
+    -------
+    bounds_lo, bounds_hi : tuple of numpy.ndarray
+        Lower and upper corners with shape ``(K, 3)``, where ``K`` is the number
+        of translations in ``snap.translations``.
+    """
     radius = _snapshot_search_radius(snap)
     base_lo = snap.positions.min(axis=0) - radius
     base_hi = snap.positions.max(axis=0) + radius
@@ -429,7 +594,23 @@ def _snapshot_translation_bounds(snap: YarnSnapshot) -> Tuple[np.ndarray, np.nda
 def _point_in_polygon_batch_numpy(points_uv: np.ndarray,
                                   polygon: np.ndarray,
                                   poly_len: int) -> np.ndarray:
-    """Vectorized ray-casting point-in-polygon test for numpy arrays."""
+    """Classify numpy points against a 2D polygon with ray casting.
+
+    Parameters
+    ----------
+    points_uv : numpy.ndarray
+        Query points in local section coordinates, shape ``(N, 2)``.
+    polygon : numpy.ndarray
+        Polygon vertices with shape ``(M, 2)``. The polygon should be closed by
+        repeating the first point at the end.
+    poly_len : int
+        Number of valid vertices from ``polygon`` to use.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array of shape ``(N,)``. ``True`` means the point is inside.
+    """
     poly = polygon[:poly_len]
     p_next = np.roll(poly, shift=-1, axis=0)
 
@@ -452,10 +633,31 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
                                 snapshots: List[YarnSnapshot],
                                 bounds: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
                                 aabb_pruning: bool = True) -> np.ndarray:
-    """Classify one contiguous voxel-center chunk."""
+    """Classify a contiguous numpy voxel-center chunk.
+
+    Parameters
+    ----------
+    pts : numpy.ndarray
+        Voxel center coordinates for one chunk, shape ``(C, 3)``.
+    snapshots : list of YarnSnapshot
+        Yarn snapshots to test against.
+    bounds : list of tuple of numpy.ndarray, optional
+        Per-yarn bounds returned by :func:`_snapshot_translation_bounds`. Pass
+        ``None`` when AABB pruning is disabled.
+    aabb_pruning : bool, default=True
+        Whether to use the precomputed AABBs before running geometric tests.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``int32`` yarn index for each point in ``pts``. ``-1`` is
+        matrix/background.
+    """
     C = pts.shape[0]
     best_dist = np.full(C, np.inf, dtype=pts.dtype)
     best_yarn = np.full(C, -1, dtype=np.int32)
+    chunk_lo = pts.min(axis=0)
+    chunk_hi = pts.max(axis=0)
 
     for y_idx, snap in enumerate(snapshots):
         Py = snap.positions
@@ -473,15 +675,23 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
             active_idx = None
             active_pts = pts
             if bounds_lo is not None and bounds_hi is not None:
-                mask = np.all((pts >= bounds_lo[t_idx]) & (pts <= bounds_hi[t_idx]), axis=1)
+                lo = bounds_lo[t_idx]
+                hi = bounds_hi[t_idx]
+                if np.any(chunk_hi < lo) or np.any(chunk_lo > hi):
+                    continue
+                mask = np.all((pts >= lo) & (pts <= hi), axis=1)
                 if not np.any(mask):
                     continue
                 active_idx = np.nonzero(mask)[0]
                 active_pts = pts[active_idx]
 
             local_count = active_pts.shape[0]
-            diff = active_pts[:, None, :] - Pt[None, :, :]
-            d2 = np.einsum("cmd,cmd->cm", diff, diff)
+            d2 = (
+                np.einsum("ij,ij->i", active_pts, active_pts)[:, None]
+                + np.einsum("ij,ij->i", Pt, Pt)[None, :]
+                - 2.0 * (active_pts @ Pt.T)
+            )
+            np.maximum(d2, 0.0, out=d2)
             nn = np.argmin(d2, axis=1)
 
             rel = active_pts - Pt[nn]
@@ -511,6 +721,14 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
 
 
 def _default_numpy_workers() -> int:
+    """Return the conservative default number of numpy worker threads.
+
+    Returns
+    -------
+    int
+        Between 1 and 4, capped to avoid oversubscription with BLAS, torch, or
+        host applications embedding TexGen.
+    """
     return max(1, min(os.cpu_count() or 1, 4))
 
 
@@ -519,7 +737,29 @@ def _classify_voxels_numpy(centers: np.ndarray,
                            chunk: int = 65536,
                            workers: Optional[int] = None,
                            aabb_pruning: bool = True) -> np.ndarray:
-    """For every voxel center, return owning yarn index (-1 = matrix/none)."""
+    """Classify all voxel centers with the numpy backend.
+
+    Parameters
+    ----------
+    centers : numpy.ndarray
+        Voxel center coordinates, shape ``(V, 3)``.
+    snapshots : list of YarnSnapshot
+        Yarn snapshots to test.
+    chunk : int, default=65536
+        Number of voxel centers processed per task.
+    workers : int or None, default=None
+        Number of Python worker threads. ``None`` uses
+        :func:`_default_numpy_workers`.
+    aabb_pruning : bool, default=True
+        Skip yarn/translation candidates whose conservative bounding boxes
+        cannot contain the current voxel chunk.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``int32`` yarn index for each center, shape ``(V,)``. ``-1`` is
+        matrix/background.
+    """
     V = centers.shape[0]
     yarn_id = np.full(V, -1, dtype=np.int32)
     ranges = [(v0, min(v0 + chunk, V)) for v0 in range(0, V, chunk)]
@@ -531,6 +771,7 @@ def _classify_voxels_numpy(centers: np.ndarray,
     worker_count = min(worker_count, len(ranges))
 
     def classify_range(range_bounds):
+        """Classify one ``(start, stop)`` center slice for executor.map."""
         v0, v1 = range_bounds
         return v0, v1, _classify_voxel_chunk_numpy(
             centers[v0:v1], snapshots, bounds=bounds_list, aabb_pruning=aabb_pruning
@@ -593,14 +834,41 @@ def _structured_cell_lows_sizes(lo: np.ndarray,
                                 hi: np.ndarray,
                                 nx: int, ny: int, nz: int,
                                 dtype) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Create base-grid cell lower corners, sizes, and level ids."""
+    """Create base-grid adaptive cell arrays.
+
+    Parameters
+    ----------
+    lo, hi : numpy.ndarray
+        Domain lower and upper corners, each shape ``(3,)``.
+    nx, ny, nz : int
+        Base grid resolution.
+    dtype : numpy dtype
+        Floating point dtype for output coordinate arrays.
+
+    Returns
+    -------
+    lows : numpy.ndarray
+        Lower corner of each base cell, shape ``(nx*ny*nz, 3)`` in TexGen
+        element order.
+    sizes : numpy.ndarray
+        Cell dimensions, same shape as ``lows``.
+    levels : numpy.ndarray
+        Refinement level per cell, shape ``(nx*ny*nz,)``. Base cells are level
+        zero.
+    """
     cell_size = ((hi - lo) / np.array([nx, ny, nz], dtype=np.float64)).astype(dtype)
-    xs = lo[0] + np.arange(nx, dtype=np.float64) * cell_size[0]
-    ys = lo[1] + np.arange(ny, dtype=np.float64) * cell_size[1]
-    zs = lo[2] + np.arange(nz, dtype=np.float64) * cell_size[2]
-    gz, gy, gx = np.meshgrid(zs, ys, xs, indexing="ij")
-    lows = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1).astype(dtype, copy=False)
-    sizes = np.broadcast_to(cell_size, lows.shape).copy()
+    xs = np.asarray(lo[0], dtype=dtype) + np.arange(nx, dtype=dtype) * cell_size[0]
+    ys = np.asarray(lo[1], dtype=dtype) + np.arange(ny, dtype=dtype) * cell_size[1]
+    zs = np.asarray(lo[2], dtype=dtype) + np.arange(nz, dtype=dtype) * cell_size[2]
+
+    lows_grid = np.empty((nz, ny, nx, 3), dtype=dtype)
+    lows_grid[..., 0] = xs
+    lows_grid[..., 1] = ys[None, :, None]
+    lows_grid[..., 2] = zs[:, None, None]
+    lows = lows_grid.reshape(-1, 3)
+
+    sizes = np.empty_like(lows)
+    sizes[:] = cell_size
     levels = np.zeros(lows.shape[0], dtype=np.int16)
     return lows, sizes, levels
 
@@ -608,23 +876,48 @@ def _structured_cell_lows_sizes(lo: np.ndarray,
 def _subdivide_cells(lows: np.ndarray,
                      sizes: np.ndarray,
                      levels: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Split each parent hex cell into eight children."""
+    """Split parent hex cells into eight children each.
+
+    Parameters
+    ----------
+    lows, sizes : numpy.ndarray
+        Parent lower corners and dimensions, each shape ``(N, 3)``.
+    levels : numpy.ndarray
+        Parent refinement levels, shape ``(N,)``.
+
+    Returns
+    -------
+    child_lows, child_sizes, child_levels : tuple of numpy.ndarray
+        Child arrays with ``8*N`` rows. Child levels are parent level plus one.
+    """
     offsets = _CHILD_OFFSETS.astype(lows.dtype, copy=False)
     half_sizes = sizes * np.asarray(0.5, dtype=sizes.dtype)
-    child_sizes = np.repeat(half_sizes, 8, axis=0)
-    child_lows = np.repeat(lows, 8, axis=0) + child_sizes * np.tile(offsets, (lows.shape[0], 1))
+    child_lows = (
+        lows[:, None, :] + half_sizes[:, None, :] * offsets[None, :, :]
+    ).reshape(-1, 3)
+    child_sizes = np.broadcast_to(
+        half_sizes[:, None, :], (lows.shape[0], offsets.shape[0], 3)
+    ).reshape(-1, 3).copy()
     child_levels = np.repeat(levels + 1, 8)
     return child_lows, child_sizes, child_levels
 
 
 def _cell_sample_points(lows: np.ndarray, sizes: np.ndarray) -> np.ndarray:
-    """Return center plus corner samples for each cell."""
+    """Return center plus corner samples for adaptive refinement.
+
+    Parameters
+    ----------
+    lows, sizes : numpy.ndarray
+        Cell lower corners and dimensions, each shape ``(N, 3)``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Sample coordinates with shape ``(9*N, 3)``. For each cell, the first
+        sample is the center and the remaining eight samples are corners.
+    """
     offsets = _ADAPTIVE_SAMPLE_OFFSETS.astype(lows.dtype, copy=False)
-    sample_count = offsets.shape[0]
-    return (
-        np.repeat(lows, sample_count, axis=0)
-        + np.repeat(sizes, sample_count, axis=0) * np.tile(offsets, (lows.shape[0], 1))
-    )
+    return (lows[:, None, :] + sizes[:, None, :] * offsets[None, :, :]).reshape(-1, 3)
 
 
 def _refine_adaptive_cells(lows: np.ndarray,
@@ -636,7 +929,30 @@ def _refine_adaptive_cells(lows: np.ndarray,
                            workers: Optional[int],
                            max_adaptive_cells: int,
                            aabb_pruning: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Refine cells whose center/corners do not agree on yarn ownership."""
+    """Refine cells whose center and corner labels disagree.
+
+    Parameters
+    ----------
+    lows, sizes, levels : numpy.ndarray
+        Current leaf-cell arrays.
+    snapshots : list of YarnSnapshot
+        Yarn snapshots used to classify sample points.
+    adaptive_levels : int
+        Maximum number of refinement passes.
+    chunk_voxels : int
+        Maximum sample points classified at once.
+    workers : int or None
+        Numpy classifier worker count.
+    max_adaptive_cells : int
+        Safety cap on generated leaf-cell count.
+    aabb_pruning : bool, default=True
+        Whether to use yarn AABB pruning during sample classification.
+
+    Returns
+    -------
+    lows, sizes, levels : tuple of numpy.ndarray
+        Refined leaf-cell arrays.
+    """
     sample_count = _ADAPTIVE_SAMPLE_OFFSETS.shape[0]
     cell_chunk = max(1, chunk_voxels // sample_count)
 
@@ -681,7 +997,26 @@ def _classify_adaptive_cells_numpy(lows: np.ndarray,
                                    chunk_voxels: int,
                                    workers: Optional[int],
                                    aabb_pruning: bool = True) -> np.ndarray:
-    """Classify adaptive leaf cells by their centers."""
+    """Classify adaptive leaf cells by center point ownership.
+
+    Parameters
+    ----------
+    lows, sizes : numpy.ndarray
+        Leaf-cell lower corners and dimensions, each shape ``(N, 3)``.
+    snapshots : list of YarnSnapshot
+        Yarn snapshots to test.
+    chunk_voxels : int
+        Maximum centers classified at once.
+    workers : int or None
+        Numpy classifier worker count.
+    aabb_pruning : bool, default=True
+        Whether to use yarn AABB pruning.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``int32`` yarn index per cell, shape ``(N,)``.
+    """
     centers = lows + sizes * np.asarray(0.5, dtype=sizes.dtype)
     return _classify_voxels_numpy(
         centers, snapshots, chunk=chunk_voxels, workers=workers,
@@ -696,7 +1031,22 @@ def _classify_adaptive_cells_numpy(lows: np.ndarray,
 
 def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
                textile_name: str = "TexGenPython"):
-    """Write an Abaqus .inp with structured hex mesh + per-element ELSETs."""
+    """Write a structured Abaqus ``.inp`` hex mesh.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Output file path. Parent directories must already exist.
+    lo, hi : array-like of shape ``(3,)``
+        Domain lower and upper corners.
+    nx, ny, nz : int
+        Structured grid resolution.
+    yarn_id : numpy.ndarray
+        ``int32`` yarn index per element, shape ``(nx*ny*nz,)``. ``-1`` is
+        written as the ``Matrix`` element set.
+    textile_name : str, default="TexGenPython"
+        Name written to the Abaqus heading.
+    """
     dx = (hi[0] - lo[0]) / nx
     dy = (hi[1] - lo[1]) / ny
     dz = (hi[2] - lo[2]) / nz
@@ -704,9 +1054,24 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
     nnx, nny, nnz = nx + 1, ny + 1, nz + 1
 
     def nid(ix, iy, iz):
+        """Return the Abaqus node id for integer grid coordinates."""
         return 1 + ix + iy * nnx + iz * nnx * nny
 
-    with open(path, "w") as f:
+    def flush_lines(file_obj, pending):
+        """Write and clear buffered text lines."""
+        if pending:
+            file_obj.writelines(pending)
+            pending.clear()
+
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        lines = []
+
+        def emit(line: str):
+            """Append one line to the local write buffer."""
+            lines.append(line)
+            if len(lines) >= 8192:
+                flush_lines(f, lines)
+
         f.write("*Heading\n")
         f.write(f"TexGen Python voxel mesh: {textile_name}\n")
         f.write("*Preprint, echo=NO, model=NO, history=NO, contact=NO\n")
@@ -717,11 +1082,11 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
                     x = lo[0] + ix * dx
                     y = lo[1] + iy * dy
                     z = lo[2] + iz * dz
-                    f.write(f"{nid(ix,iy,iz)}, {x:.6g}, {y:.6g}, {z:.6g}\n")
+                    emit(f"{nid(ix,iy,iz)}, {x:.6g}, {y:.6g}, {z:.6g}\n")
 
+        flush_lines(f, lines)
         f.write("*Element, type=C3D8R\n")
         eid = 0
-        elems_per_yarn = {}
         for iz in range(nz):
             for iy in range(ny):
                 for ix in range(nx):
@@ -734,18 +1099,20 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
                     n6 = nid(ix+1, iy,   iz+1)
                     n7 = nid(ix+1, iy+1, iz+1)
                     n8 = nid(ix,   iy+1, iz+1)
-                    f.write(f"{eid}, {n1}, {n2}, {n3}, {n4}, {n5}, {n6}, {n7}, {n8}\n")
-                    yidx = int(yarn_id[eid - 1])
-                    elems_per_yarn.setdefault(yidx, []).append(eid)
+                    emit(f"{eid}, {n1}, {n2}, {n3}, {n4}, {n5}, {n6}, {n7}, {n8}\n")
 
-        # ELSETs per yarn (including -1 = matrix).
-        for yidx, ids in elems_per_yarn.items():
+        flush_lines(f, lines)
+        # ELSETs per yarn (including -1 = matrix). Avoid storing Python int
+        # lists for every element; scan the compact numpy yarn_id array instead.
+        for yidx in np.unique(yarn_id):
+            ids = np.nonzero(yarn_id == yidx)[0] + 1
             name = "Matrix" if yidx < 0 else f"Yarn{yidx}"
             f.write(f"*Elset, elset={name}\n")
             # Abaqus: 16 ids per line.
             for i in range(0, len(ids), 16):
-                f.write(", ".join(str(e) for e in ids[i:i+16]) + ",\n")
+                emit(", ".join(str(int(e)) for e in ids[i:i+16]) + ",\n")
 
+        flush_lines(f, lines)
         f.write("*End Part\n*Assembly, name=Assembly\n")
         f.write("*Instance, name=TexGenInstance, part=TexGenPart\n*End Instance\n")
         f.write("*End Assembly\n")
@@ -754,26 +1121,58 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
 def _write_adaptive_inp(path: Path,
                         cells: AdaptiveVoxelCells,
                         textile_name: str = "TexGenAdaptivePython") -> dict:
-    """Write non-uniform adaptive hex cells as an Abaqus input deck."""
+    """Write adaptive non-uniform hex cells as an Abaqus input deck.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Output file path. Parent directories must already exist.
+    cells : AdaptiveVoxelCells
+        Leaf-cell geometry and yarn ownership arrays.
+    textile_name : str, default="TexGenAdaptivePython"
+        Name written to the Abaqus heading.
+
+    Returns
+    -------
+    dict
+        Mesh counts with keys ``"nodes"`` and ``"elements"``.
+
+    Notes
+    -----
+    Nodes are deduplicated by rounded coordinates. This keeps adjacent adaptive
+    cells connected when their corner coordinates match.
+    """
     node_offsets = _HEX_NODE_OFFSETS.astype(cells.lows.dtype, copy=False)
     node_ids = {}
     node_coords = []
-    elem_nodes = []
+
+    def node_key(coord: np.ndarray) -> tuple:
+        """Return a hashable rounded coordinate key for node deduplication."""
+        return tuple(np.round(coord.astype(np.float64, copy=False), 12))
 
     for low, size in zip(cells.lows, cells.sizes):
-        conn = []
         for offset in node_offsets:
             coord = low + size * offset
-            key = tuple(np.round(coord.astype(np.float64), 12))
-            node_id = node_ids.get(key)
-            if node_id is None:
-                node_id = len(node_coords) + 1
-                node_ids[key] = node_id
+            key = node_key(coord)
+            if key not in node_ids:
+                node_ids[key] = len(node_coords) + 1
                 node_coords.append(coord.astype(np.float64, copy=False))
-            conn.append(node_id)
-        elem_nodes.append(conn)
 
-    with open(path, "w") as f:
+    def flush_lines(file_obj, pending):
+        """Write and clear buffered text lines."""
+        if pending:
+            file_obj.writelines(pending)
+            pending.clear()
+
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        lines = []
+
+        def emit(line: str):
+            """Append one line to the local write buffer."""
+            lines.append(line)
+            if len(lines) >= 8192:
+                flush_lines(f, lines)
+
         f.write("*Heading\n")
         f.write(f"TexGen Python adaptive voxel mesh: {textile_name}\n")
         f.write("** Lightweight linear-octree mesh generated by numpy backend.\n")
@@ -781,26 +1180,30 @@ def _write_adaptive_inp(path: Path,
         f.write("*Preprint, echo=NO, model=NO, history=NO, contact=NO\n")
         f.write("**\n*Part, name=TexGenPart\n*Node\n")
         for node_id, coord in enumerate(node_coords, start=1):
-            f.write(f"{node_id}, {coord[0]:.6g}, {coord[1]:.6g}, {coord[2]:.6g}\n")
+            emit(f"{node_id}, {coord[0]:.6g}, {coord[1]:.6g}, {coord[2]:.6g}\n")
 
+        flush_lines(f, lines)
         f.write("*Element, type=C3D8R\n")
-        elems_per_yarn = {}
-        for elem_id, conn in enumerate(elem_nodes, start=1):
-            f.write(f"{elem_id}, " + ", ".join(str(node_id) for node_id in conn) + "\n")
-            yidx = int(cells.yarn_id[elem_id - 1])
-            elems_per_yarn.setdefault(yidx, []).append(elem_id)
+        for elem_id, (low, size) in enumerate(zip(cells.lows, cells.sizes), start=1):
+            conn = []
+            for offset in node_offsets:
+                conn.append(node_ids[node_key(low + size * offset)])
+            emit(f"{elem_id}, " + ", ".join(str(node_id) for node_id in conn) + "\n")
 
-        for yidx, ids in elems_per_yarn.items():
+        flush_lines(f, lines)
+        for yidx in np.unique(cells.yarn_id):
+            ids = np.nonzero(cells.yarn_id == yidx)[0] + 1
             name = "Matrix" if yidx < 0 else f"Yarn{yidx}"
             f.write(f"*Elset, elset={name}\n")
             for i in range(0, len(ids), 16):
-                f.write(", ".join(str(e) for e in ids[i:i+16]) + ",\n")
+                emit(", ".join(str(int(e)) for e in ids[i:i+16]) + ",\n")
 
+        flush_lines(f, lines)
         f.write("*End Part\n*Assembly, name=Assembly\n")
         f.write("*Instance, name=TexGenInstance, part=TexGenPart\n*End Instance\n")
         f.write("*End Assembly\n")
 
-    return dict(nodes=len(node_coords), elements=len(elem_nodes))
+    return dict(nodes=len(node_coords), elements=int(cells.lows.shape[0]))
 
 
 # ---------------------------------------------------------------------------
@@ -812,7 +1215,33 @@ def _validate_voxelizer_args(nx: int, ny: int, nz: int,
                              backend: str, dtype: str, chunk_voxels: int,
                              adaptive_levels: int,
                              max_adaptive_cells: int) -> int:
-    """Validate common public API parameters and return base cell count."""
+    """Validate public voxelizer arguments.
+
+    Parameters
+    ----------
+    nx, ny, nz : int
+        Structured base-grid resolution.
+    backend : str
+        Requested backend name: ``"auto"``, ``"numpy"`` or ``"torch"``.
+    dtype : str
+        Requested floating dtype: ``"float32"`` or ``"float64"``.
+    chunk_voxels : int
+        Number of voxels processed per classifier chunk.
+    adaptive_levels : int
+        Number of adaptive refinement passes.
+    max_adaptive_cells : int
+        Maximum allowed adaptive leaf cells.
+
+    Returns
+    -------
+    int
+        Base cell count ``nx*ny*nz``.
+
+    Raises
+    ------
+    ValueError
+        If any argument is outside the accepted range.
+    """
     if backend not in {"auto", "numpy", "torch"}:
         raise ValueError('backend must be one of "auto", "numpy", or "torch"')
     if dtype not in {"float32", "float64"}:
@@ -834,7 +1263,27 @@ def _resolve_backend(backend: str,
                      dtype: str,
                      workers: Optional[int],
                      adaptive: bool) -> BackendSelection:
-    """Resolve auto/numpy/torch settings into concrete backend parameters."""
+    """Resolve user backend options into concrete execution settings.
+
+    Parameters
+    ----------
+    backend : {"auto", "numpy", "torch"}
+        Requested backend.
+    device : str or None
+        Requested torch device. ``None`` allows automatic selection.
+    dtype : {"float32", "float64"}
+        Numerical precision.
+    workers : int or None
+        Requested numpy worker count. Ignored by torch.
+    adaptive : bool
+        Whether adaptive voxelization is active. Adaptive mode currently forces
+        numpy.
+
+    Returns
+    -------
+    BackendSelection
+        Concrete backend/device/dtype/worker configuration.
+    """
     if adaptive:
         if backend == "torch":
             raise ValueError("adaptive=True currently supports only the numpy backend")
@@ -877,23 +1326,65 @@ def _resolve_backend(backend: str,
 
 
 def _structured_voxel_centers(lo: np.ndarray, hi: np.ndarray,
-                              nx: int, ny: int, nz: int) -> np.ndarray:
-    """Build structured voxel centers in TexGen row-major element order."""
+                              nx: int, ny: int, nz: int,
+                              dtype=np.float64) -> np.ndarray:
+    """Build structured voxel centers in TexGen element order.
+
+    Parameters
+    ----------
+    lo, hi : numpy.ndarray
+        Domain lower and upper corners, each shape ``(3,)``.
+    nx, ny, nz : int
+        Structured grid resolution.
+    dtype : numpy dtype, default=np.float64
+        Output dtype.
+
+    Returns
+    -------
+    numpy.ndarray
+        Voxel centers with shape ``(nx*ny*nz, 3)``. Flattening order is
+        ``ix + iy*nx + iz*nx*ny``, matching Abaqus element output.
+    """
     dx = (hi[0] - lo[0]) / nx
     dy = (hi[1] - lo[1]) / ny
     dz = (hi[2] - lo[2]) / nz
-    xs = lo[0] + (np.arange(nx, dtype=np.float64) + 0.5) * dx
-    ys = lo[1] + (np.arange(ny, dtype=np.float64) + 0.5) * dy
-    zs = lo[2] + (np.arange(nz, dtype=np.float64) + 0.5) * dz
-    gz, gy, gx = np.meshgrid(zs, ys, xs, indexing="ij")  # outer-to-inner: z,y,x
-    return np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
+    xs = np.asarray(lo[0], dtype=dtype) + (np.arange(nx, dtype=dtype) + 0.5) * np.asarray(dx, dtype=dtype)
+    ys = np.asarray(lo[1], dtype=dtype) + (np.arange(ny, dtype=dtype) + 0.5) * np.asarray(dy, dtype=dtype)
+    zs = np.asarray(lo[2], dtype=dtype) + (np.arange(nz, dtype=dtype) + 0.5) * np.asarray(dz, dtype=dtype)
+
+    centers = np.empty((nz, ny, nx, 3), dtype=dtype)
+    centers[..., 0] = xs
+    centers[..., 1] = ys[None, :, None]
+    centers[..., 2] = zs[:, None, None]
+    return centers.reshape(-1, 3)  # outer-to-inner: z,y,x
 
 
 def _textile_name(textile: CTextile) -> str:
+    """Return a safe display name for a TexGen textile.
+
+    Parameters
+    ----------
+    textile : CTextile
+        TexGen textile object.
+
+    Returns
+    -------
+    str
+        ``textile.GetName()`` when available, otherwise ``"Textile"``.
+    """
     return getattr(textile, "GetName", lambda: "Textile")()
 
 
 def _sync_torch_backend(torch_mod, device: Optional[str]) -> None:
+    """Synchronize asynchronous torch devices before timing or copying results.
+
+    Parameters
+    ----------
+    torch_mod : module
+        Imported torch module.
+    device : str or None
+        Device name. CUDA and MPS are synchronized; CPU is a no-op.
+    """
     if device == "cuda":
         torch_mod.cuda.synchronize()
     elif device == "mps" and hasattr(torch_mod, "mps"):
@@ -963,6 +1454,7 @@ def voxelize_textile(textile: CTextile,
     backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive)
 
     def log(msg):
+        """Print one timing/status line when verbose output is enabled."""
         if verbose:
             print(f"[voxelizer] {msg}")
 
@@ -1037,7 +1529,8 @@ def voxelize_textile(textile: CTextile,
             ),
         )
 
-    centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz)
+    centers_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
+    centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz, dtype=centers_dtype)
 
     t0 = time.perf_counter()
     if backend_cfg.backend == "torch":

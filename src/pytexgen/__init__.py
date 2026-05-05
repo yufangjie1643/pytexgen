@@ -22,7 +22,18 @@ try:
 except _PackageNotFoundError:
     __version__ = "1.1.0"
 
-# Import the SWIG-generated Core module (the compiled C++ bindings)
+# Import the SWIG-generated Core module (the compiled C++ bindings), attach
+# runtime docstrings, then re-export the Core API at package level.
+from . import Core as _CoreModule
+
+try:
+    from ._core_docs import apply_core_docstrings as _apply_core_docstrings
+
+    _apply_core_docstrings(_CoreModule)
+except Exception:
+    # Documentation must never make the compiled extension fail to import.
+    pass
+
 # This makes all Core classes/functions available directly on pytexgen,
 # e.g. pytexgen.CTextile, pytexgen.CTextileWeave2D, pytexgen.XYZ, etc.
 from .Core import *  # noqa: F401, F403
@@ -50,4 +61,8 @@ for _mod in _optional_modules:
     except ImportError:
         pass
 
-del _optional_modules, _mod
+del _optional_modules, _mod, _CoreModule
+try:
+    del _apply_core_docstrings
+except NameError:
+    pass

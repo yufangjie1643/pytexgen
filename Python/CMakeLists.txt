@@ -88,11 +88,17 @@ IF(BUILD_PYTHON_INTERFACE)
         endif()
     ENDIF()
 
+    IF(APPLE)
+        set(_TEXGEN_EXTENSION_RPATH "@loader_path")
+    ELSEIF(UNIX)
+        set(_TEXGEN_EXTENSION_RPATH "$ORIGIN")
+    ENDIF()
+
     IF(UNIX)
         SET_TARGET_PROPERTIES(_Core PROPERTIES
             INSTALL_RPATH_USE_LINK_PATH 1
             BUILD_WITH_INSTALL_RPATH 1
-            INSTALL_RPATH "$ORIGIN")
+            INSTALL_RPATH "${_TEXGEN_EXTENSION_RPATH}")
     ENDIF()
 
     # In SKBUILD (wheel) mode, TexGenCore is STATIC so there must be no
@@ -166,9 +172,10 @@ IF(BUILD_PYTHON_INTERFACE)
             SET(PYTHON_MODULES "${PYTHON_MODULES}, 'Export'")
         ENDIF()
 
-        FILE(WRITE "__init__.py" "# __all__ = [${PYTHON_MODULES}]")
+        set(TEXGEN_LEGACY_INIT_PY "${CMAKE_CURRENT_BINARY_DIR}/__init__.py")
+        FILE(WRITE "${TEXGEN_LEGACY_INIT_PY}" "# __all__ = [${PYTHON_MODULES}]")
 
-        INSTALL(FILES __init__.py "${TEXGEN_CORE_SWIG_PY}"
+        INSTALL(FILES "${TEXGEN_LEGACY_INIT_PY}" "${TEXGEN_CORE_SWIG_PY}"
             DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
         INSTALL(FILES ${PYTHON_MODULE_FILES}
             DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)

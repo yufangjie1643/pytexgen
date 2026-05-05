@@ -35,7 +35,9 @@ set_target_properties(triangle
    POSITION_INDEPENDENT_CODE TRUE
    )
 
-target_link_libraries(triangle PRIVATE -lm)
+if(NOT MSVC)
+   target_link_libraries(triangle PRIVATE m)
+endif()
 target_include_directories(triangle
    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}> $<INSTALL_INTERFACE:include>
 	PRIVATE private
