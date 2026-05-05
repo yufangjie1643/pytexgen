@@ -139,11 +139,33 @@ if "PARAMS" not in globals():
     PARAMS = DEFAULT_PARAMS.copy()
 
 
+def _validate_yarn_count_multiples(params):
+    y_count = int(params["num_x_yarns"])
+    x_count = int(params["num_y_yarns"])
+    z_count = int(params["z_layers"])
+
+    if z_count < 1:
+        raise ValueError("z_layers must be >= 1 and is treated as the z-direction yarn layer count")
+    if y_count < 1 or y_count % 2 != 0:
+        raise ValueError("num_x_yarns controls the y-direction yarn count and must be a multiple of 2")
+    if x_count < 1 or x_count % 4 != 0:
+        raise ValueError("num_y_yarns controls the x-direction yarn count and must be a multiple of 4")
+
+    rve_config = params.get("rve_export")
+    if rve_config and rve_config.get("enabled", True):
+        layer_count = int(rve_config.get("layer_count") or z_count)
+        if layer_count < 1:
+            raise ValueError("rve_export.layer_count must be >= 1")
+        if layer_count != z_count:
+            raise ValueError("rve_export.layer_count must match z_layers for SiC/SiC RVE exports")
+
+
 def create_sic_sic_shallow_cross_straight(params=None):
     active_params = DEFAULT_PARAMS.copy()
     if params:
         active_params.update(params)
     active_params["weave_type"] = "straight"
+    _validate_yarn_count_multiples(active_params)
 
     rve_exports = None
     rve_config = active_params.get("rve_export")

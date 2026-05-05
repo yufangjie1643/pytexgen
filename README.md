@@ -323,20 +323,25 @@ Minimal `params.json` example for one `128x128x128` RVE and its matching TG3:
 }
 ```
 
-An alternate 3-by-5 yarn layout is committed as
-`script/params_sic_sic_3x5_rve.json`. It exports `L01` and `L02` at
-`64x64x64`, saves the matching clipped TG3 files, and writes output under
-`Saved_SiC_SiC_Shallow_Cross_Straight/RVE_3x5_test`.
+The SiC/SiC generator enforces the yarn-count rules used by the examples:
+`z_layers >= 1`, `num_x_yarns` is the y-direction yarn count and must be a
+multiple of 2, and `num_y_yarns` is the x-direction yarn count and must be a
+multiple of 4. `rve_export.layer_count` must match `z_layers`.
+
+An alternate x4/y2/z1 layout is committed as
+`script/params_sic_sic_x4_y2_z1_rve.json`. It exports `L00` at `64x32x16`,
+saves the matching clipped TG3 file, and writes output under
+`Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_test`.
 
 ```bash
-uv run python script/sic_sic_shallow_cross_straight.py @script/params_sic_sic_3x5_rve.json
+uv run python script/sic_sic_shallow_cross_straight.py @script/params_sic_sic_x4_y2_z1_rve.json
 ```
 
-Preview the 3-by-5 `L01` output:
+Preview the x4/y2/z1 `L00` output:
 
 ```bash
 pip install plotly
-uv run python script/inp_viewer.py Saved_SiC_SiC_Shallow_Cross_Straight/RVE_3x5_test/sic_sic_3x5_test_rve_L01_mesh_64x64x64.inp --backend plotly --output build/rve_3x5_L01.html --background white
+uv run python script/inp_viewer.py Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_test/sic_sic_x4_y2_z1_test_rve_L00_mesh_64x32x16.inp --backend plotly --output build/rve_x4_y2_z1_L00.html --background white
 ```
 
 Render yarn elements from the latest generated INP file. This defaults to

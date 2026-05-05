@@ -1,0 +1,76 @@
+{
+  "num_x_yarns": 2,
+  "num_y_yarns": 4,
+  "z_layers": 1,
+  "binder_depth": 1,
+  "warp_yarn_width": 1.2,
+  "weft_yarn_width": 1.5,
+  "binder_yarn_width": 0.6,
+  "x_yarn_widths": [
+    1.2,
+    1.2
+  ],
+  "x_yarn_heights": [
+    0.3,
+    0.3
+  ],
+  "x_yarn_spacings": [
+    1.4,
+    1.4
+  ],
+  "y_yarn_widths": [
+    1.5,
+    1.5,
+    1.5,
+    1.5
+  ],
+  "y_yarn_heights": [
+    0.3,
+    0.3,
+    0.3,
+    0.3
+  ],
+  "y_yarn_spacings": [
+    2.2,
+    2.2,
+    2.2,
+    2.2
+  ],
+  "x_spacing": 1.4,
+  "y_spacing": 2.2,
+  "x_height": 0.3,
+  "y_height": 0.3,
+  "section_shape": "power_ellipse",
+  "warp_yarn_power": 1.5,
+  "weft_yarn_power": 1.5,
+  "binder_yarn_power": 1.5,
+  "translate": [
+    -1.1,
+    -0.7,
+    0.0
+  ],
+  "save_tg3": true,
+  "save_dir": "Saved_SiC_SiC_Shallow_Cross_Straight",
+  "file_prefix": "sic_sic_x4_y2_z1_test",
+  "rve_export": {
+    "enabled": true,
+    "save_dir": "Saved_SiC_SiC_Shallow_Cross_Straight/RVE_x4_y2_z1_test",
+    "file_prefix": "sic_sic_x4_y2_z1_test_rve",
+    "layer_count": 1,
+    "layers": [
+      0
+    ],
+    "layers_per_rve": 1,
+    "window_mode": "yarn_centres",
+    "z_padding": 0.0,
+    "save_tg3": true,
+    "mesh_boundary": "CPeriodicBoundaries",
+    "mesh_resolutions": [
+      [
+        64,
+        32,
+        16
+      ]
+    ]
+  }
+}
