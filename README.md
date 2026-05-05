@@ -270,6 +270,11 @@ Synthetic pruning benchmark:
 python bench_gpu_voxelizer_backends.py --resolution 32 --yarn-grid 4 --workers 4
 ```
 
+The Python voxelizer enables conservative AABB candidate pruning with
+`aabb_pruning=True` by default in the examples. The synthetic benchmark is the
+quick way to compare pruning behavior after changes; increase `--yarn-grid` or
+`--resolution` to make candidate skipping more visible.
+
 Torch/CUDA benchmark when torch is installed:
 
 ```bash
@@ -316,6 +321,22 @@ Minimal `params.json` example for one `128x128x128` RVE and its matching TG3:
     "mesh_resolutions": [[128, 128, 128]]
   }
 }
+```
+
+An alternate 3-by-5 yarn layout is committed as
+`script/params_sic_sic_3x5_rve.json`. It exports `L01` and `L02` at
+`64x64x64`, saves the matching clipped TG3 files, and writes output under
+`Saved_SiC_SiC_Shallow_Cross_Straight/RVE_3x5_test`.
+
+```bash
+uv run python script/sic_sic_shallow_cross_straight.py @script/params_sic_sic_3x5_rve.json
+```
+
+Preview the 3-by-5 `L01` output:
+
+```bash
+pip install plotly
+uv run python script/inp_viewer.py Saved_SiC_SiC_Shallow_Cross_Straight/RVE_3x5_test/sic_sic_3x5_test_rve_L01_mesh_64x64x64.inp --backend plotly --output build/rve_3x5_L01.html --background white
 ```
 
 Render yarn elements from the latest generated INP file. This defaults to
