@@ -30,6 +30,19 @@ def _iter_text_lines(filename):
 	with open(filename, encoding="utf-8", errors="replace") as file:
 		yield from file
 
+def _abaqus_displacement(columns):
+	"""Return a displacement vector from Abaqus ``U`` output columns."""
+	if not columns:
+		return XYZ()
+	try:
+		return XYZ(
+			columns["U.U1"] if "U.U1" in columns else columns["U1"],
+			columns["U.U2"] if "U.U2" in columns else columns["U2"],
+			columns["U.U3"] if "U.U3" in columns else columns["U3"],
+		)
+	except (KeyError, TypeError, ValueError):
+		return XYZ()
+
 class TemporaryDirectoryRedirect(object):
 	'''Class used to change the current working directory to a new temporary
 	directory on initialisation. On destruction the working directory will
@@ -239,11 +252,7 @@ class TextileDeformerAbaqus(CTextileDeformerVolumeMesh, CSimulationAbaqus):
 		dispData = XYZMeshData("Displacements", CMeshDataBase.NODE)
 		for nodeNum, node in list(nodes.items()):
 			nodeMap[nodeNum] = mesh.AddNode(XYZ(node[0], node[1], node[2]))
-			try:
-				x = nodeDisplacements[nodeNum]
-				d = XYZ(x['U.U1'], x['U.U2'], x['U.U3'])
-			except:
-				d = XYZ()
+			d = _abaqus_displacement(nodeDisplacements.get(nodeNum))
 			dispData.m_Data.append(d)
 		for elemNum, elem in list(elements.items()):
 			mesh.AddElement(elem[0], [nodeMap[x] for x in elem[1]])

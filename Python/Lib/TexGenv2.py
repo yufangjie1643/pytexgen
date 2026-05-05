@@ -20,6 +20,7 @@ try:
 except ImportError:
     from TexGen.Core import *
 import re
+from io import StringIO
 
 def GetNextLine(File):
     """Get the next line in a file ignoring lines beginning with *
@@ -43,7 +44,8 @@ def ImportTexGenv2(filename):
     Returns the name of the textile imported."""
 
     # Open the file
-    File = open(filename, 'r', encoding="utf-8", errors="replace")
+    with open(filename, 'r', encoding="utf-8", errors="replace") as source:
+        File = StringIO(source.read())
     # Read the first line
     NumVectors = int(GetNextLine(File))
     # Read the second line
@@ -167,6 +169,5 @@ def ImportTexGenv2(filename):
         Domain = CDomainPlanes(*DomainSize)
         Textile.AssignDomain(Domain)
 
-    File.close()
     return AddTextile(Textile)
 

@@ -454,6 +454,19 @@ void CTextile::GetPointInformation(const vector<XYZ> &Points, vector<POINT_INFO>
 	{
 		vector<XYZ> Translations = DomainPlanes.GetTranslations(*itYarn);
 		CYarn& Yarn = *itYarn;
+		pair<XYZ, XYZ> YarnAABB = Yarn.GetAABB();
+		bool bYarnOverlapsPoints = false;
+		vector<XYZ>::const_iterator itTranslation;
+		for (itTranslation = Translations.begin(); itTranslation != Translations.end(); ++itTranslation)
+		{
+			if (BoundingBoxIntersect(YarnAABB.first + *itTranslation, YarnAABB.second + *itTranslation, Min, Max, dTolerance))
+			{
+				bYarnOverlapsPoints = true;
+				break;
+			}
+		}
+		if (!bYarnOverlapsPoints)
+			continue;
 		#pragma omp parallel for schedule(dynamic, 256) firstprivate(Translations)
 		for (int i = 0; i < nPoints; ++i)
 		{
@@ -510,6 +523,19 @@ void CTextile::GetPointInformation(const vector<XYZ> &Points, vector<POINT_INFO>
 	m_Yarns[iYarn].BuildYarnIfNeeded(CYarn::SURFACE | CYarn::VOLUME | CYarn::LINE);
 	vector<XYZ> Translations = DomainPlanes.GetTranslations(m_Yarns[iYarn]);
 	CYarn& Yarn = m_Yarns[iYarn];
+	pair<XYZ, XYZ> YarnAABB = Yarn.GetAABB();
+	bool bYarnOverlapsPoints = false;
+	vector<XYZ>::const_iterator itTranslation;
+	for (itTranslation = Translations.begin(); itTranslation != Translations.end(); ++itTranslation)
+	{
+		if (BoundingBoxIntersect(YarnAABB.first + *itTranslation, YarnAABB.second + *itTranslation, Min, Max, dTolerance))
+		{
+			bYarnOverlapsPoints = true;
+			break;
+		}
+	}
+	if (!bYarnOverlapsPoints)
+		return;
 	const int nPoints = static_cast<int>(Points.size());
 	#pragma omp parallel for schedule(dynamic, 256) firstprivate(Translations)
 	for (int i = 0; i < nPoints; ++i)

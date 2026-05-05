@@ -36,10 +36,16 @@
 
 // Maximum number of characters in a file name (including the null).
 
+#ifdef FILENAMESIZE
+#undef FILENAMESIZE
+#endif
 #define FILENAMESIZE 1024
 
 // Maximum number of chars in a line read from a file (including the null).
 
+#ifdef INPUTLINESIZE
+#undef INPUTLINESIZE
+#endif
 #define INPUTLINESIZE 2048
 
 // TetGen only uses the C standard library.

@@ -105,11 +105,17 @@
 
 /* Maximum number of characters in a file name (including the null).         */
 
+#ifdef FILENAMESIZE
+#undef FILENAMESIZE
+#endif
 #define FILENAMESIZE 2048
 
 /* Maximum number of characters in a line read from a file (including the    */
 /*   null).                                                                  */
 
+#ifdef INPUTLINESIZE
+#undef INPUTLINESIZE
+#endif
 #define INPUTLINESIZE 1024
 
 /* For efficiency, a variety of data structures are allocated in bulk.  The  */
@@ -155,6 +161,9 @@
 
 /* A number that speaks for itself, every kissable digit.                    */
 
+#ifdef PI
+#undef PI
+#endif
 #define PI 3.141592653589793238462643383279502884197169399375105820974944592308
 
 /* Another fave.                                                             */

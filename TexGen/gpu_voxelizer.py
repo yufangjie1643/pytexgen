@@ -673,7 +673,6 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
             bounds_lo, bounds_hi = bounds[y_idx]
 
         for t_idx, offset in enumerate(snap.translations):
-            Pt = Py + offset
             active_idx = None
             active_pts = pts
             if bounds_lo is not None and bounds_hi is not None:
@@ -687,6 +686,7 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
                 active_idx = np.nonzero(mask)[0]
                 active_pts = pts[active_idx]
 
+            Pt = Py + offset
             local_count = active_pts.shape[0]
             d2 = (
                 np.einsum("ij,ij->i", active_pts, active_pts)[:, None]

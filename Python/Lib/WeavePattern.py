@@ -19,6 +19,7 @@ try:
     from .Core import *
 except ImportError:
     from TexGen.Core import *
+from io import StringIO
 from math import *
 
 def SpacedStringToIntVector( Str ):
@@ -58,7 +59,8 @@ def SetupBinders( Str ):
 	return NumBinders, Vector
 
 def ImportWeavePattern( Filename ):
-	file = open(Filename, 'r', encoding="utf-8", errors="replace")
+	with open(Filename, 'r', encoding="utf-8", errors="replace") as source:
+		file = StringIO(source.read())
 	Pattern = CPatternDraft()
 
 	firstLine = True
@@ -143,8 +145,6 @@ def ImportWeavePattern( Filename ):
 					Pattern.AddRow( line )
 					LineVector = StringToIntVector( line )
 					WeftMatrix.append(LineVector) 
-
-	file.close()
 
 	NumWefts = len(WeftMatrix)
 	

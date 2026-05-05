@@ -19,6 +19,7 @@ try:
     from .Core import *
 except ImportError:
     from TexGen.Core import *
+from io import StringIO
 from copy import copy
 
 def ImportWiseTex(filename):
@@ -27,7 +28,8 @@ def ImportWiseTex(filename):
     exactly the same.
     Returns the name of the textile imported."""
     # Open file
-    File = open(filename, 'r', encoding="utf-8", errors="replace")
+    with open(filename, 'r', encoding="utf-8", errors="replace") as source:
+        File = StringIO(source.read())
 
     # Get cell size
     CellSize = XYZ(*[float(item) for item in File.readline().split()])
@@ -194,5 +196,4 @@ def ImportWiseTex(filename):
     # Add domain to textile
     Textile.AssignDomain(Domain)
 
-    File.close()
     return AddTextile(Textile)
