@@ -58,7 +58,7 @@ namespace TexGen
 		vector<POINT_INFO> m_ElementsInfo;
 
 		/// Save tetgenio data to CMesh
-		void SaveMesh(CTextile &Textile);
+		bool SaveMesh(CTextile &Textile);
 		/// Save output mesh to Abaqus export file
 		void SaveToAbaqus( string Filename, CTextile &Textile );
 		/// Save output mesh to VTK format

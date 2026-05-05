@@ -29,6 +29,78 @@ extern "C"
 using namespace TexGen;
 using namespace std;
 
+namespace
+{
+	string NormaliseTetgenParameters(const string &Parameters)
+	{
+		string Clean;
+		for (string::const_iterator itChar = Parameters.begin(); itChar != Parameters.end(); ++itChar)
+		{
+			if (*itChar != '-' && !isspace((unsigned char)*itChar))
+				Clean.push_back(*itChar);
+		}
+		if (Clean.find('p') == string::npos)
+			Clean.insert(Clean.begin(), 'p');
+		return Clean;
+	}
+
+	bool HasDuplicateCornerIndices(const vector<int> &Indices)
+	{
+		for (int i = 0; i < 4; ++i)
+		{
+			for (int j = i + 1; j < 4; ++j)
+			{
+				if (Indices[i] == Indices[j])
+					return true;
+			}
+		}
+		return false;
+	}
+
+	double TetSignedVolume6(const CMesh &Mesh, const vector<int> &Indices)
+	{
+		const XYZ &P0 = Mesh.GetNode(Indices[0]);
+		const XYZ &P1 = Mesh.GetNode(Indices[1]);
+		const XYZ &P2 = Mesh.GetNode(Indices[2]);
+		const XYZ &P3 = Mesh.GetNode(Indices[3]);
+		return DotProduct(CrossProduct(P1 - P0, P2 - P0), P3 - P0);
+	}
+
+	double TetQualityMeanRatio(const CMesh &Mesh, const vector<int> &Indices, double dVolume)
+	{
+		const XYZ &P0 = Mesh.GetNode(Indices[0]);
+		const XYZ &P1 = Mesh.GetNode(Indices[1]);
+		const XYZ &P2 = Mesh.GetNode(Indices[2]);
+		const XYZ &P3 = Mesh.GetNode(Indices[3]);
+		double dEdgeSum =
+			GetLengthSquared(P0, P1) + GetLengthSquared(P0, P2) + GetLengthSquared(P0, P3) +
+			GetLengthSquared(P1, P2) + GetLengthSquared(P1, P3) + GetLengthSquared(P2, P3);
+		if (dEdgeSum <= 0.0 || dVolume <= 0.0)
+			return 0.0;
+		return 12.0 * pow(3.0 * dVolume, 2.0 / 3.0) / dEdgeSum;
+	}
+
+	void ReorientLinearTet(vector<int> &Indices)
+	{
+		swap(Indices[0], Indices[1]);
+	}
+
+	void ReorientQuadraticTet(vector<int> &Indices)
+	{
+		vector<int> OldIndices = Indices;
+		Indices[0] = OldIndices[1];
+		Indices[1] = OldIndices[0];
+		Indices[2] = OldIndices[2];
+		Indices[3] = OldIndices[3];
+		Indices[4] = OldIndices[4];
+		Indices[5] = OldIndices[6];
+		Indices[6] = OldIndices[5];
+		Indices[7] = OldIndices[8];
+		Indices[8] = OldIndices[7];
+		Indices[9] = OldIndices[9];
+	}
+}
+
 CTetgenMesh::CTetgenMesh(double Seed) : CMeshDomainPlane(Seed)
 {
 	
@@ -46,12 +118,25 @@ void CTetgenMesh::SaveTetgenMesh( CTextile &Textile, string OutputFilename, stri
 	pair<XYZ, XYZ> DomainAABB;
 	XYZ P;
 
+	m_Mesh.Clear();
+	m_OutputMesh.Clear();
+	m_ElementsInfo.clear();
+	m_DomainMeshes.clear();
+	m_TriangulatedMeshes.clear();
+	m_PolygonNumVertices.clear();
+	m_in.deinitialize();
+	m_in.initialize();
+	m_out.deinitialize();
+	m_out.initialize();
+
 	if ( !Textile.AddSurfaceToMesh( m_Mesh, m_DomainMeshes, true ) )
 	{
 		TGERROR("Error creating surface mesh. Cannot generate tetgen mesh");
 		return;
 	}
 	m_Mesh.ConvertQuadstoTriangles(true);
+	m_Mesh.MergeNodes(1e-9);
+	m_Mesh.RemoveDegenerateTriangles();
 
 	MeshDomainPlanes( bPeriodic );
 	
@@ -193,7 +278,8 @@ void CTetgenMesh::SaveTetgenMesh( CTextile &Textile, string OutputFilename, stri
 				for (itPolygonIndices = PolygonIndices.begin(); itPolygonIndices != PolygonIndices.end(); )
 				{
 					p = &f->polygonlist[PolyInd++];
-					p->numberofvertices = *(itNumVertices++);
+					int iClosedNumVertices = *(itNumVertices++);
+					p->numberofvertices = iClosedNumVertices - 1;
 					p->vertexlist = new int[p->numberofvertices];
 				
 					for ( int iNode = 0; iNode < p->numberofvertices; ++iNode )
@@ -208,6 +294,7 @@ void CTetgenMesh::SaveTetgenMesh( CTextile &Textile, string OutputFilename, stri
 						else  // Add existing node index to vertex list
 	  						p->vertexlist[iNode] = ind + 1;
 					}
+					++itPolygonIndices; // Skip the repeated closing vertex stored in CMesh::POLYGON.
 				}
 				++iFace;
 			}
@@ -234,21 +321,18 @@ void CTetgenMesh::SaveTetgenMesh( CTextile &Textile, string OutputFilename, stri
 	
 	string strOutput;
 	string strInput;
-	int size = (int)OutputFilename.length();
-	
-	char* TetgenOutput = new char[size];
-	char* TetgenInput = new char[size+5];
 	if (FileType == INP_EXPORT)
 		strOutput = RemoveExtension( OutputFilename, ".inp" );
 	else
 		strOutput = RemoveExtension(OutputFilename, ".vtu");
 	strInput = strOutput + "Input";
-	strcpy(TetgenOutput, strOutput.c_str());
-	strcpy( TetgenInput, strInput.c_str());
+	vector<char> TetgenOutput(strOutput.begin(), strOutput.end());
+	TetgenOutput.push_back('\0');
+	vector<char> TetgenInput(strInput.begin(), strInput.end());
+	TetgenInput.push_back('\0');
 	
-	m_in.save_nodes(TetgenInput);
-	m_in.save_poly(TetgenInput);
-	delete [] TetgenInput;
+	m_in.save_nodes(&TetgenInput[0]);
+	m_in.save_poly(&TetgenInput[0]);
 
 	// Check the input mesh first
 	try
@@ -260,34 +344,39 @@ void CTetgenMesh::SaveTetgenMesh( CTextile &Textile, string OutputFilename, stri
 		TGERROR("Tetrahedralize failed.  Intersections in PLC");
 		return;
 	}
+	m_out.deinitialize();
+	m_out.initialize();
+
 	// Then create the mesh
+	string TetgenParameters = NormaliseTetgenParameters(Parameters);
 	try
 	{
-		tetrahedralize((char*)Parameters.c_str(), &m_in, &m_out);
+		tetrahedralize((char*)TetgenParameters.c_str(), &m_in, &m_out);
 	}
 	catch(...)
 	{
 		TGERROR("Tetrahedralize failed.  No mesh generated");
-		TGERROR(Parameters);
+		TGERROR(TetgenParameters);
 		return;
 	}
 			
 	// Output mesh to files 'barout.node', 'barout.ele' and 'barout.face'.
-	m_out.save_nodes(TetgenOutput);
-	m_out.save_elements(TetgenOutput);
-	m_out.save_faces(TetgenOutput);
-	delete [] TetgenOutput;
+	m_out.save_nodes(&TetgenOutput[0]);
+	m_out.save_elements(&TetgenOutput[0]);
+	m_out.save_faces(&TetgenOutput[0]);
 
-	SaveMesh( Textile );
+	if (!SaveMesh( Textile ))
+		return;
 	if (FileType == INP_EXPORT)
 		SaveToAbaqus(OutputFilename, Textile);
 	else
 		SaveToVTK(OutputFilename);
 }
 
-void CTetgenMesh::SaveMesh(CTextile &Textile)
+bool CTetgenMesh::SaveMesh(CTextile &Textile)
 {
 	m_OutputMesh.Clear();
+	m_ElementsInfo.clear();
 	
 	// Store output mesh in CMesh
 	for (int i = 0; i < m_out.numberofpoints * 3; ) // Three REALs in pointlist for each point
@@ -301,25 +390,79 @@ void CTetgenMesh::SaveMesh(CTextile &Textile)
 
 	CMesh::ELEMENT_TYPE ElementType = m_out.numberofcorners == 4 ? CMesh::TET : CMesh::QUADRATIC_TET;
 	int quad_tet_ind[10] = {0, 1, 2, 3, 6, 7, 9, 5, 8, 4};
+	pair<XYZ, XYZ> AABB = m_OutputMesh.GetAABB();
+	double dVolumeTolerance = pow(GetLength(AABB.second - AABB.first), 3.0) * 1e-14;
+	if (dVolumeTolerance < 1e-30)
+		dVolumeTolerance = 1e-30;
+	int iRemovedDegenerateTets = 0;
+	int iInvalidTets = 0;
+	double dMinVolume = -1.0;
+	double dMinQuality = -1.0;
 
 	for (int i = 0; i < m_out.numberoftetrahedra; i++)
 	{
 		vector<int> Indices;
+		bool bInvalidIndices = false;
 		for ( int j = 0; j < m_out.numberofcorners; j++ )
 		{
+			int iIndex;
 			if (ElementType == CMesh::TET) 
 			{
-				Indices.push_back( m_out.tetrahedronlist[i*m_out.numberofcorners + j]-1 );  // Tetgen indices start from 1
+				iIndex = m_out.tetrahedronlist[i*m_out.numberofcorners + j]-1;  // Tetgen indices start from 1
 			}
 			else
 			{
-				Indices.push_back( m_out.tetrahedronlist[i*m_out.numberofcorners + quad_tet_ind[j]] -1);
+				iIndex = m_out.tetrahedronlist[i*m_out.numberofcorners + quad_tet_ind[j]] -1;
 			}
+			if (iIndex < 0 || iIndex >= m_OutputMesh.GetNumNodes())
+				bInvalidIndices = true;
+			Indices.push_back(iIndex);
 		}
+		if (bInvalidIndices)
+		{
+			++iInvalidTets;
+			continue;
+		}
+		if (HasDuplicateCornerIndices(Indices))
+		{
+			++iRemovedDegenerateTets;
+			continue;
+		}
+		double dSignedVolume6 = TetSignedVolume6(m_OutputMesh, Indices);
+		double dVolume = fabs(dSignedVolume6) / 6.0;
+		if (dVolume <= dVolumeTolerance)
+		{
+			++iRemovedDegenerateTets;
+			continue;
+		}
+		if (dSignedVolume6 < 0.0)
+		{
+			if (ElementType == CMesh::TET)
+				ReorientLinearTet(Indices);
+			else
+				ReorientQuadraticTet(Indices);
+		}
+		double dQuality = TetQualityMeanRatio(m_OutputMesh, Indices, dVolume);
+		if (dMinVolume < 0.0 || dVolume < dMinVolume)
+			dMinVolume = dVolume;
+		if (dMinQuality < 0.0 || dQuality < dMinQuality)
+			dMinQuality = dQuality;
 		m_OutputMesh.AddElement(ElementType, Indices);
 	}
+	if (iInvalidTets > 0)
+		TGERROR("Discarded " << iInvalidTets << " tetrahedra with invalid TetGen node indices");
+	if (iRemovedDegenerateTets > 0)
+		TGERROR("Discarded " << iRemovedDegenerateTets << " zero-volume or duplicate-node tetrahedra");
+	if (m_OutputMesh.GetNumElements(ElementType) == 0)
+	{
+		TGERROR("TetGen output contains no valid tetrahedra after quality filtering");
+		return false;
+	}
+	m_OutputMesh.RemoveUnreferencedNodes();
+	TGLOG("TetGen mesh quality: min volume = " << dMinVolume << ", min mean-ratio quality = " << dMinQuality);
 
 	Textile.GetPointInformation(m_OutputMesh.GetElementCenters(ElementType), m_ElementsInfo);
+	return true;
 }
 
 void CTetgenMesh::SaveToAbaqus( string Filename, CTextile &Textile )
