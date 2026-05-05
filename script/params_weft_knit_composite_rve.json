@@ -1,0 +1,30 @@
+{
+  "wales": 8,
+  "courses": 8,
+  "wale_height": 1.0,
+  "loop_height": 1.2,
+  "course_width": 1.0,
+  "yarn_thickness": 0.15,
+  "save_tg3": true,
+  "save_dir": "Saved_Weft_Knit_Composite",
+  "file_prefix": "weft_knit_composite",
+  "rve_export": {
+    "enabled": true,
+    "save_dir": "Saved_Weft_Knit_Composite/RVE",
+    "file_prefix": "weft_knit_composite_rve",
+    "rve_wales": 2,
+    "rve_courses": 2,
+    "wale_start": "center",
+    "course_start": "center",
+    "z_padding": 0.0,
+    "save_tg3": true,
+    "mesh_boundary": "CPeriodicBoundaries",
+    "mesh_resolutions": [
+      [
+        64,
+        64,
+        32
+      ]
+    ]
+  }
+}

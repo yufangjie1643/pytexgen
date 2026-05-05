@@ -382,6 +382,40 @@ On the Windows workstation used during development, the default `64x64x64`
 benchmark completed 64/64 cases in 62.599 s with 4 workers. The temporary mesh
 data totalled about 2.9 GB before cleanup.
 
+## Weft-Knit Composite Script
+
+`script/weft_knit_composite.py` creates a parametric weft-knit composite parent
+model using `CTextileWeftKnit`, then exports a central RVE window. The default
+parent is 8 wales by 8 courses; the RVE is the central 2-by-2 window. This keeps
+the parent model larger than the rendered/exported region.
+
+Run the default model and RVE export:
+
+```bash
+uv run python script/weft_knit_composite.py
+```
+
+Run with the committed parameter file:
+
+```bash
+uv run python script/weft_knit_composite.py @script/params_weft_knit_composite_rve.json
+```
+
+The default parameter file writes:
+
+```text
+Saved_Weft_Knit_Composite/weft_knit_composite.tg3
+Saved_Weft_Knit_Composite/RVE/weft_knit_composite_rve_W03_W04_C03_C04.tg3
+Saved_Weft_Knit_Composite/RVE/weft_knit_composite_rve_W03_W04_C03_C04_mesh_64x64x32.inp
+```
+
+Preview the central knit RVE:
+
+```bash
+pip install plotly
+uv run python script/inp_viewer.py Saved_Weft_Knit_Composite/RVE/weft_knit_composite_rve_W03_W04_C03_C04_mesh_64x64x32.inp --backend plotly --output build/weft_knit_rve.html --background white
+```
+
 ## Project Layout
 
 ```text
