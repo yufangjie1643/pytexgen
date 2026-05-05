@@ -17,11 +17,16 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+*.lnk
 
 # Generated SWIG files are committed so normal wheel builds do not need SWIG.
 
 # Test output / generated mesh files
 *.inp
+*.ori
+*.eld
+*.tg3
+Saved_*/
 _gpu_test/
 test_output/
 _test_one/

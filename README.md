@@ -276,6 +276,62 @@ Torch/CUDA benchmark when torch is installed:
 python bench_gpu_voxelizer_backends.py --include-torch --device cuda
 ```
 
+## SiC/SiC RVE Scripts
+
+The `script/` directory contains ready-to-run examples for shallow-cross
+layer-to-layer textiles and layer-aware RVE exports. The SiC/SiC example uses
+default parameters, exports layer windows from the model domain instead of
+hard-coded absolute z limits, and can read overrides from `@params.json`.
+
+Generate the default SiC/SiC shallow-cross straight model and all default RVE
+layers:
+
+```bash
+uv run python script/sic_sic_shallow_cross_straight.py
+```
+
+Override parameters with a JSON file:
+
+```bash
+uv run python script/sic_sic_shallow_cross_straight.py @params.json
+```
+
+Render yarn elements from the latest generated INP file. This defaults to
+auto-detecting the newest `.inp` under the common output folders:
+
+```bash
+pip install matplotlib
+uv run python script/inp_viewer.py --backend matplotlib --output build/rve_view.png --background white --no-axes --no-title
+```
+
+Create an interactive HTML view:
+
+```bash
+pip install plotly
+uv run python script/inp_viewer.py path/to/mesh.inp --backend plotly --output build/rve_view.html --background white
+```
+
+Run the reproducible RVE export benchmark used for local speed checks. The
+default is 64 exports, 4 parallel workers, and a `64x64x64` mesh. Large
+generated mesh files are deleted after each case; `progress.json` and
+`summary.json` remain under `build/`.
+
+```bash
+uv run python script/bench_sic_sic_rve_parallel.py
+```
+
+Useful benchmark variants:
+
+```bash
+uv run python script/bench_sic_sic_rve_parallel.py --cases 1 --resolution 128 128 128
+uv run python script/bench_sic_sic_rve_parallel.py --cases 8 --workers 2 --resolution 64
+uv run python script/bench_sic_sic_rve_parallel.py --keep-output
+```
+
+On the Windows workstation used during development, the default `64x64x64`
+benchmark completed 64/64 cases in 62.599 s with 4 workers. The temporary mesh
+data totalled about 2.9 GB before cleanup.
+
 ## Project Layout
 
 ```text
@@ -285,6 +341,7 @@ Python/Core.py           committed SWIG Python proxy
 Python/Core_wrap.cxx      committed SWIG C++ wrapper
 TexGen/gpu_voxelizer.py   portable numpy/torch voxelization backend
 src/pytexgen/             installed Python package
+script/                   TexGen examples, RVE export helpers, INP viewer, benchmarks
 docs/voxel_backends.md    backend selection and p4est notes
 pyproject.toml            Python packaging and wheel build configuration
 ```
