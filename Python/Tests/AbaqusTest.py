@@ -18,8 +18,8 @@
 import unittest
 from math import pi
 from TestUtils import GetTestWeave
-from TexGen.Abaqus import TextileDeformerAbaqus
-from TexGen.Core import *
+from pytexgen.Abaqus import TextileDeformerAbaqus
+from pytexgen import *
 
 class AbaqusTest(unittest.TestCase):
     def setUp(self):

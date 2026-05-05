@@ -1352,7 +1352,9 @@ bool CYarn::PointInsideYarn(const XYZ &Point, XYZ *pTangent, XY *pLoc, double* p
 	int i;
 	CSlaveNode N;
 	double u;
-	m_pInterpolation->Initialise(m_MasterNodes);
+	// BuildYarnIfNeeded(SURFACE) has already initialised interpolation caches.
+	// Reinitialising here mutates shared interpolation state and is unsafe when
+	// PointInsideYarn is called from OpenMP point loops.
 
 	YARN_POSITION_INFORMATION YarnPositionInfo;
 	YarnPositionInfo.SectionLengths = m_SectionLengths;
@@ -1624,7 +1626,7 @@ double CYarn::FindClosestSurfacePoint(const XYZ &Point, XYZ &SurfacePoint, int i
 	int i;
 	CSlaveNode N;
 	double u;
-	m_pInterpolation->Initialise(m_MasterNodes);
+	// BuildYarnIfNeeded(SURFACE) has already initialised interpolation caches.
 
 	YARN_POSITION_INFORMATION YarnPositionInfo;
 	YarnPositionInfo.SectionLengths = m_SectionLengths;

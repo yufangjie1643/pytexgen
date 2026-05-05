@@ -17,8 +17,8 @@
 
 import unittest
 from TestUtils import GetTestTextile
-from TexGen.FlowTex import ExportFlowTex
-from TexGen.Core import *
+from pytexgen.FlowTex import ExportFlowTex
+from pytexgen import *
 
 class FlowTexTest(unittest.TestCase):
     def setUp(self):

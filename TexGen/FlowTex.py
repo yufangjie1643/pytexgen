@@ -15,7 +15,10 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-from TexGen.Core import *
+try:
+    from .Core import *
+except ImportError:
+    from TexGen.Core import *
 
 def ExportFlowTex(Filename, TextileName, NumPoints):
     """ Export a textile to be read in by FlowTex. """

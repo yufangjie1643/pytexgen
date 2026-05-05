@@ -17,8 +17,8 @@
 
 import unittest
 from TestUtils import GetTestTextile
-from TexGen.GridFile import ExportGridFile
-from TexGen.Core import *
+from pytexgen.GridFile import ExportGridFile
+from pytexgen import *
 
 class GridFileTest(unittest.TestCase):
     def setUp(self):

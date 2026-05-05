@@ -37,6 +37,10 @@ Documentation = "https://github.com/yufangjie1643/pytexgen#readme"
 Repository = "https://github.com/yufangjie1643/pytexgen"
 Issues = "https://github.com/yufangjie1643/pytexgen/issues"
 
+[project.optional-dependencies]
+voxel = ["numpy>=1.21"]
+gpu = ["numpy>=1.21", "torch"]
+
 # ---------------------------------------------------------------------------
 # scikit-build-core configuration
 # ---------------------------------------------------------------------------
@@ -53,6 +57,9 @@ cmake.args = [
     "-DBUILD_DOCUMENTATION=OFF",
     "-DBUILD_PROFILE=OFF",
     "-DBUILD_SHARED=OFF",
+    "-DTEXGEN_ENABLE_OPENMP=OFF",
+    "-DTEXGEN_ENABLE_NATIVE_OPTIMIZATIONS=OFF",
+    "-DTEXGEN_REGENERATE_SWIG=OFF",
 ]
 
 # Tell scikit-build-core where our Python package source is
@@ -75,8 +82,6 @@ skip = "*-musllinux* *-win32 *_i686"
 test-command = "python -c \"import pytexgen; print('pytexgen', pytexgen.__version__, 'loaded OK')\""
 
 [tool.cibuildwheel.linux]
-# Install SWIG in the manylinux container before building
-before-all = "yum install -y swig || (apt-get update && apt-get install -y swig)"
 archs = ["x86_64", "aarch64"]
 
 # Use manylinux2014 for broader compatibility
@@ -85,10 +90,6 @@ manylinux-aarch64-image = "manylinux2014"
 
 [tool.cibuildwheel.macos]
 archs = ["x86_64", "arm64"]
-# Install SWIG via Homebrew
-before-all = "brew install swig"
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
-# SWIG must be available on PATH; install via choco or pre-install in CI
-before-all = "choco install swig -y"

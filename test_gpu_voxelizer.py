@@ -1,14 +1,14 @@
-"""Smoke test for TexGen.gpu_voxelizer."""
+"""Smoke test for pytexgen.gpu_voxelizer."""
 import sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from TexGen.Core import (
+from pytexgen import (
     CShearedTextileWeave2D, AddTextile, DeleteTextile, SaveToXML, OUTPUT_STANDARD,
     CRectangularVoxelMesh,
 )
-from TexGen.gpu_voxelizer import voxelize_textile
+from pytexgen.gpu_voxelizer import voxelize_textile
 
 
 def build_textile():
@@ -25,12 +25,17 @@ def build_textile():
 def main():
     out_dir = Path("./_gpu_test"); out_dir.mkdir(exist_ok=True)
 
-    # --- GPU path ---
+    # --- Python numpy path (OpenMP-free) ---
     T1 = build_textile()
     t0 = time.perf_counter()
     info = voxelize_textile(T1, nx=64, ny=64, nz=64,
-                            out_inp=str(out_dir / "gpu.inp"))
-    print(f"[GPU] total {time.perf_counter()-t0:.2f}s, device={info['device']}")
+                            out_inp=str(out_dir / "numpy.inp"),
+                            backend="numpy",
+                            workers=4)
+    print(
+        f"[PY] total {time.perf_counter()-t0:.2f}s, "
+        f"backend={info['backend']}, workers={info['workers']}, device={info['device']}"
+    )
 
     # --- Reference: TexGen CPU voxelizer ---
     T2 = build_textile()

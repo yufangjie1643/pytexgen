@@ -17,7 +17,10 @@
 
 import re
 from sys import stderr
-from TexGen.Core import *
+try:
+	from .Core import *
+except ImportError:
+	from TexGen.Core import *
 import os, shutil
 from tempfile import mkdtemp
 from glob import glob

@@ -27,19 +27,25 @@ IF(UNIX)
 ENDIF()
 
 # ============================================================================
-# OpenMP (for parallelizing hot loops such as CTextile::GetPointInformation)
+# Build options
 # ============================================================================
-FIND_PACKAGE(OpenMP)
-IF(OpenMP_CXX_FOUND)
-    MESSAGE(STATUS "OpenMP enabled: ${OpenMP_CXX_FLAGS}")
-ELSE()
-    MESSAGE(WARNING "OpenMP not found - build will be single-threaded")
-ENDIF()
+SET(BUILD_RENDERER OFF CACHE BOOL "Enable rendering using VTK.")
+SET(BUILD_PYTHON_INTERFACE ON CACHE BOOL "Enable the Python interface.")
+SET(BUILD_GUI OFF CACHE BOOL "Build the graphical user interface.")
+SET(BUILD_EXAMPLES OFF CACHE BOOL "Build the examples.")
+SET(BUILD_UNIT_TESTS OFF CACHE BOOL "Build the unit tests to ensure the software is working as expected.")
+SET(BUILD_CASCADE_EXPORT OFF CACHE BOOL "Build module to export geometry to Open CASCADE.")
+SET(BUILD_SHARED OFF CACHE BOOL "Build shared libraries (set OFF for wheel packaging)")
+SET(BUILD_DOCUMENTATION OFF CACHE BOOL "Build documentation using doxygen")
+SET(BUILD_PROFILE OFF CACHE BOOL "Build profiling")
+SET(TEXGEN_ENABLE_OPENMP OFF CACHE BOOL "Enable OpenMP acceleration for C++ point-classification loops")
+SET(TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS OFF CACHE BOOL "Enable architecture-native compiler flags such as -march=native")
+SET(TEXGEN_REGENERATE_SWIG OFF CACHE BOOL "Regenerate Python SWIG wrappers instead of using committed generated files")
 
 # ============================================================================
 # Release-mode optimization flags
-# Force -O3 / /O2 + architecture-native vectorization when building Release.
-# Users can still override via -DCMAKE_CXX_FLAGS_RELEASE=... on the command line.
+# Keep wheel builds portable by default.  Architecture-native flags are useful
+# for local benchmarking, but they can make wheels fail on older CPUs.
 # ============================================================================
 IF(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     SET(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -55,12 +61,13 @@ IF(MSVC)
     SET(CMAKE_SHARED_LINKER_FLAGS_RELEASE "/LTCG" CACHE STRING "" FORCE)
     SET(CMAKE_STATIC_LINKER_FLAGS_RELEASE "/LTCG" CACHE STRING "" FORCE)
 ELSE()
-    # -O3 + native arch (skip -march=native on aarch64 CI where it may be unsupported)
-    INCLUDE(CheckCXXCompilerFlag)
-    CHECK_CXX_COMPILER_FLAG("-march=native" TEXGEN_HAS_MARCH_NATIVE)
     SET(_TEXGEN_OPT_FLAGS "-O3 -DNDEBUG -ffast-math -fno-finite-math-only")
-    IF(TEXGEN_HAS_MARCH_NATIVE)
-        SET(_TEXGEN_OPT_FLAGS "${_TEXGEN_OPT_FLAGS} -march=native")
+    IF(TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS)
+        INCLUDE(CheckCXXCompilerFlag)
+        CHECK_CXX_COMPILER_FLAG("-march=native" TEXGEN_HAS_MARCH_NATIVE)
+        IF(TEXGEN_HAS_MARCH_NATIVE)
+            SET(_TEXGEN_OPT_FLAGS "${_TEXGEN_OPT_FLAGS} -march=native")
+        ENDIF()
     ENDIF()
     SET(CMAKE_CXX_FLAGS_RELEASE "${_TEXGEN_OPT_FLAGS}"
         CACHE STRING "Release C++ flags" FORCE)
@@ -78,17 +85,18 @@ ELSE()
 ENDIF()
 
 # ============================================================================
-# Build options
+# OpenMP (optional; Python numpy/torch voxelization is the default acceleration path)
 # ============================================================================
-SET(BUILD_RENDERER ON CACHE BOOL "Enable rendering using VTK.")
-SET(BUILD_PYTHON_INTERFACE ON CACHE BOOL "Enable the Python interface.")
-SET(BUILD_GUI ON CACHE BOOL "Build the graphical user interface.")
-SET(BUILD_EXAMPLES OFF CACHE BOOL "Build the examples.")
-SET(BUILD_UNIT_TESTS OFF CACHE BOOL "Build the unit tests to ensure the software is working as expected.")
-SET(BUILD_CASCADE_EXPORT OFF CACHE BOOL "Build module to export geometry to Open CASCADE.")
-SET(BUILD_SHARED ON CACHE BOOL "Build shared libraries (set OFF for wheel packaging)")
-SET(BUILD_DOCUMENTATION OFF CACHE BOOL "Build documentation using doxygen")
-SET(BUILD_PROFILE OFF CACHE BOOL "Build profiling")
+IF(TEXGEN_ENABLE_OPENMP)
+    FIND_PACKAGE(OpenMP)
+    IF(OpenMP_CXX_FOUND)
+        MESSAGE(STATUS "OpenMP enabled: ${OpenMP_CXX_FLAGS}")
+    ELSE()
+        MESSAGE(WARNING "TEXGEN_ENABLE_OPENMP=ON but OpenMP was not found - build will be single-threaded")
+    ENDIF()
+ELSE()
+    MESSAGE(STATUS "OpenMP disabled (TEXGEN_ENABLE_OPENMP=OFF)")
+ENDIF()
 
 IF(BUILD_GUI)
     IF(NOT BUILD_RENDERER)

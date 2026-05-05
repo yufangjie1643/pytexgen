@@ -1,4 +1,4 @@
-from TexGen.Core import *
+from pytexgen import *
 
 def GetTestTextile():
     Textile = CTextile()

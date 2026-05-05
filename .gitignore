@@ -18,9 +18,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Generated SWIG files
-Python/Core_wrap.cxx
-Python/Core.py
+# Generated SWIG files are committed so normal wheel builds do not need SWIG.
 
 # Test output / generated mesh files
 *.inp

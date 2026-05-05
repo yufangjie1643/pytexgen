@@ -10,7 +10,17 @@ Usage:
     from pytexgen import CTextile, CTextileWeave2D, XYZ
 """
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+    from importlib.metadata import version as _dist_version
+except ImportError:  # pragma: no cover - Python < 3.8 compatibility guard
+    _PackageNotFoundError = Exception
+    _dist_version = None
+
+try:
+    __version__ = _dist_version("pytexgen") if _dist_version else "1.0.1"
+except _PackageNotFoundError:
+    __version__ = "1.0.1"
 
 # Import the SWIG-generated Core module (the compiled C++ bindings)
 # This makes all Core classes/functions available directly on pytexgen,

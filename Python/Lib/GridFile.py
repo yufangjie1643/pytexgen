@@ -15,7 +15,10 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-from TexGen.Core import *
+try:
+    from .Core import *
+except ImportError:
+    from TexGen.Core import *
 
 def AverageZComparison(x, y):
     """ Take the average of second and third element in an array and compare
@@ -104,7 +107,7 @@ def ExportGridFile(Filename, TextileName, NumPoints):
     File.write('** GRID POINTS: NUMVOLUMES { VOLUME NUMBER, BOTTOM Z, TOP Z, DIRECTION (X, Y, Z) }\n')
     for Intersections, Point in zip(IntersectionsList, Points):
         # Sort the intersections in ascending order of the average of ZMin and ZMax
-        Intersections.sort(cmp=AverageZComparison)
+        Intersections.sort(key=lambda item: item[1] + item[2])
         # Write out the number of volumes
         File.write(str(1+2*len(Intersections)) + '\n')
         # Store the Z coordinate of the previous volume

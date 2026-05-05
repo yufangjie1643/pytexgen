@@ -17,8 +17,8 @@
 
 import unittest
 from TestUtils import GetTestTextile
-from TexGen.WiseTex import ImportWiseTex
-from TexGen.Core import *
+from pytexgen.WiseTex import ImportWiseTex
+from pytexgen import *
 
 class ImportTest(unittest.TestCase):
     def tearDown(self):

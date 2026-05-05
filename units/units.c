@@ -35,6 +35,7 @@
 #include<stdio.h>
 #include<string.h>
 #include<stdlib.h>
+#include<ctype.h>
 
 
 /*  Define a few useful constants  */

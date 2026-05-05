@@ -58,13 +58,20 @@ pytexgen brings the full power of the TexGen C++ engine to Python, enabling scri
 pip install pytexgen
 ```
 
-Requires **Python 3.7+**. Pre-built binary wheels are provided for all major platforms — no compiler or C++ dependencies needed.
+Requires **Python 3.9+**. Pre-built binary wheels are provided for all major platforms — no compiler or C++ dependencies needed.
 
 To verify the installation:
 
 ```python
 import pytexgen
 print(pytexgen.__version__)
+```
+
+The OpenMP-free Python voxelizer is optional:
+
+```bash
+pip install "pytexgen[voxel]"  # numpy CPU/adaptive backend
+pip install "pytexgen[gpu]"    # numpy + torch backend
 ```
 
 ---
@@ -402,6 +409,10 @@ domain.GetBoxLimits(min_pt, max_pt)
 | `CSurfaceMesh()` | Surface triangulation |
 | `CShellElementExport(...)` | Shell element export |
 
+`COctreeVoxelMesh` requires p4est/sc libraries and is not included in the default binary wheels.
+For portable installs, `pytexgen.gpu_voxelizer.voxelize_textile(..., adaptive=True)`
+provides lightweight numpy adaptive voxel output without p4est.
+
 Boundary condition types: `"CPeriodicBoundaries"`, `"CMaterialPeriodic"`, etc.
 
 Voxel mesh export example:
@@ -418,6 +429,34 @@ vox.SaveVoxelMesh(
     0                 # offset
 )
 ```
+
+OpenMP-free Python backend alternative:
+
+```python
+from pytexgen.gpu_voxelizer import voxelize_textile
+
+voxelize_textile(
+    textile,
+    nx=nx, ny=ny, nz=nz,
+    out_inp="mesh_numpy.inp",
+    backend="numpy",  # or "torch" for CUDA/MPS/torch CPU
+    workers=4,        # numpy backend only
+)
+
+voxelize_textile(
+    textile,
+    nx=16, ny=16, nz=8,
+    out_inp="mesh_adaptive_numpy.inp",
+    backend="numpy",
+    adaptive=True,
+    adaptive_levels=2,
+)
+```
+
+`adaptive=True` refines cells whose center/corners disagree on yarn ownership and
+writes non-uniform C3D8R cells. It does not generate p4est-style 2:1 balancing or
+hanging-node constraints; use a local p4est-enabled `COctreeVoxelMesh` build when
+those conforming adaptive FEM features are required.
 
 ### Math Utilities
 
@@ -459,14 +498,17 @@ If you need to build pytexgen from source (e.g., for development or unsupported 
 
 - **CMake** 3.17+
 - **C++ compiler** with C++11 support (GCC, Clang, or MSVC)
-- **SWIG** (for regenerating Python bindings)
-- **Python** 3.7+ with `scikit-build-core`
+- **Python** 3.9+ with `scikit-build-core`
+
+SWIG is not required for normal wheel builds because generated bindings are
+committed in the repository. Install SWIG only when changing `Python/Core.i`
+and configure with `-DTEXGEN_REGENERATE_SWIG=ON`.
 
 ### Build Steps
 
 ```bash
-git clone https://github.com/louisepb/TexGen.git
-cd TexGen
+git clone https://github.com/yufangjie1643/pytexgen.git
+cd pytexgen
 
 # Install build dependencies
 pip install scikit-build-core
@@ -487,6 +529,9 @@ python -m build
 | `BUILD_RENDERER` | OFF | Build OpenGL renderer |
 | `BUILD_GUI` | OFF | Build wxWidgets GUI |
 | `BUILD_SHARED` | OFF | Shared libs (OFF for wheels) |
+| `TEXGEN_ENABLE_OPENMP` | OFF | Enable optional C++ OpenMP point-classification loops |
+| `TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS` | OFF | Enable local CPU-specific flags such as `-march=native` |
+| `TEXGEN_REGENERATE_SWIG` | OFF | Regenerate Python bindings from `Python/Core.i` |
 
 ---
 
@@ -497,6 +542,8 @@ TexGen/
 ├── Core/                   # C++ engine (textile geometry, meshing, export)
 ├── Python/
 │   ├── Core.i              # SWIG interface — C++ to Python bindings
+│   ├── Core.py             # Committed SWIG-generated Python proxy
+│   ├── Core_wrap.cxx       # Committed SWIG-generated C++ wrapper
 │   ├── Scripts/            # Example scripts
 │   └── Lib/                # Python utility modules (Abaqus, Ansys, ...)
 ├── src/pytexgen/           # Python package (installed via pip)

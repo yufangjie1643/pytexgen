@@ -1,11 +1,6 @@
 IF(BUILD_PYTHON_INTERFACE)
 
     # ========================================================================
-    # Find SWIG
-    # ========================================================================
-    FIND_PACKAGE(SWIG REQUIRED)
-
-    # ========================================================================
     # Find Python - use modern FindPython for scikit-build-core compatibility
     # ========================================================================
     if(DEFINED SKBUILD)
@@ -26,24 +21,48 @@ IF(BUILD_PYTHON_INTERFACE)
     INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../OctreeRefinement/include)
 
     # ========================================================================
-    # SWIG: Generate Core wrapper
+    # SWIG Core wrapper
+    #
+    # Wheel builds use committed generated files by default so users and CI do
+    # not need a system SWIG install.  Set TEXGEN_REGENERATE_SWIG=ON only when
+    # Core.i or wrapped C++ APIs change.
     # ========================================================================
-    FILE(GLOB CORE_HEADER_FILES ../Core/*.h)
+    set(TEXGEN_CORE_SWIG_PY "${CMAKE_CURRENT_SOURCE_DIR}/Core.py")
+    set(TEXGEN_CORE_SWIG_CXX "${CMAKE_CURRENT_SOURCE_DIR}/Core_wrap.cxx")
 
-    # Pass -DTEXGEN_USE_P4EST to SWIG when p4est is available
-    set(SWIG_P4EST_FLAG "")
-    if(TEXGEN_HAS_P4EST)
-        set(SWIG_P4EST_FLAG "-DTEXGEN_USE_P4EST")
+    if(TEXGEN_REGENERATE_SWIG)
+        FIND_PACKAGE(SWIG REQUIRED)
+        FILE(GLOB CORE_HEADER_FILES ../Core/*.h)
+
+        # Pass -DTEXGEN_USE_P4EST to SWIG when p4est is available.
+        set(SWIG_P4EST_FLAG "")
+        if(TEXGEN_HAS_P4EST)
+            set(SWIG_P4EST_FLAG "-DTEXGEN_USE_P4EST")
+        endif()
+
+        ADD_CUSTOM_COMMAND(OUTPUT "${TEXGEN_CORE_SWIG_CXX}" "${TEXGEN_CORE_SWIG_PY}"
+            COMMAND "${SWIG_EXECUTABLE}" -c++ -python
+                ${SWIG_P4EST_FLAG}
+                -outdir "${CMAKE_CURRENT_SOURCE_DIR}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/Core.i"
+            MAIN_DEPENDENCY "${CMAKE_CURRENT_SOURCE_DIR}/Core.i"
+            DEPENDS ${CORE_HEADER_FILES}
+            COMMENT "Generating SWIG Core wrapper code...")
+        SET_SOURCE_FILES_PROPERTIES("${TEXGEN_CORE_SWIG_CXX}" PROPERTIES GENERATED 1)
+    else()
+        if(NOT EXISTS "${TEXGEN_CORE_SWIG_CXX}" OR NOT EXISTS "${TEXGEN_CORE_SWIG_PY}")
+            MESSAGE(FATAL_ERROR
+                "Pre-generated SWIG files are missing. Expected:\n"
+                "  ${TEXGEN_CORE_SWIG_CXX}\n"
+                "  ${TEXGEN_CORE_SWIG_PY}\n"
+                "Install SWIG and configure with -DTEXGEN_REGENERATE_SWIG=ON "
+                "to regenerate them.")
+        endif()
+        MESSAGE(STATUS "Using pre-generated SWIG Core wrapper")
+        if(TEXGEN_HAS_P4EST)
+            MESSAGE(STATUS "Pre-generated Core wrapper omits p4est; use -DTEXGEN_REGENERATE_SWIG=ON to expose COctreeVoxelMesh")
+        endif()
     endif()
-
-    ADD_CUSTOM_COMMAND(OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/Core_wrap.cxx"
-        COMMAND "${SWIG_EXECUTABLE}" -c++ -python
-            ${SWIG_P4EST_FLAG}
-            -outdir "${CMAKE_CURRENT_SOURCE_DIR}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/Core.i"
-        MAIN_DEPENDENCY "${CMAKE_CURRENT_SOURCE_DIR}/Core.i"
-        DEPENDS ${CORE_HEADER_FILES}
-        COMMENT "Generating SWIG Core wrapper code...")
 
     if(COMMAND cmake_policy)
         cmake_policy(SET CMP0003 NEW)
@@ -52,13 +71,21 @@ IF(BUILD_PYTHON_INTERFACE)
     # ========================================================================
     # Build _Core extension module
     # ========================================================================
-    ADD_LIBRARY(_Core MODULE Core.i Core_wrap.cxx)
-    SET_SOURCE_FILES_PROPERTIES(Core_wrap.cxx PROPERTIES GENERATED 1)
+    ADD_LIBRARY(_Core MODULE "${TEXGEN_CORE_SWIG_CXX}")
 
     # Naming conventions: _Core.pyd (Windows) or _Core.so (Unix)
     SET_TARGET_PROPERTIES(_Core PROPERTIES PREFIX "" DEBUG_POSTFIX "_d")
     IF(WIN32)
-        SET_TARGET_PROPERTIES(_Core PROPERTIES SUFFIX ".pyd")
+        SET_TARGET_PROPERTIES(_Core PROPERTIES
+            SUFFIX ".pyd"
+            WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        if(MINGW)
+            target_link_options(_Core PRIVATE
+                "-Wl,--export-all-symbols"
+                "-static"
+                "-static-libgcc"
+                "-static-libstdc++")
+        endif()
     ENDIF()
 
     IF(UNIX)
@@ -109,11 +136,15 @@ IF(BUILD_PYTHON_INTERFACE)
             RUNTIME DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
         # SWIG-generated Python proxy (Core.py)
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/Core.py"
+        install(FILES "${TEXGEN_CORE_SWIG_PY}"
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
         # Python utility modules (Abaqus.py, Ansys.py, etc.)
         install(FILES ${PYTHON_MODULE_FILES}
+            DESTINATION ${PYTEXGEN_INSTALL_DIR})
+
+        # Optional GPU voxelizer lives in the source compatibility package.
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/gpu_voxelizer.py"
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
         # On Windows, also install the TexGenCore DLL if built as shared
@@ -137,7 +168,7 @@ IF(BUILD_PYTHON_INTERFACE)
 
         FILE(WRITE "__init__.py" "# __all__ = [${PYTHON_MODULES}]")
 
-        INSTALL(FILES __init__.py Core.py
+        INSTALL(FILES __init__.py "${TEXGEN_CORE_SWIG_PY}"
             DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
         INSTALL(FILES ${PYTHON_MODULE_FILES}
             DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
@@ -162,6 +193,7 @@ IF(BUILD_PYTHON_INTERFACE)
     # Renderer module (only in legacy mode - not included in core wheel)
     # ========================================================================
     IF(BUILD_RENDERER AND NOT DEFINED SKBUILD)
+        FIND_PACKAGE(SWIG REQUIRED)
         FILE(GLOB RENDERER_HEADER_FILES ../Renderer/*.h)
         FIND_PACKAGE(VTK 6.3 REQUIRED NO_MODULE)
         INCLUDE_DIRECTORIES(${VTK_INCLUDE_DIRS})
@@ -212,6 +244,7 @@ IF(BUILD_PYTHON_INTERFACE)
     # Export module (only in legacy mode - not included in core wheel)
     # ========================================================================
     IF(BUILD_CASCADE_EXPORT AND NOT DEFINED SKBUILD)
+        FIND_PACKAGE(SWIG REQUIRED)
         SET(EXPORT_HEADER_FILES ../Export/Exporter.h)
 
         ADD_CUSTOM_COMMAND(OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/Export_wrap.cxx"
