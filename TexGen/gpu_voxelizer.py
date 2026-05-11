@@ -20,12 +20,14 @@ Design goals:
 
 Usage:
     from pytexgen import *
-    from pytexgen.gpu_voxelizer import voxelize_textile
+    from pytexgen.gpu_voxelizer import voxelize_textile, voxelize_textile_data
 
     T = CShearedTextileWeave2D(3,3,5.0,2.0,0.2618,True,True)
     T.SetYarnWidths(2.0); T.SetYarnHeights(0.8); T.AssignDefaultDomain()
 
     voxelize_textile(T, nx=64, ny=64, nz=64, out_inp="out.inp", backend="numpy")
+    data = voxelize_textile_data(T, nx=64, ny=64, nz=64, backend="torch")
+    material_grid = data.material_id()
     voxelize_textile(T, nx=16, ny=16, nz=8, out_inp="adaptive.inp",
                      backend="numpy", adaptive=True, adaptive_levels=2)
     voxelize_textile(T, nx=64, ny=64, nz=64, out_inp="out_torch.inp", backend="torch")
@@ -34,14 +36,45 @@ Usage:
 from __future__ import annotations
 
 import math
+import importlib
+import json
 import os
 import time
+from collections.abc import Mapping as MappingABC
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+
+DEFAULT_NUMPY_CHUNK_VOXELS = 8192
+
+
+def _progress_iter(iterable: Iterable[Any],
+                   progress: Any = False,
+                   *,
+                   total: Optional[int] = None,
+                   desc: Optional[str] = None,
+                   unit: str = "it") -> Iterable[Any]:
+    """Wrap an iterable with tqdm when progress reporting is requested.
+
+    ``progress`` may be ``True`` to use ``tqdm.auto.tqdm`` or a callable with a
+    tqdm-compatible signature for tests and host applications. Keeping tqdm
+    lazy avoids adding it to the base runtime dependency set.
+    """
+    if not progress:
+        return iterable
+    if callable(progress):
+        return progress(iterable, total=total, desc=desc, unit=unit)
+    try:
+        from tqdm.auto import tqdm
+    except ImportError as exc:
+        raise ImportError(
+            "progress=True requires tqdm. Install it with `pip install tqdm` "
+            'or `pip install "pytexgen[progress]"`.'
+        ) from exc
+    return tqdm(iterable, total=total, desc=desc, unit=unit)
 
 try:
     import torch
@@ -110,6 +143,117 @@ class AdaptiveVoxelCells:
 
 
 @dataclass
+class SnapshotBundle:
+    """Structure-of-arrays snapshot for high-throughput C++/Python handoff.
+
+    The existing public voxelizer operates on ``YarnSnapshot`` objects for
+    readability. Future C++/nanobind providers can return this flatter layout
+    instead, avoiding thousands of small SWIG object reads while keeping the
+    downstream numpy/torch voxelizer API stable.
+    """
+    positions: np.ndarray
+    tangents: np.ndarray
+    ups: np.ndarray
+    sides: np.ndarray
+    node_offsets: np.ndarray
+    sections: np.ndarray
+    section_offsets: np.ndarray
+    translations: np.ndarray
+    translation_offsets: np.ndarray
+    aabb: np.ndarray
+
+    @property
+    def num_yarns(self) -> int:
+        """Return the number of yarn snapshots stored in this bundle."""
+        return int(len(self.node_offsets) - 1)
+
+    @classmethod
+    def from_snapshots(cls,
+                       snapshots: List[YarnSnapshot],
+                       aabb: np.ndarray) -> "SnapshotBundle":
+        """Pack per-yarn snapshots into flat arrays plus offset tables."""
+        node_offsets = [0]
+        section_offsets = [0]
+        translation_offsets = [0]
+        positions = []
+        tangents = []
+        ups = []
+        sides = []
+        sections = []
+        translations = []
+
+        for snap in snapshots:
+            positions.append(np.asarray(snap.positions))
+            tangents.append(np.asarray(snap.tangents))
+            ups.append(np.asarray(snap.ups))
+            sides.append(np.asarray(snap.sides))
+            sections.append(np.asarray(snap.section))
+            translations.append(np.asarray(snap.translations))
+            node_offsets.append(node_offsets[-1] + int(snap.positions.shape[0]))
+            section_offsets.append(section_offsets[-1] + int(snap.section.shape[0]))
+            translation_offsets.append(
+                translation_offsets[-1] + int(snap.translations.shape[0])
+            )
+
+        coord_dtype = (
+            np.asarray(snapshots[0].positions).dtype if snapshots else np.float64
+        )
+        section_dtype = (
+            np.asarray(snapshots[0].section).dtype if snapshots else coord_dtype
+        )
+
+        return cls(
+            positions=(
+                np.concatenate(positions, axis=0)
+                if positions else np.empty((0, 3), dtype=coord_dtype)
+            ),
+            tangents=(
+                np.concatenate(tangents, axis=0)
+                if tangents else np.empty((0, 3), dtype=coord_dtype)
+            ),
+            ups=(
+                np.concatenate(ups, axis=0)
+                if ups else np.empty((0, 3), dtype=coord_dtype)
+            ),
+            sides=(
+                np.concatenate(sides, axis=0)
+                if sides else np.empty((0, 3), dtype=coord_dtype)
+            ),
+            node_offsets=np.asarray(node_offsets, dtype=np.int64),
+            sections=(
+                np.concatenate(sections, axis=0)
+                if sections else np.empty((0, 2), dtype=section_dtype)
+            ),
+            section_offsets=np.asarray(section_offsets, dtype=np.int64),
+            translations=(
+                np.concatenate(translations, axis=0)
+                if translations else np.empty((0, 3), dtype=coord_dtype)
+            ),
+            translation_offsets=np.asarray(translation_offsets, dtype=np.int64),
+            aabb=np.asarray(aabb, dtype=np.float64),
+        )
+
+    def to_snapshots(self) -> List[YarnSnapshot]:
+        """Unpack this bundle into the existing ``YarnSnapshot`` representation."""
+        snapshots: List[YarnSnapshot] = []
+        for index in range(self.num_yarns):
+            n0, n1 = self.node_offsets[index:index + 2]
+            s0, s1 = self.section_offsets[index:index + 2]
+            t0, t1 = self.translation_offsets[index:index + 2]
+            snapshots.append(
+                YarnSnapshot(
+                    positions=self.positions[n0:n1],
+                    tangents=self.tangents[n0:n1],
+                    ups=self.ups[n0:n1],
+                    sides=self.sides[n0:n1],
+                    section=self.sections[s0:s1],
+                    translations=self.translations[t0:t1],
+                )
+            )
+        return snapshots
+
+
+@dataclass
 class BackendSelection:
     """Resolved numerical backend settings."""
     backend: str
@@ -118,6 +262,404 @@ class BackendSelection:
     np_dtype: Optional[type] = None
     torch_dtype: Optional[object] = None
     torch_module: Optional[object] = None
+
+
+@dataclass
+class VoxelGridData:
+    """Structured voxel data for direct numpy/torch solver handoff.
+
+    ``yarn_id`` is stored in TexGen element order:
+    ``ix + iy*nx + iz*nx*ny``. The ``grid`` property exposes the same data as a
+    ``(nz, ny, nx)`` view without copying for both numpy arrays and torch
+    tensors.
+    """
+    yarn_id: Any
+    aabb: Any
+    resolution: Tuple[int, int, int]
+    backend: str
+    device: str
+    workers: int
+    dtype: str
+    timings: Dict[str, float]
+    centers: Optional[Any] = None
+    aabb_pruning: bool = True
+    storage: str = "numpy"
+    order: str = "ix + iy*nx + iz*nx*ny"
+
+    @property
+    def shape(self) -> Tuple[int, int, int]:
+        """Return the structured grid shape as ``(nz, ny, nx)``."""
+        nx, ny, nz = self.resolution
+        return (nz, ny, nx)
+
+    @property
+    def grid(self):
+        """Return ``yarn_id`` as a zero-copy ``(nz, ny, nx)`` view."""
+        return self.yarn_id.reshape(self.shape)
+
+    @property
+    def voxel_size(self):
+        """Return voxel spacing along x, y and z in the current array backend."""
+        nx, ny, nz = self.resolution
+        if _is_torch_tensor(self.aabb):
+            denom = self.aabb.new_tensor([nx, ny, nz], dtype=self.aabb.dtype)
+        else:
+            aabb_np = np.asarray(self.aabb)
+            denom = np.asarray([nx, ny, nz], dtype=aabb_np.dtype)
+        return (self.aabb[1] - self.aabb[0]) / denom
+
+    def occupancy(self):
+        """Return a boolean grid where yarn voxels are true."""
+        return self.grid >= 0
+
+    def material_id(self, matrix_id: int = 0, yarn_offset: int = 1):
+        """Return solver-friendly material ids as a ``(nz, ny, nx)`` grid.
+
+        Matrix voxels are assigned ``matrix_id``. Yarn ids are shifted by
+        ``yarn_offset`` so TexGen yarn 0 can map to material id 1 by default.
+        """
+        grid = self.grid
+        if _is_torch_tensor(grid):
+            torch_mod = _require_torch()
+            matrix = grid.new_full(grid.shape, int(matrix_id))
+            return torch_mod.where(grid >= 0, grid + int(yarn_offset), matrix)
+        return np.where(grid >= 0, grid + int(yarn_offset), int(matrix_id))
+
+    def to(self,
+           storage: Optional[str] = None,
+           *,
+           device: Optional[str] = None,
+           dtype: Optional[object] = None,
+           copy: bool = False) -> "VoxelGridData":
+        """Return this voxel data in another array storage backend.
+
+        This follows the spirit of ``torch.Tensor.to(...)`` at the container
+        level: it converts the stored arrays while preserving metadata and the
+        public ``VoxelGridData`` API. Use ``data.grid`` or ``data.material_id()``
+        to pass individual arrays/tensors to downstream code.
+
+        Parameters
+        ----------
+        storage : {"numpy", "torch", None}
+            Target array backend. ``None`` keeps the current backend and only
+            applies device/copy handling when the data is torch-backed.
+        device : str or None
+            Target torch device. Ignored for numpy output.
+        dtype : object or None
+            Target floating-point dtype, for example ``"float32"``,
+            ``np.float32`` or ``torch.float32``. Integer label arrays such as
+            ``yarn_id`` are intentionally kept as integers.
+        copy : bool
+            Force a copy/clone even when the current storage already matches.
+        """
+        target = self.storage if storage is None else storage.lower()
+        if target not in {"numpy", "torch"}:
+            raise ValueError('storage must be "numpy", "torch", or None')
+        if target == "numpy":
+            return self.to_numpy(copy=copy, dtype=dtype)
+        return self.to_torch(device=device, copy=copy, dtype=dtype)
+
+    def to_numpy(self, copy: bool = False,
+                 dtype: Optional[object] = None) -> "VoxelGridData":
+        """Return an equivalent data object backed by numpy arrays.
+
+        Prefer ``data.to("numpy")`` in new code.
+        """
+        np_dtype = _resolve_numpy_array_dtype(dtype)
+        yarn_id = _array_to_numpy(self.yarn_id, copy=copy)
+        aabb = _array_to_numpy(self.aabb, copy=copy)
+        centers = None if self.centers is None else _array_to_numpy(self.centers, copy=copy)
+        if np_dtype is not None:
+            aabb = aabb.astype(np_dtype, copy=copy or aabb.dtype != np_dtype)
+            if centers is not None:
+                centers = centers.astype(np_dtype, copy=copy or centers.dtype != np_dtype)
+        return VoxelGridData(
+            yarn_id=yarn_id,
+            aabb=aabb,
+            resolution=self.resolution,
+            backend=self.backend,
+            device="cpu",
+            workers=self.workers,
+            dtype=self.dtype if np_dtype is None else np_dtype.name,
+            timings=dict(self.timings),
+            centers=centers,
+            aabb_pruning=self.aabb_pruning,
+            storage="numpy",
+            order=self.order,
+        )
+
+    def to_torch(self, device: Optional[str] = None,
+                 copy: bool = False,
+                 dtype: Optional[object] = None) -> "VoxelGridData":
+        """Return an equivalent data object backed by torch tensors.
+
+        Prefer ``data.to("torch", device=...)`` in new code.
+        """
+        torch_mod = _require_torch()
+        yarn_id = _array_to_torch(self.yarn_id, torch_mod, device=device, copy=copy)
+        torch_dtype = _resolve_torch_array_dtype(torch_mod, dtype)
+        aabb = _array_to_torch(
+            self.aabb, torch_mod, device=str(yarn_id.device), copy=copy
+        )
+        if torch_dtype is not None:
+            aabb = aabb.to(dtype=torch_dtype, copy=copy)
+        centers = None
+        if self.centers is not None:
+            centers = _array_to_torch(
+                self.centers, torch_mod, device=str(yarn_id.device), copy=copy
+            )
+            if torch_dtype is not None:
+                centers = centers.to(dtype=torch_dtype, copy=copy)
+        return VoxelGridData(
+            yarn_id=yarn_id,
+            aabb=aabb,
+            resolution=self.resolution,
+            backend=self.backend,
+            device=str(yarn_id.device),
+            workers=self.workers,
+            dtype=self.dtype if torch_dtype is None else _torch_dtype_name(torch_dtype),
+            timings=dict(self.timings),
+            centers=centers,
+            aabb_pruning=self.aabb_pruning,
+            storage="torch",
+            order=self.order,
+        )
+
+    def save_npz(self, path: str,
+                 *,
+                 compressed: bool = True,
+                 include_centers: bool = True) -> None:
+        """Save voxel data to a portable numpy ``.npz`` file.
+
+        Tensor-backed data is copied to CPU numpy arrays before writing. The
+        saved file is intended for fast reload into numpy or torch without
+        going through Abaqus ``.inp`` text output.
+        """
+        payload = {
+            "yarn_id": _array_to_numpy(self.yarn_id, copy=False),
+            "aabb": _array_to_numpy(self.aabb, copy=False),
+            "resolution": np.asarray(self.resolution, dtype=np.int64),
+            "aabb_pruning": np.asarray(bool(self.aabb_pruning)),
+            "backend": np.asarray(self.backend),
+            "device": np.asarray(self.device),
+            "dtype": np.asarray(self.dtype),
+            "storage": np.asarray(self.storage),
+            "order": np.asarray(self.order),
+            "timings_json": np.asarray(json.dumps(self.timings)),
+        }
+        if include_centers and self.centers is not None:
+            payload["centers"] = _array_to_numpy(self.centers, copy=False)
+
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        saver = np.savez_compressed if compressed else np.savez
+        saver(out_path, **payload)
+
+    @classmethod
+    def load_npz(cls, path: str,
+                 *,
+                 output: str = "numpy",
+                 device: Optional[str] = None) -> "VoxelGridData":
+        """Load voxel data saved by :meth:`save_npz`.
+
+        Parameters
+        ----------
+        output : {"numpy", "torch"}
+            Storage backend for the returned object.
+        device : str or None
+            Torch device when ``output="torch"``.
+        """
+        output = output.lower()
+        if output not in {"numpy", "torch"}:
+            raise ValueError('output must be "numpy" or "torch"')
+
+        with np.load(path, allow_pickle=False) as data:
+            timings_raw = str(data["timings_json"].item())
+            centers = data["centers"].copy() if "centers" in data.files else None
+            obj = cls(
+                yarn_id=data["yarn_id"].copy(),
+                aabb=data["aabb"].copy(),
+                resolution=tuple(int(v) for v in data["resolution"].tolist()),
+                backend=str(data["backend"].item()),
+                device="cpu",
+                workers=1,
+                dtype=str(data["dtype"].item()),
+                timings=json.loads(timings_raw),
+                centers=centers,
+                aabb_pruning=bool(data["aabb_pruning"].item()),
+                storage="numpy",
+                order=str(data["order"].item()),
+            )
+
+        if output == "torch":
+            return obj.to_torch(device=device, copy=False)
+        return obj
+
+    def to_dlpack(self, field: str = "yarn_id"):
+        """Export one voxel data field as a DLPack capsule.
+
+        Parameters
+        ----------
+        field : {"yarn_id", "material_id", "occupancy"}
+            Field to expose. ``material_id`` uses the default
+            :meth:`material_id` mapping and ``occupancy`` exports the boolean
+            yarn mask.
+
+        Returns
+        -------
+        PyCapsule
+            DLPack capsule consumable by torch, CuPy, JAX, and other tensor
+            libraries that support the DLPack Python protocol.
+        """
+        if torch is None:
+            raise ImportError(
+                "DLPack export requires PyTorch. Install with "
+                '`pip install "pytexgen[gpu]"` or convert through numpy.'
+            )
+
+        field = field.lower()
+        if field == "yarn_id":
+            value = self.yarn_id
+        elif field == "material_id":
+            value = self.material_id()
+        elif field == "occupancy":
+            value = self.occupancy()
+        else:
+            raise ValueError(
+                'field must be one of "yarn_id", "material_id", or "occupancy"'
+            )
+
+        tensor = value if _is_torch_tensor(value) else torch.as_tensor(value)
+        return torch.utils.dlpack.to_dlpack(tensor)
+
+
+@dataclass
+class VoxelizationCache:
+    """Cached TexGen geometry snapshots for repeated voxelization.
+
+    Use this when the same textile is voxelized at multiple resolutions or sent
+    to multiple array backends. It avoids repeating the SWIG/C++ object walk in
+    :func:`extract_snapshots`.
+    """
+    snapshots: List["YarnSnapshot"]
+    aabb: np.ndarray
+
+    @classmethod
+    def from_textile(cls, textile: CTextile) -> "VoxelizationCache":
+        """Extract and cache yarn snapshots from a built textile."""
+        bundle = extract_snapshot_bundle(textile)
+        snapshots, aabb = bundle.to_snapshots(), bundle.aabb
+        if len(snapshots) == 0:
+            raise RuntimeError("No yarns extracted - textile may be empty or unbuilt")
+        return cls(snapshots=snapshots, aabb=aabb)
+
+    @classmethod
+    def from_bundle(cls, bundle: SnapshotBundle) -> "VoxelizationCache":
+        """Create a cache from a structure-of-arrays snapshot bundle."""
+        bundle = _coerce_snapshot_bundle(bundle)
+        return cls(snapshots=bundle.to_snapshots(), aabb=bundle.aabb)
+
+    def voxelize(self, nx: int = 64, ny: int = 64, nz: int = 64,
+                 **kwargs) -> VoxelGridData:
+        """Voxelize cached snapshots without re-reading the TexGen textile."""
+        return voxelize_snapshots_data(
+            self.snapshots, self.aabb, nx=nx, ny=ny, nz=nz, **kwargs
+        )
+
+
+def _is_torch_tensor(value) -> bool:
+    """Return true when ``value`` behaves like a torch tensor."""
+    return hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "device")
+
+
+def _array_to_numpy(value, copy: bool = False):
+    """Convert numpy-like or torch tensor data to a numpy array."""
+    if _is_torch_tensor(value):
+        array = value.detach().cpu().numpy()
+        return array.copy() if copy else array
+    return np.array(value, copy=copy)
+
+
+def _array_to_torch(value, torch_mod, device: Optional[str] = None, copy: bool = False):
+    """Convert numpy-like or torch tensor data to a torch tensor."""
+    if _is_torch_tensor(value):
+        tensor = value.to(device=device) if device is not None else value
+    else:
+        tensor = torch_mod.as_tensor(value)
+        if device is not None:
+            tensor = tensor.to(device=device)
+    return tensor.clone() if copy else tensor
+
+
+def _resolve_numpy_array_dtype(dtype):
+    """Resolve a dtype accepted by ``VoxelGridData.to('numpy', dtype=...)``."""
+    if dtype is None:
+        return None
+    if hasattr(dtype, "is_floating_point"):
+        name = str(dtype).replace("torch.", "")
+        if name == "bfloat16":
+            raise ValueError("numpy output does not support torch.bfloat16 dtype")
+        dtype = name
+    np_dtype = np.dtype(dtype)
+    if not np.issubdtype(np_dtype, np.floating):
+        raise ValueError(f"numpy conversion dtype must be floating, got {np_dtype}")
+    return np_dtype
+
+
+def _resolve_torch_array_dtype(torch_mod, dtype):
+    """Resolve a dtype accepted by ``VoxelGridData.to('torch', dtype=...)``."""
+    if dtype is None:
+        return None
+    if isinstance(dtype, str):
+        dtype = dtype.replace("torch.", "")
+        try:
+            return {
+                "float16": torch_mod.float16,
+                "float32": torch_mod.float32,
+                "float64": torch_mod.float64,
+                "bfloat16": torch_mod.bfloat16,
+            }[dtype.lower()]
+        except KeyError:
+            raise ValueError(
+                'torch dtype string must be "float16", "float32", '
+                '"float64", or "bfloat16"'
+            )
+    if hasattr(dtype, "is_floating_point"):
+        if not dtype.is_floating_point:
+            raise ValueError(f"torch conversion dtype must be floating, got {dtype}")
+        return dtype
+    # Accept numpy dtype-like objects for convenience.
+    np_dtype = np.dtype(dtype)
+    if not np.issubdtype(np_dtype, np.floating):
+        raise ValueError(f"torch conversion dtype must be floating, got {np_dtype}")
+    return {
+        np.dtype("float16"): torch_mod.float16,
+        np.dtype("float32"): torch_mod.float32,
+        np.dtype("float64"): torch_mod.float64,
+    }.get(np_dtype) or (_raise_unsupported_torch_dtype(np_dtype))
+
+
+def _raise_unsupported_torch_dtype(np_dtype):
+    """Raise a consistent error for unsupported torch conversion dtypes."""
+    raise ValueError(f"unsupported torch floating dtype: {np_dtype}")
+
+
+def _torch_dtype_name(dtype) -> str:
+    """Return a compact dtype metadata name from a torch dtype."""
+    return str(dtype).replace("torch.", "")
+
+
+def _coerce_voxel_grid_output(data: VoxelGridData,
+                              output: str,
+                              device: Optional[str]) -> VoxelGridData:
+    """Convert a ``VoxelGridData`` object to the requested storage backend."""
+    if output == "backend":
+        return data
+    if output == "numpy":
+        return data.to("numpy", copy=False)
+    if output == "torch":
+        return data.to("torch", device=device, copy=False)
+    raise ValueError('output must be one of "backend", "numpy", or "torch"')
 
 
 def _xyz(v) -> np.ndarray:
@@ -287,6 +829,85 @@ def extract_snapshots(textile: CTextile) -> Tuple[List[YarnSnapshot], np.ndarray
     return snapshots, aabb
 
 
+def _coerce_snapshot_bundle(value: Any) -> SnapshotBundle:
+    """Return ``value`` as a ``SnapshotBundle``.
+
+    Fast C++ providers may return the dataclass directly or a mapping of arrays
+    with the same field names. Keeping the coercion here gives external
+    providers a small, stable contract.
+    """
+    if isinstance(value, SnapshotBundle):
+        return value
+    if isinstance(value, MappingABC):
+        required = (
+            "positions", "tangents", "ups", "sides", "node_offsets",
+            "sections", "section_offsets", "translations",
+            "translation_offsets", "aabb",
+        )
+        missing = [key for key in required if key not in value]
+        if missing:
+            raise ValueError(
+                "snapshot bundle mapping is missing required field(s): "
+                + ", ".join(missing)
+            )
+        return SnapshotBundle(
+            positions=np.asarray(value["positions"]),
+            tangents=np.asarray(value["tangents"]),
+            ups=np.asarray(value["ups"]),
+            sides=np.asarray(value["sides"]),
+            node_offsets=np.asarray(value["node_offsets"], dtype=np.int64),
+            sections=np.asarray(value["sections"]),
+            section_offsets=np.asarray(value["section_offsets"], dtype=np.int64),
+            translations=np.asarray(value["translations"]),
+            translation_offsets=np.asarray(value["translation_offsets"], dtype=np.int64),
+            aabb=np.asarray(value["aabb"], dtype=np.float64),
+        )
+    raise TypeError(
+        "fastdata provider must return SnapshotBundle or a mapping of bundle arrays"
+    )
+
+
+def _load_fastdata_provider():
+    """Return an optional compiled fastdata provider module, if installed."""
+    candidates = []
+    package = __package__
+    if package:
+        candidates.append(f"{package}._fastdata")
+    candidates.append("TexGen._fastdata")
+
+    seen = set()
+    for module_name in candidates:
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        try:
+            provider = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(provider, "extract_snapshot_bundle"):
+            return provider
+    return None
+
+
+def extract_snapshot_bundle(textile: CTextile,
+                            provider: Optional[Any] = None) -> SnapshotBundle:
+    """Extract textile geometry as a structure-of-arrays bundle.
+
+    A provider module can be passed explicitly for tests or supplied by an
+    installed ``_fastdata`` extension. Without one, the function falls back to
+    the existing SWIG-based :func:`extract_snapshots` path.
+    """
+    provider = _load_fastdata_provider() if provider is None else provider
+    if provider is not None:
+        extractor = getattr(provider, "extract_snapshot_bundle", None)
+        if extractor is None:
+            raise TypeError("fastdata provider lacks extract_snapshot_bundle")
+        return _coerce_snapshot_bundle(extractor(textile))
+
+    snapshots, aabb = extract_snapshots(textile)
+    return SnapshotBundle.from_snapshots(snapshots, aabb)
+
+
 # ---------------------------------------------------------------------------
 # Classification: for every voxel center, find owning yarn.
 # ---------------------------------------------------------------------------
@@ -400,7 +1021,8 @@ def _point_in_polygon_batch(points_uv: torch.Tensor,
 def _classify_voxels_torch(centers: torch.Tensor,
                            packed: dict,
                            chunk: int = 65536,
-                           aabb_pruning: bool = True) -> torch.Tensor:
+                           aabb_pruning: bool = True,
+                           progress: Any = False) -> torch.Tensor:
     """Classify voxel centers with the torch backend.
 
     Parameters
@@ -415,6 +1037,8 @@ def _classify_voxels_torch(centers: torch.Tensor,
     aabb_pruning : bool, default=True
         Skip yarn/translation candidates whose conservative bounding boxes
         cannot contain the current chunk.
+    progress : bool or callable, default=False
+        Show a tqdm progress bar over voxel chunks when true.
 
     Returns
     -------
@@ -436,7 +1060,11 @@ def _classify_voxels_torch(centers: torch.Tensor,
     num_yarns = P.shape[0]
 
     # Process voxels in chunks to cap VRAM.
-    for v0 in range(0, V, chunk):
+    chunk_starts = range(0, V, chunk)
+    for v0 in _progress_iter(
+        chunk_starts, progress, total=math.ceil(V / chunk),
+        desc="classify torch voxels", unit="chunk"
+    ):
         v1 = min(v0 + chunk, V)
         pts = centers[v0:v1]                           # (C, 3)
         C = pts.shape[0]
@@ -734,11 +1362,23 @@ def _default_numpy_workers() -> int:
     return max(1, min(os.cpu_count() or 1, 4))
 
 
+def _effective_numpy_workers(num_items: int,
+                             chunk: int,
+                             workers: Optional[int]) -> int:
+    """Return the actual numpy worker count after chunk-count clamping."""
+    worker_count = _default_numpy_workers() if workers is None else workers
+    if worker_count < 1:
+        raise ValueError("workers must be >= 1")
+    task_count = max(1, math.ceil(num_items / chunk))
+    return min(worker_count, task_count)
+
+
 def _classify_voxels_numpy(centers: np.ndarray,
                            snapshots: List[YarnSnapshot],
-                           chunk: int = 65536,
+                           chunk: int = DEFAULT_NUMPY_CHUNK_VOXELS,
                            workers: Optional[int] = None,
-                           aabb_pruning: bool = True) -> np.ndarray:
+                           aabb_pruning: bool = True,
+                           progress: Any = False) -> np.ndarray:
     """Classify all voxel centers with the numpy backend.
 
     Parameters
@@ -747,7 +1387,7 @@ def _classify_voxels_numpy(centers: np.ndarray,
         Voxel center coordinates, shape ``(V, 3)``.
     snapshots : list of YarnSnapshot
         Yarn snapshots to test.
-    chunk : int, default=65536
+    chunk : int, default=8192
         Number of voxel centers processed per task.
     workers : int or None, default=None
         Number of Python worker threads. ``None`` uses
@@ -755,6 +1395,8 @@ def _classify_voxels_numpy(centers: np.ndarray,
     aabb_pruning : bool, default=True
         Skip yarn/translation candidates whose conservative bounding boxes
         cannot contain the current voxel chunk.
+    progress : bool or callable, default=False
+        Show a tqdm progress bar over voxel chunks when true.
 
     Returns
     -------
@@ -767,10 +1409,7 @@ def _classify_voxels_numpy(centers: np.ndarray,
     ranges = [(v0, min(v0 + chunk, V)) for v0 in range(0, V, chunk)]
     bounds_list = [_snapshot_translation_bounds(s) for s in snapshots] if aabb_pruning else None
 
-    worker_count = _default_numpy_workers() if workers is None else workers
-    if worker_count < 1:
-        raise ValueError("workers must be >= 1")
-    worker_count = min(worker_count, len(ranges))
+    worker_count = _effective_numpy_workers(V, chunk, workers)
 
     def classify_range(range_bounds):
         """Classify one ``(start, stop)`` center slice for executor.map."""
@@ -780,12 +1419,19 @@ def _classify_voxels_numpy(centers: np.ndarray,
         )
 
     if worker_count == 1:
-        for range_bounds in ranges:
+        for range_bounds in _progress_iter(
+            ranges, progress, total=len(ranges),
+            desc="classify numpy voxels", unit="chunk"
+        ):
             v0, v1, ids = classify_range(range_bounds)
             yarn_id[v0:v1] = ids
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            for v0, v1, ids in executor.map(classify_range, ranges):
+            results = executor.map(classify_range, ranges)
+            for v0, v1, ids in _progress_iter(
+                results, progress, total=len(ranges),
+                desc="classify numpy voxels", unit="chunk"
+            ):
                 yarn_id[v0:v1] = ids
 
     return yarn_id
@@ -930,7 +1576,8 @@ def _refine_adaptive_cells(lows: np.ndarray,
                            chunk_voxels: int,
                            workers: Optional[int],
                            max_adaptive_cells: int,
-                           aabb_pruning: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                           aabb_pruning: bool = True,
+                           progress: Any = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Refine cells whose center and corner labels disagree.
 
     Parameters
@@ -949,6 +1596,8 @@ def _refine_adaptive_cells(lows: np.ndarray,
         Safety cap on generated leaf-cell count.
     aabb_pruning : bool, default=True
         Whether to use yarn AABB pruning during sample classification.
+    progress : bool or callable, default=False
+        Show a tqdm progress bar over adaptive cell chunks when true.
 
     Returns
     -------
@@ -958,9 +1607,14 @@ def _refine_adaptive_cells(lows: np.ndarray,
     sample_count = _ADAPTIVE_SAMPLE_OFFSETS.shape[0]
     cell_chunk = max(1, chunk_voxels // sample_count)
 
-    for _ in range(adaptive_levels):
+    for level in range(adaptive_levels):
         refine_parts = []
-        for c0 in range(0, lows.shape[0], cell_chunk):
+        cell_starts = range(0, lows.shape[0], cell_chunk)
+        for c0 in _progress_iter(
+            cell_starts, progress, total=math.ceil(lows.shape[0] / cell_chunk),
+            desc=f"refine adaptive level {level + 1}/{adaptive_levels}",
+            unit="chunk"
+        ):
             c1 = min(c0 + cell_chunk, lows.shape[0])
             samples = _cell_sample_points(lows[c0:c1], sizes[c0:c1])
             sample_ids = _classify_voxels_numpy(
@@ -998,7 +1652,8 @@ def _classify_adaptive_cells_numpy(lows: np.ndarray,
                                    snapshots: List[YarnSnapshot],
                                    chunk_voxels: int,
                                    workers: Optional[int],
-                                   aabb_pruning: bool = True) -> np.ndarray:
+                                   aabb_pruning: bool = True,
+                                   progress: Any = False) -> np.ndarray:
     """Classify adaptive leaf cells by center point ownership.
 
     Parameters
@@ -1013,6 +1668,8 @@ def _classify_adaptive_cells_numpy(lows: np.ndarray,
         Numpy classifier worker count.
     aabb_pruning : bool, default=True
         Whether to use yarn AABB pruning.
+    progress : bool or callable, default=False
+        Show a tqdm progress bar over adaptive leaf-cell chunks when true.
 
     Returns
     -------
@@ -1022,7 +1679,7 @@ def _classify_adaptive_cells_numpy(lows: np.ndarray,
     centers = lows + sizes * np.asarray(0.5, dtype=sizes.dtype)
     return _classify_voxels_numpy(
         centers, snapshots, chunk=chunk_voxels, workers=workers,
-        aabb_pruning=aabb_pruning
+        aabb_pruning=aabb_pruning, progress=progress
     )
 
 
@@ -1032,7 +1689,8 @@ def _classify_adaptive_cells_numpy(lows: np.ndarray,
 
 
 def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
-               textile_name: str = "TexGenPython"):
+               textile_name: str = "TexGenPython",
+               progress: Any = False):
     """Write a structured Abaqus ``.inp`` hex mesh.
 
     Parameters
@@ -1048,6 +1706,8 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
         written as the ``Matrix`` element set.
     textile_name : str, default="TexGenPython"
         Name written to the Abaqus heading.
+    progress : bool or callable, default=False
+        Show tqdm progress bars for node, element, and element-set writing.
     """
     dx = (hi[0] - lo[0]) / nx
     dy = (hi[1] - lo[1]) / ny
@@ -1078,7 +1738,9 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
         f.write(f"TexGen Python voxel mesh: {textile_name}\n")
         f.write("*Preprint, echo=NO, model=NO, history=NO, contact=NO\n")
         f.write("**\n*Part, name=TexGenPart\n*Node\n")
-        for iz in range(nnz):
+        for iz in _progress_iter(
+            range(nnz), progress, total=nnz, desc="write nodes", unit="z-slice"
+        ):
             for iy in range(nny):
                 for ix in range(nnx):
                     x = lo[0] + ix * dx
@@ -1089,7 +1751,9 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
         flush_lines(f, lines)
         f.write("*Element, type=C3D8R\n")
         eid = 0
-        for iz in range(nz):
+        for iz in _progress_iter(
+            range(nz), progress, total=nz, desc="write elements", unit="z-slice"
+        ):
             for iy in range(ny):
                 for ix in range(nx):
                     eid += 1
@@ -1106,7 +1770,11 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
         flush_lines(f, lines)
         # ELSETs per yarn (including -1 = matrix). Avoid storing Python int
         # lists for every element; scan the compact numpy yarn_id array instead.
-        for yidx in np.unique(yarn_id):
+        unique_yarns = np.unique(yarn_id)
+        for yidx in _progress_iter(
+            unique_yarns, progress, total=len(unique_yarns),
+            desc="write element sets", unit="set"
+        ):
             ids = np.nonzero(yarn_id == yidx)[0] + 1
             name = "Matrix" if yidx < 0 else f"Yarn{yidx}"
             f.write(f"*Elset, elset={name}\n")
@@ -1122,7 +1790,8 @@ def _write_inp(path: Path, lo, hi, nx, ny, nz, yarn_id: np.ndarray,
 
 def _write_adaptive_inp(path: Path,
                         cells: AdaptiveVoxelCells,
-                        textile_name: str = "TexGenAdaptivePython") -> dict:
+                        textile_name: str = "TexGenAdaptivePython",
+                        progress: Any = False) -> dict:
     """Write adaptive non-uniform hex cells as an Abaqus input deck.
 
     Parameters
@@ -1133,6 +1802,8 @@ def _write_adaptive_inp(path: Path,
         Leaf-cell geometry and yarn ownership arrays.
     textile_name : str, default="TexGenAdaptivePython"
         Name written to the Abaqus heading.
+    progress : bool or callable, default=False
+        Show tqdm progress bars for node deduplication and mesh writing.
 
     Returns
     -------
@@ -1152,7 +1823,11 @@ def _write_adaptive_inp(path: Path,
         """Return a hashable rounded coordinate key for node deduplication."""
         return tuple(np.round(coord.astype(np.float64, copy=False), 12))
 
-    for low, size in zip(cells.lows, cells.sizes):
+    cell_pairs = zip(cells.lows, cells.sizes)
+    for low, size in _progress_iter(
+        cell_pairs, progress, total=int(cells.lows.shape[0]),
+        desc="deduplicate adaptive nodes", unit="cell"
+    ):
         for offset in node_offsets:
             coord = low + size * offset
             key = node_key(coord)
@@ -1181,19 +1856,31 @@ def _write_adaptive_inp(path: Path,
         f.write("** Hanging-node constraints and p4est-style 2:1 balancing are not generated.\n")
         f.write("*Preprint, echo=NO, model=NO, history=NO, contact=NO\n")
         f.write("**\n*Part, name=TexGenPart\n*Node\n")
-        for node_id, coord in enumerate(node_coords, start=1):
+        node_iter = enumerate(node_coords, start=1)
+        for node_id, coord in _progress_iter(
+            node_iter, progress, total=len(node_coords),
+            desc="write adaptive nodes", unit="node"
+        ):
             emit(f"{node_id}, {coord[0]:.6g}, {coord[1]:.6g}, {coord[2]:.6g}\n")
 
         flush_lines(f, lines)
         f.write("*Element, type=C3D8R\n")
-        for elem_id, (low, size) in enumerate(zip(cells.lows, cells.sizes), start=1):
+        elem_iter = enumerate(zip(cells.lows, cells.sizes), start=1)
+        for elem_id, (low, size) in _progress_iter(
+            elem_iter, progress, total=int(cells.lows.shape[0]),
+            desc="write adaptive elements", unit="element"
+        ):
             conn = []
             for offset in node_offsets:
                 conn.append(node_ids[node_key(low + size * offset)])
             emit(f"{elem_id}, " + ", ".join(str(node_id) for node_id in conn) + "\n")
 
         flush_lines(f, lines)
-        for yidx in np.unique(cells.yarn_id):
+        unique_yarns = np.unique(cells.yarn_id)
+        for yidx in _progress_iter(
+            unique_yarns, progress, total=len(unique_yarns),
+            desc="write adaptive element sets", unit="set"
+        ):
             ids = np.nonzero(cells.yarn_id == yidx)[0] + 1
             name = "Matrix" if yidx < 0 else f"Yarn{yidx}"
             f.write(f"*Elset, elset={name}\n")
@@ -1393,19 +2080,327 @@ def _sync_torch_backend(torch_mod, device: Optional[str]) -> None:
         torch_mod.mps.synchronize()
 
 
+def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
+                            aabb: np.ndarray,
+                            nx: int = 64, ny: int = 64, nz: int = 64,
+                            backend: str = "numpy",
+                            device: Optional[str] = None,
+                            dtype: str = "float32",
+                            chunk_voxels: int = DEFAULT_NUMPY_CHUNK_VOXELS,
+                            workers: Optional[int] = None,
+                            verbose: bool = True,
+                            include_centers: bool = False,
+                            output: str = "backend",
+                            aabb_pruning: bool = True,
+                            progress: Any = False) -> VoxelGridData:
+    """Voxelize pre-extracted yarn snapshots and return numpy/torch data.
+
+    This skips the TexGen/SWIG object traversal in :func:`extract_snapshots`.
+    It is the preferred path for repeated voxelization of the same textile, for
+    example resolution sweeps or emitting both numpy and torch outputs.
+    """
+    backend = backend.lower()
+    output = output.lower()
+    if output not in {"backend", "numpy", "torch"}:
+        raise ValueError('output must be one of "backend", "numpy", or "torch"')
+
+    _validate_voxelizer_args(
+        nx, ny, nz, backend, dtype, chunk_voxels,
+        adaptive_levels=0, max_adaptive_cells=nx * ny * nz
+    )
+    if len(snapshots) == 0:
+        raise RuntimeError("No yarn snapshots provided")
+
+    backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
+
+    def log(msg):
+        """Print one timing/status line when verbose output is enabled."""
+        if verbose:
+            print(f"[voxelizer] {msg}")
+
+    aabb_np = np.asarray(aabb, dtype=np.float64)
+    if aabb_np.shape != (2, 3):
+        raise ValueError(f"aabb must have shape (2, 3), got {aabb_np.shape}")
+
+    lo, hi = aabb_np[0], aabb_np[1]
+    centers_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
+    centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz, dtype=centers_dtype)
+    centers_out = None
+
+    t0 = time.perf_counter()
+    if backend_cfg.backend == "torch":
+        torch_mod = backend_cfg.torch_module
+        packed = _pack_yarns(
+            snapshots, device=backend_cfg.device, dtype=backend_cfg.torch_dtype
+        )
+        centers = torch_mod.from_numpy(centers_np).to(
+            device=backend_cfg.device, dtype=backend_cfg.torch_dtype
+        )
+        t_pack = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        yarn_id = _classify_voxels_torch(
+            centers, packed, chunk=chunk_voxels, aabb_pruning=aabb_pruning,
+            progress=progress
+        )
+        _sync_torch_backend(torch_mod, backend_cfg.device)
+        t_classify = time.perf_counter() - t0
+        log(
+            f"classified {centers.shape[0]:,} cached voxels with torch/"
+            f"{backend_cfg.device} in {t_classify:.3f}s"
+        )
+        if include_centers:
+            centers_out = centers
+        aabb_out = torch_mod.as_tensor(
+            aabb_np, device=backend_cfg.device, dtype=backend_cfg.torch_dtype
+        )
+        actual_workers = 1
+    else:
+        snapshots_np = _snapshots_as_dtype(snapshots, backend_cfg.np_dtype)
+        centers_np = centers_np.astype(backend_cfg.np_dtype, copy=False)
+        t_pack = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        actual_workers = _effective_numpy_workers(
+            centers_np.shape[0], chunk_voxels, backend_cfg.workers
+        )
+        yarn_id = _classify_voxels_numpy(
+            centers_np, snapshots_np, chunk=chunk_voxels, workers=backend_cfg.workers,
+            aabb_pruning=aabb_pruning, progress=progress
+        )
+        t_classify = time.perf_counter() - t0
+        log(
+            f"classified {centers_np.shape[0]:,} cached voxels with numpy/"
+            f"{actual_workers} workers in {t_classify:.3f}s"
+        )
+        if include_centers:
+            centers_out = centers_np
+        aabb_out = aabb_np
+
+    data = VoxelGridData(
+        yarn_id=yarn_id,
+        aabb=aabb_out,
+        resolution=(nx, ny, nz),
+        backend=backend_cfg.backend,
+        device=backend_cfg.device,
+        workers=actual_workers,
+        dtype=dtype,
+        timings=dict(extract=0.0, pack=t_pack, classify=t_classify),
+        centers=centers_out,
+        aabb_pruning=aabb_pruning,
+        storage="torch" if backend_cfg.backend == "torch" else "numpy",
+    )
+    return _coerce_voxel_grid_output(data, output, device=device)
+
+
+def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
+                                  nx: int = 64, ny: int = 64, nz: int = 64,
+                                  backend: str = "numpy",
+                                  device: Optional[str] = None,
+                                  dtype: str = "float32",
+                                  chunk_voxels: int = DEFAULT_NUMPY_CHUNK_VOXELS,
+                                  workers: Optional[int] = None,
+                                  verbose: bool = True,
+                                  include_centers: bool = False,
+                                  output: str = "backend",
+                                  aabb_pruning: bool = True,
+                                  progress: Any = False) -> VoxelGridData:
+    """Voxelize a structure-of-arrays snapshot bundle.
+
+    This is the stable entry point for future compiled ``_fastdata`` providers:
+    they only need to return a ``SnapshotBundle``-compatible layout, while the
+    existing numpy/torch classification and data-return code remains unchanged.
+    """
+    bundle = _coerce_snapshot_bundle(bundle)
+    return voxelize_snapshots_data(
+        bundle.to_snapshots(),
+        bundle.aabb,
+        nx=nx,
+        ny=ny,
+        nz=nz,
+        backend=backend,
+        device=device,
+        dtype=dtype,
+        chunk_voxels=chunk_voxels,
+        workers=workers,
+        verbose=verbose,
+        include_centers=include_centers,
+        output=output,
+        aabb_pruning=aabb_pruning,
+        progress=progress,
+    )
+
+
+def voxelize_textile_data(textile: CTextile,
+                          nx: int = 64, ny: int = 64, nz: int = 64,
+                          backend: str = "numpy",
+                          device: Optional[str] = None,
+                          dtype: str = "float32",
+                          chunk_voxels: int = DEFAULT_NUMPY_CHUNK_VOXELS,
+                          workers: Optional[int] = None,
+                          verbose: bool = True,
+                          include_centers: bool = False,
+                          output: str = "backend",
+                          aabb_pruning: bool = True,
+                          progress: Any = False) -> VoxelGridData:
+    """Voxelize a built CTextile and return direct numpy/torch data.
+
+    This path skips Abaqus ``.inp`` generation. It is intended for solvers that
+    can consume structured arrays or tensors directly and should avoid the file
+    write plus torch-to-CPU copy used by ``voxelize_textile``.
+
+    Parameters
+    ----------
+    textile : CTextile
+        A fully built textile (all section/refine work done by TexGen).
+    nx, ny, nz : int
+        Voxel resolution along each axis of the domain AABB.
+    backend : {"numpy", "auto", "torch"}
+        Classification backend. ``numpy`` is the default OpenMP-free CPU path.
+        ``auto`` may pick torch when an accelerator is available. ``torch`` can
+        leave ``yarn_id`` on the selected device when ``output="backend"``.
+    device : {"cuda", "mps", "cpu", None}
+        Torch device for classification or forced torch output.
+    dtype : {"float32", "float64"}
+        Floating-point precision used for classification geometry.
+    chunk_voxels : int
+        Voxels processed per batch.
+    workers : int or None
+        Number of numpy worker threads. Ignored by torch classification.
+    verbose : bool
+        Print per-phase timing.
+    include_centers : bool
+        Include voxel centers in the returned data object. Disabled by default
+        to keep solver handoff memory-light.
+    output : {"backend", "numpy", "torch"}
+        Storage backend for returned arrays. ``backend`` preserves the
+        classification result storage; ``numpy`` forces CPU numpy arrays;
+        ``torch`` returns torch tensors.
+    aabb_pruning : bool
+        Skip yarn/translation candidates whose conservative bounding boxes do
+        not overlap the current voxel chunk.
+    progress : bool or callable
+        Show tqdm progress bars over classifier chunks when true. ``tqdm`` is
+        imported lazily and is not required unless this is enabled.
+
+    Returns
+    -------
+    VoxelGridData
+        Structured voxel ids and metadata. ``data.grid`` is a zero-copy
+        ``(nz, ny, nx)`` view. ``data.yarn_id`` remains flat in TexGen element
+        order for direct finite-element assembly.
+    """
+    backend = backend.lower()
+    output = output.lower()
+    if output not in {"backend", "numpy", "torch"}:
+        raise ValueError('output must be one of "backend", "numpy", or "torch"')
+
+    _validate_voxelizer_args(
+        nx, ny, nz, backend, dtype, chunk_voxels,
+        adaptive_levels=0, max_adaptive_cells=nx * ny * nz
+    )
+    backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
+
+    def log(msg):
+        """Print one timing/status line when verbose output is enabled."""
+        if verbose:
+            print(f"[voxelizer] {msg}")
+
+    t0 = time.perf_counter()
+    bundle = extract_snapshot_bundle(textile)
+    snapshots, aabb = bundle.to_snapshots(), bundle.aabb
+    t_extract = time.perf_counter() - t0
+    log(
+        f"extracted {len(snapshots)} yarns, AABB={aabb.tolist()}, "
+        f"backend={backend_cfg.backend}, workers={backend_cfg.workers}, {t_extract:.3f}s"
+    )
+
+    if len(snapshots) == 0:
+        raise RuntimeError("No yarns extracted - textile may be empty or unbuilt")
+
+    lo, hi = aabb[0], aabb[1]
+    centers_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
+    centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz, dtype=centers_dtype)
+    centers_out = None
+
+    t0 = time.perf_counter()
+    if backend_cfg.backend == "torch":
+        torch_mod = backend_cfg.torch_module
+        packed = _pack_yarns(
+            snapshots, device=backend_cfg.device, dtype=backend_cfg.torch_dtype
+        )
+        centers = torch_mod.from_numpy(centers_np).to(
+            device=backend_cfg.device, dtype=backend_cfg.torch_dtype
+        )
+        t_pack = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        yarn_id = _classify_voxels_torch(
+            centers, packed, chunk=chunk_voxels, aabb_pruning=aabb_pruning,
+            progress=progress
+        )
+        _sync_torch_backend(torch_mod, backend_cfg.device)
+        t_classify = time.perf_counter() - t0
+        log(
+            f"classified {centers.shape[0]:,} voxels with torch/"
+            f"{backend_cfg.device} in {t_classify:.3f}s"
+        )
+        if include_centers:
+            centers_out = centers
+        actual_workers = 1
+    else:
+        snapshots_np = _snapshots_as_dtype(snapshots, backend_cfg.np_dtype)
+        centers_np = centers_np.astype(backend_cfg.np_dtype, copy=False)
+        t_pack = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        actual_workers = _effective_numpy_workers(
+            centers_np.shape[0], chunk_voxels, backend_cfg.workers
+        )
+        yarn_id = _classify_voxels_numpy(
+            centers_np, snapshots_np, chunk=chunk_voxels, workers=backend_cfg.workers,
+            aabb_pruning=aabb_pruning, progress=progress
+        )
+        t_classify = time.perf_counter() - t0
+        log(
+            f"classified {centers_np.shape[0]:,} voxels with numpy/"
+            f"{actual_workers} workers in {t_classify:.3f}s"
+        )
+        if include_centers:
+            centers_out = centers_np
+
+    data = VoxelGridData(
+        yarn_id=yarn_id,
+        aabb=aabb if backend_cfg.backend != "torch" else torch_mod.as_tensor(
+            aabb, device=backend_cfg.device, dtype=backend_cfg.torch_dtype
+        ),
+        resolution=(nx, ny, nz),
+        backend=backend_cfg.backend,
+        device=backend_cfg.device,
+        workers=actual_workers,
+        dtype=dtype,
+        timings=dict(extract=t_extract, pack=t_pack, classify=t_classify),
+        centers=centers_out,
+        aabb_pruning=aabb_pruning,
+        storage="torch" if backend_cfg.backend == "torch" else "numpy",
+    )
+    return _coerce_voxel_grid_output(data, output, device=device)
+
+
 def voxelize_textile(textile: CTextile,
                      nx: int = 64, ny: int = 64, nz: int = 64,
                      out_inp: str = "out.inp",
-                     backend: str = "auto",
+                     backend: str = "numpy",
                      device: Optional[str] = None,
                      dtype: str = "float32",
-                     chunk_voxels: int = 65536,
+                     chunk_voxels: int = DEFAULT_NUMPY_CHUNK_VOXELS,
                      workers: Optional[int] = None,
                      verbose: bool = True,
                      adaptive: bool = False,
                      adaptive_levels: int = 1,
                      max_adaptive_cells: int = 2_000_000,
-                     aabb_pruning: bool = True) -> dict:
+                     aabb_pruning: bool = True,
+                     progress: Any = False) -> dict:
     """Voxelize a built CTextile and write an Abaqus .inp.
 
     Parameters
@@ -1416,10 +2411,11 @@ def voxelize_textile(textile: CTextile,
         Voxel resolution along each axis of the domain AABB.
     out_inp : str
         Output Abaqus input deck path.
-    backend : {"auto", "numpy", "torch"}
-        ``numpy`` uses portable CPU vectorization. ``torch`` uses CUDA/MPS/CPU
-        tensors. ``auto`` picks torch only when an accelerator is available or
-        when ``device`` is explicitly provided; otherwise it uses numpy.
+    backend : {"numpy", "auto", "torch"}
+        ``numpy`` uses portable CPU vectorization and is the default OpenMP-free
+        path. ``torch`` uses CUDA/MPS/CPU tensors. ``auto`` picks torch only
+        when an accelerator is available or when ``device`` is explicitly
+        provided; otherwise it uses numpy.
     device : {"cuda", "mps", "cpu", None}
         Torch device. Ignored by the numpy backend.
     dtype : {"float32", "float64"}
@@ -1442,6 +2438,9 @@ def voxelize_textile(textile: CTextile,
     aabb_pruning : bool
         Skip yarn/translation candidates whose conservative bounding boxes do
         not overlap the current voxel chunk. Enabled by default.
+    progress : bool or callable
+        Show tqdm progress bars over classifier and writer chunks when true.
+        ``tqdm`` is imported lazily and is not required unless this is enabled.
 
     Returns
     -------
@@ -1461,7 +2460,8 @@ def voxelize_textile(textile: CTextile,
             print(f"[voxelizer] {msg}")
 
     t0 = time.perf_counter()
-    snapshots, aabb = extract_snapshots(textile)
+    bundle = extract_snapshot_bundle(textile)
+    snapshots, aabb = bundle.to_snapshots(), bundle.aabb
     t_extract = time.perf_counter() - t0
     log(
         f"extracted {len(snapshots)} yarns, AABB={aabb.tolist()}, "
@@ -1482,7 +2482,8 @@ def voxelize_textile(textile: CTextile,
         t0 = time.perf_counter()
         lows, sizes, levels = _refine_adaptive_cells(
             lows, sizes, levels, snapshots_np, adaptive_levels, chunk_voxels,
-            backend_cfg.workers, max_adaptive_cells, aabb_pruning=aabb_pruning
+            backend_cfg.workers, max_adaptive_cells, aabb_pruning=aabb_pruning,
+            progress=progress
         )
         t_refine = time.perf_counter() - t0
         log(
@@ -1491,14 +2492,17 @@ def voxelize_textile(textile: CTextile,
         )
 
         t0 = time.perf_counter()
+        actual_workers = _effective_numpy_workers(
+            lows.shape[0], chunk_voxels, backend_cfg.workers
+        )
         yarn_id = _classify_adaptive_cells_numpy(
             lows, sizes, snapshots_np, chunk_voxels, backend_cfg.workers,
-            aabb_pruning=aabb_pruning
+            aabb_pruning=aabb_pruning, progress=progress
         )
         t_classify = time.perf_counter() - t0
         log(
             f"classified {lows.shape[0]:,} adaptive cells with numpy/"
-            f"{backend_cfg.workers} workers in {t_classify:.3f}s"
+            f"{actual_workers} workers in {t_classify:.3f}s"
         )
 
         t0 = time.perf_counter()
@@ -1506,7 +2510,7 @@ def voxelize_textile(textile: CTextile,
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cells = AdaptiveVoxelCells(lows=lows, sizes=sizes, levels=levels, yarn_id=yarn_id)
         mesh_counts = _write_adaptive_inp(
-            out_path, cells, textile_name=_textile_name(textile)
+            out_path, cells, textile_name=_textile_name(textile), progress=progress
         )
         t_write = time.perf_counter() - t0
         log(
@@ -1519,7 +2523,7 @@ def voxelize_textile(textile: CTextile,
             aabb=aabb,
             backend=backend_cfg.backend,
             device=backend_cfg.device,
-            workers=backend_cfg.workers,
+            workers=actual_workers,
             adaptive=True,
             aabb_pruning=aabb_pruning,
             levels=levels,
@@ -1547,7 +2551,8 @@ def voxelize_textile(textile: CTextile,
 
         t0 = time.perf_counter()
         yarn_id_tensor = _classify_voxels_torch(
-            centers, packed, chunk=chunk_voxels, aabb_pruning=aabb_pruning
+            centers, packed, chunk=chunk_voxels, aabb_pruning=aabb_pruning,
+            progress=progress
         )
         _sync_torch_backend(torch_mod, backend_cfg.device)
         t_classify = time.perf_counter() - t0
@@ -1556,27 +2561,31 @@ def voxelize_textile(textile: CTextile,
             f"{backend_cfg.device} in {t_classify:.3f}s"
         )
         yarn_id = yarn_id_tensor.detach().cpu().numpy()
+        actual_workers = 1
     else:
         snapshots_np = _snapshots_as_dtype(snapshots, backend_cfg.np_dtype)
         centers_np = centers_np.astype(backend_cfg.np_dtype, copy=False)
         t_pack = time.perf_counter() - t0
 
         t0 = time.perf_counter()
+        actual_workers = _effective_numpy_workers(
+            centers_np.shape[0], chunk_voxels, backend_cfg.workers
+        )
         yarn_id = _classify_voxels_numpy(
             centers_np, snapshots_np, chunk=chunk_voxels, workers=backend_cfg.workers,
-            aabb_pruning=aabb_pruning
+            aabb_pruning=aabb_pruning, progress=progress
         )
         t_classify = time.perf_counter() - t0
         log(
             f"classified {centers_np.shape[0]:,} voxels with numpy/"
-            f"{backend_cfg.workers} workers in {t_classify:.3f}s"
+            f"{actual_workers} workers in {t_classify:.3f}s"
         )
 
     t0 = time.perf_counter()
     out_path = Path(out_inp)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _write_inp(out_path, lo, hi, nx, ny, nz, yarn_id,
-               textile_name=_textile_name(textile))
+               textile_name=_textile_name(textile), progress=progress)
     t_write = time.perf_counter() - t0
     log(f"wrote {out_path} ({t_write:.3f}s)")
 
@@ -1585,10 +2594,22 @@ def voxelize_textile(textile: CTextile,
         aabb=aabb,
         backend=backend_cfg.backend,
         device=backend_cfg.device,
-        workers=backend_cfg.workers,
+        workers=actual_workers,
         adaptive=False, aabb_pruning=aabb_pruning,
         timings=dict(extract=t_extract, pack=t_pack, classify=t_classify, write=t_write),
     )
 
 
-__all__ = ["voxelize_textile", "extract_snapshots", "YarnSnapshot", "AdaptiveVoxelCells"]
+__all__ = [
+    "voxelize_textile",
+    "voxelize_textile_data",
+    "voxelize_snapshots_data",
+    "voxelize_snapshot_bundle_data",
+    "extract_snapshots",
+    "extract_snapshot_bundle",
+    "YarnSnapshot",
+    "SnapshotBundle",
+    "AdaptiveVoxelCells",
+    "VoxelGridData",
+    "VoxelizationCache",
+]

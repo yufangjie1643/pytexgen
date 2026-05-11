@@ -60,7 +60,6 @@ IF(MSVC)
         $<$<CONFIG:Release>:/Ot>
         $<$<CONFIG:Release>:/fp:fast>
     )
-    SET(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 ELSE()
     ADD_COMPILE_OPTIONS(
         $<$<CONFIG:Release>:-O3>

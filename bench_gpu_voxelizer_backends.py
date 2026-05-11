@@ -2,7 +2,8 @@
 
 This benchmark avoids real TexGen geometry so it can run quickly during backend
 development. It measures the classification kernel with and without AABB
-candidate pruning, then optionally measures torch CPU/GPU if torch is installed.
+candidate pruning, measures the direct data interface, and then runs a simple
+matrix-norm workload on the returned 64^3 voxel material grid.
 """
 
 import argparse
@@ -103,9 +104,53 @@ def best_time(fn, repeat):
     return min(timings), result
 
 
+class FakeTextile:
+    """Minimal textile object for synthetic public-interface benchmarks."""
+
+    def GetName(self):
+        """Return a stable synthetic textile name."""
+        return "SyntheticBenchmark"
+
+
+def patch_extract_snapshots(voxelizer, snapshots, aabb):
+    """Patch ``extract_snapshots`` so public APIs use synthetic geometry."""
+    old_extract = voxelizer.extract_snapshots
+
+    def fake_extract(_textile):
+        """Return benchmark snapshots without building a real TexGen textile."""
+        return snapshots, aabb.copy()
+
+    voxelizer.extract_snapshots = fake_extract
+    return old_extract
+
+
+def restore_extract_snapshots(voxelizer, old_extract):
+    """Restore the original ``extract_snapshots`` function."""
+    voxelizer.extract_snapshots = old_extract
+
+
+def norm_order_arg(order):
+    """Convert a command-line norm order to numpy/torch linalg input."""
+    return "fro" if order == "fro" else 2
+
+
+def numpy_material_matrix_norm(data, order):
+    """Compute a matrix norm from direct numpy voxel data."""
+    nx, ny, nz = data.resolution
+    matrix = data.material_id().astype(np.float32, copy=False).reshape(nz * ny, nx)
+    return np.linalg.norm(matrix, ord=norm_order_arg(order))
+
+
+def torch_material_matrix_norm(data, torch_mod, order):
+    """Compute a matrix norm from direct torch voxel data."""
+    nx, ny, nz = data.resolution
+    matrix = data.material_id().to(dtype=torch_mod.float32).reshape(nz * ny, nx)
+    return torch_mod.linalg.matrix_norm(matrix, ord=norm_order_arg(order))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resolution", type=int, default=32)
+    parser.add_argument("--resolution", type=int, default=64)
     parser.add_argument("--yarn-grid", type=int, default=4, help="Creates yarn_grid^2 straight yarns")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--chunk-voxels", type=int, default=8192)
@@ -113,12 +158,15 @@ def main():
     parser.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     parser.add_argument("--include-torch", action="store_true")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--norm-order", choices=["fro", "2"], default="fro")
+    parser.add_argument("--skip-direct-data", action="store_true")
     args = parser.parse_args()
 
     voxelizer = load_voxelizer_module()
     dtype = {"float32": np.float32, "float64": np.float64}[args.dtype]
     centers = make_centers(args.resolution, dtype)
     snapshots = make_snapshots(voxelizer, args.yarn_grid, dtype)
+    aabb = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float64)
 
     print(
         f"voxels={centers.shape[0]:,} yarns={len(snapshots)} "
@@ -146,6 +194,36 @@ def main():
     print(f"numpy pruned:   {pruned_time:.4f}s  speedup={speedup:.2f}x")
     print(f"occupied cells: {int((pruned >= 0).sum()):,}")
 
+    if not args.skip_direct_data:
+        old_extract = patch_extract_snapshots(voxelizer, snapshots, aabb)
+        try:
+            data_time, numpy_data = best_time(
+                lambda: voxelizer.voxelize_textile_data(
+                    FakeTextile(),
+                    nx=args.resolution, ny=args.resolution, nz=args.resolution,
+                    backend="numpy",
+                    output="numpy",
+                    dtype=args.dtype,
+                    workers=args.workers,
+                    chunk_voxels=args.chunk_voxels,
+                    verbose=False,
+                    aabb_pruning=True,
+                ),
+                args.repeat,
+            )
+            norm_time, norm_value = best_time(
+                lambda: numpy_material_matrix_norm(numpy_data, args.norm_order),
+                args.repeat,
+            )
+            np.testing.assert_array_equal(numpy_data.yarn_id, pruned)
+            print(
+                f"direct numpy data: {data_time:.4f}s  "
+                f"matrix_norm({args.norm_order})={float(norm_value):.6g} "
+                f"in {norm_time:.4f}s"
+            )
+        finally:
+            restore_extract_snapshots(voxelizer, old_extract)
+
     if not args.include_torch:
         return
     if voxelizer.torch is None:
@@ -171,6 +249,42 @@ def main():
     torch_np = torch_ids.detach().cpu().numpy()
     np.testing.assert_array_equal(torch_np, pruned)
     print(f"torch/{args.device} pruned: {torch_time:.4f}s")
+
+    if not args.skip_direct_data:
+        old_extract = patch_extract_snapshots(voxelizer, snapshots, aabb)
+        try:
+            direct_time, torch_data = best_time(
+                lambda: voxelizer.voxelize_textile_data(
+                    FakeTextile(),
+                    nx=args.resolution, ny=args.resolution, nz=args.resolution,
+                    backend="torch",
+                    device=args.device,
+                    output="backend",
+                    dtype=args.dtype,
+                    chunk_voxels=args.chunk_voxels,
+                    verbose=False,
+                    aabb_pruning=True,
+                ),
+                args.repeat,
+            )
+
+            def norm_torch():
+                value = torch_material_matrix_norm(torch_data, torch_mod, args.norm_order)
+                if args.device == "cuda":
+                    torch_mod.cuda.synchronize()
+                elif args.device == "mps" and hasattr(torch_mod, "mps"):
+                    torch_mod.mps.synchronize()
+                return value
+
+            norm_time, norm_value = best_time(norm_torch, args.repeat)
+            np.testing.assert_array_equal(torch_data.to_numpy().yarn_id, pruned)
+            print(
+                f"direct torch/{args.device} data: {direct_time:.4f}s  "
+                f"matrix_norm({args.norm_order})={float(norm_value.detach().cpu()):.6g} "
+                f"in {norm_time:.4f}s"
+            )
+        finally:
+            restore_extract_snapshots(voxelizer, old_extract)
 
 
 if __name__ == "__main__":

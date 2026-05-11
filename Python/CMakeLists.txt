@@ -78,10 +78,10 @@ IF(BUILD_PYTHON_INTERFACE)
 
     # Naming conventions: _Core.pyd (Windows) or _Core.so (Unix)
     SET_TARGET_PROPERTIES(_Core PROPERTIES PREFIX "" DEBUG_POSTFIX "_d")
+    SET_TARGET_PROPERTIES(_Core PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
     IF(WIN32)
         SET_TARGET_PROPERTIES(_Core PROPERTIES
-            SUFFIX ".pyd"
-            WINDOWS_EXPORT_ALL_SYMBOLS ON)
+            SUFFIX ".pyd")
         if(MINGW)
             target_link_options(_Core PRIVATE
                 "-Wl,--export-all-symbols"
@@ -146,6 +146,10 @@ IF(BUILD_PYTHON_INTERFACE)
 
         # Optional GPU voxelizer lives in the source compatibility package.
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/gpu_voxelizer.py"
+            DESTINATION ${PYTEXGEN_INSTALL_DIR})
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/acdm_solver.py"
+            DESTINATION ${PYTEXGEN_INSTALL_DIR})
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/torch_periodic_mesher.py"
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
         # On Windows, also install the TexGenCore DLL if built as shared

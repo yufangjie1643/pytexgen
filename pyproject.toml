@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "pytexgen"
-version = "1.1.0"
+version = "1.1.1"
 description = "Python bindings for the TexGen textile geometry modeller"
 readme = "README_pypi.md"
 license = {text = "GPL-2.0-or-later"}
@@ -41,6 +41,8 @@ Issues = "https://github.com/yufangjie1643/pytexgen/issues"
 [project.optional-dependencies]
 voxel = ["numpy>=1.21"]
 gpu = ["torch"]
+progress = ["tqdm>=4.66"]
+examples = ["matplotlib", "scipy"]
 
 # ---------------------------------------------------------------------------
 # scikit-build-core configuration

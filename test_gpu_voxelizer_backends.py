@@ -112,6 +112,272 @@ class VoxelizerBackendTest(unittest.TestCase):
             self.assertEqual(int((info["yarn_id"] >= 0).sum()), 16)
             self.assertIn("*Element, type=C3D8R", out.read_text())
 
+    def test_progress_callable_wraps_public_path_chunks(self):
+        self.patch_extract_snapshots()
+        calls = []
+
+        def progress(iterable, total=None, desc=None, unit=None):
+            calls.append((total, desc, unit))
+            for item in iterable:
+                yield item
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "numpy_progress.inp"
+            info = self.voxelizer.voxelize_textile(
+                FakeTextile(),
+                nx=4, ny=4, nz=4,
+                out_inp=str(out),
+                backend="numpy",
+                workers=1,
+                chunk_voxels=16,
+                verbose=False,
+                progress=progress,
+            )
+
+        self.assertEqual(info["backend"], "numpy")
+        self.assertIn("classify numpy voxels", [call[1] for call in calls])
+        self.assertIn("write nodes", [call[1] for call in calls])
+        self.assertIn("write elements", [call[1] for call in calls])
+
+    def test_numpy_direct_data_public_path(self):
+        self.patch_extract_snapshots()
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_centers=True,
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        self.assertIsInstance(data, self.voxelizer.VoxelGridData)
+        self.assertEqual(data.storage, "numpy")
+        self.assertEqual(data.yarn_id.shape, (64,))
+        self.assertEqual(data.grid.shape, (4, 4, 4))
+        self.assertEqual(data.centers.shape, (64, 3))
+        self.assertEqual(int(data.occupancy().sum()), 16)
+        np.testing.assert_allclose(data.voxel_size, [0.25, 0.25, 0.25])
+        materials = data.material_id()
+        self.assertEqual(materials.shape, (4, 4, 4))
+        self.assertEqual(int(materials.max()), 1)
+        self.assertEqual(int(materials.min()), 0)
+
+    def test_default_backend_is_numpy_and_reports_effective_workers(self):
+        self.patch_extract_snapshots()
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            output="numpy",
+            workers=4,
+            chunk_voxels=8,
+            verbose=False,
+        )
+
+        self.assertEqual(data.backend, "numpy")
+        self.assertEqual(data.storage, "numpy")
+        self.assertEqual(data.workers, 4)
+
+        clamped = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            output="numpy",
+            workers=4,
+            chunk_voxels=1024,
+            verbose=False,
+        )
+        self.assertEqual(clamped.workers, 1)
+
+    def test_voxel_grid_data_to_matches_torch_style_conversion(self):
+        self.patch_extract_snapshots()
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_centers=True,
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        numpy_data = data.to("numpy", dtype=np.float64)
+        self.assertEqual(numpy_data.storage, "numpy")
+        self.assertEqual(numpy_data.dtype, "float64")
+        self.assertEqual(numpy_data.aabb.dtype, np.float64)
+        self.assertEqual(numpy_data.centers.dtype, np.float64)
+        self.assertEqual(numpy_data.yarn_id.dtype, np.int32)
+        np.testing.assert_array_equal(numpy_data.yarn_id, data.yarn_id)
+        with self.assertRaisesRegex(ValueError, "floating"):
+            data.to("numpy", dtype=np.int32)
+
+        if self.voxelizer.torch is None:
+            with self.assertRaisesRegex(ImportError, "Torch backend requested"):
+                data.to("torch")
+        else:
+            torch_data = data.to("torch", device="cpu", dtype="float64")
+            self.assertEqual(torch_data.storage, "torch")
+            self.assertEqual(torch_data.dtype, "float64")
+            self.assertTrue(self.voxelizer._is_torch_tensor(torch_data.yarn_id))
+            self.assertEqual(torch_data.aabb.dtype, self.voxelizer.torch.float64)
+            self.assertEqual(torch_data.centers.dtype, self.voxelizer.torch.float64)
+            numpy_from_torch_dtype = data.to("numpy", dtype=self.voxelizer.torch.float32)
+            self.assertEqual(numpy_from_torch_dtype.aabb.dtype, np.float32)
+            with self.assertRaisesRegex(ValueError, "floating"):
+                data.to("torch", dtype=self.voxelizer.torch.int32)
+            roundtrip = torch_data.to("numpy")
+            np.testing.assert_array_equal(roundtrip.yarn_id, data.yarn_id)
+
+    def test_voxel_grid_data_npz_roundtrip(self):
+        self.patch_extract_snapshots()
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_centers=True,
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "voxels.npz"
+            data.save_npz(str(path))
+            loaded = self.voxelizer.VoxelGridData.load_npz(str(path))
+
+        self.assertEqual(loaded.storage, "numpy")
+        self.assertEqual(loaded.resolution, (4, 4, 4))
+        self.assertEqual(loaded.centers.shape, (64, 3))
+        np.testing.assert_array_equal(loaded.yarn_id, data.yarn_id)
+        np.testing.assert_allclose(loaded.aabb, data.aabb)
+        np.testing.assert_array_equal(loaded.material_id(), data.material_id())
+
+    def test_voxelize_snapshots_data_and_cache(self):
+        snap = synthetic_snapshot(self.voxelizer)
+        cached = self.voxelizer.voxelize_snapshots_data(
+            [snap],
+            self.aabb.copy(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        cache = self.voxelizer.VoxelizationCache(
+            snapshots=[snap],
+            aabb=self.aabb.copy(),
+        )
+        cached_again = cache.voxelize(
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        self.assertEqual(cached.timings["extract"], 0.0)
+        self.assertEqual(int(cached.occupancy().sum()), 16)
+        np.testing.assert_array_equal(cached_again.yarn_id, cached.yarn_id)
+
+    def test_snapshot_bundle_roundtrip_and_voxelization(self):
+        snap = synthetic_snapshot(self.voxelizer)
+        bundle = self.voxelizer.SnapshotBundle.from_snapshots(
+            [snap],
+            self.aabb.copy(),
+        )
+
+        self.assertEqual(bundle.num_yarns, 1)
+        np.testing.assert_array_equal(bundle.node_offsets, [0, 2])
+        np.testing.assert_array_equal(bundle.section_offsets, [0, 5])
+        np.testing.assert_array_equal(bundle.translation_offsets, [0, 1])
+
+        restored = bundle.to_snapshots()
+        self.assertEqual(len(restored), 1)
+        np.testing.assert_allclose(restored[0].positions, snap.positions)
+        np.testing.assert_allclose(restored[0].tangents, snap.tangents)
+        np.testing.assert_allclose(restored[0].ups, snap.ups)
+        np.testing.assert_allclose(restored[0].sides, snap.sides)
+        np.testing.assert_allclose(restored[0].section, snap.section)
+        np.testing.assert_allclose(restored[0].translations, snap.translations)
+
+        bundled = self.voxelizer.voxelize_snapshot_bundle_data(
+            bundle,
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+        direct = self.voxelizer.voxelize_snapshots_data(
+            [snap],
+            self.aabb.copy(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+        np.testing.assert_array_equal(bundled.yarn_id, direct.yarn_id)
+
+    def test_extract_snapshot_bundle_uses_provider_mapping(self):
+        snap = synthetic_snapshot(self.voxelizer)
+
+        def extract_snapshot_bundle(_textile):
+            return {
+                "positions": snap.positions,
+                "tangents": snap.tangents,
+                "ups": snap.ups,
+                "sides": snap.sides,
+                "node_offsets": np.array([0, 2], dtype=np.int64),
+                "sections": snap.section,
+                "section_offsets": np.array([0, 5], dtype=np.int64),
+                "translations": snap.translations,
+                "translation_offsets": np.array([0, 1], dtype=np.int64),
+                "aabb": self.aabb.copy(),
+            }
+
+        provider = types.SimpleNamespace(extract_snapshot_bundle=extract_snapshot_bundle)
+        bundle = self.voxelizer.extract_snapshot_bundle(FakeTextile(), provider=provider)
+
+        self.assertEqual(bundle.num_yarns, 1)
+        np.testing.assert_allclose(bundle.aabb, self.aabb)
+        np.testing.assert_allclose(bundle.positions, snap.positions)
+
+    def test_voxel_grid_data_to_dlpack_roundtrip_or_missing_error(self):
+        self.patch_extract_snapshots()
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        if self.voxelizer.torch is None:
+            with self.assertRaisesRegex(ImportError, "DLPack"):
+                data.to_dlpack("yarn_id")
+            return
+
+        torch_mod = self.voxelizer.torch
+        yarn_tensor = torch_mod.utils.dlpack.from_dlpack(data.to_dlpack("yarn_id"))
+        material_tensor = torch_mod.utils.dlpack.from_dlpack(data.to_dlpack("material_id"))
+        occupancy_tensor = torch_mod.utils.dlpack.from_dlpack(data.to_dlpack("occupancy"))
+
+        np.testing.assert_array_equal(yarn_tensor.cpu().numpy(), data.yarn_id)
+        np.testing.assert_array_equal(material_tensor.cpu().numpy(), data.material_id())
+        np.testing.assert_array_equal(occupancy_tensor.cpu().numpy(), data.occupancy())
+        with self.assertRaisesRegex(ValueError, "field"):
+            data.to_dlpack("bad_field")
+
     def test_aabb_pruning_matches_unpruned_numpy(self):
         self.patch_extract_snapshots()
         with tempfile.TemporaryDirectory() as tmp:
@@ -199,6 +465,40 @@ class VoxelizerBackendTest(unittest.TestCase):
             self.assertEqual(torch_info["backend"], "torch")
             self.assertEqual(torch_info["device"], "cpu")
             np.testing.assert_array_equal(torch_info["yarn_id"], numpy_info["yarn_id"])
+
+    def test_torch_direct_data_keeps_tensor_or_missing_error(self):
+        self.patch_extract_snapshots()
+        if self.voxelizer.torch is None:
+            with self.assertRaisesRegex(ImportError, "Torch backend requested"):
+                self.voxelizer.voxelize_textile_data(
+                    FakeTextile(),
+                    nx=4, ny=4, nz=4,
+                    backend="torch",
+                    verbose=False,
+                )
+            return
+
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="torch",
+            device="cpu",
+            output="backend",
+            include_centers=True,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        self.assertEqual(data.storage, "torch")
+        self.assertTrue(self.voxelizer._is_torch_tensor(data.yarn_id))
+        self.assertTrue(self.voxelizer._is_torch_tensor(data.centers))
+        self.assertEqual(tuple(data.grid.shape), (4, 4, 4))
+        self.assertEqual(int(data.occupancy().sum().item()), 16)
+
+        numpy_data = data.to_numpy()
+        self.assertEqual(numpy_data.storage, "numpy")
+        self.assertEqual(numpy_data.grid.shape, (4, 4, 4))
+        self.assertEqual(int(numpy_data.occupancy().sum()), 16)
 
     def test_adaptive_rejects_torch(self):
         with tempfile.TemporaryDirectory() as tmp:

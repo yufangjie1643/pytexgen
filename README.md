@@ -13,6 +13,15 @@ University of Nottingham. This project keeps the core TexGen modelling API
 available from Python while making the package easier to install, test, and use
 across Windows, Linux, and macOS.
 
+## Version 1.1.1 Highlights
+
+- Direct voxel data handoff with `VoxelGridData.to("numpy" | "torch")`,
+  `save_npz(...)`, and `load_npz(...)`.
+- Optional Voxel-ACDM adapter for numpy/torch voxel grids.
+- 2x2 weave tetrahedral mesh and small numpy/scipy FEM example scripts.
+- Root `build.sh`, `build.bat`, and `build.ps1` helpers for uv-based local
+  builds and installs.
+
 ## What This Project Adds
 
 | Area | Contribution | Practical impact |
@@ -21,9 +30,12 @@ across Windows, Linux, and macOS.
 | Stable wheel builds | Pre-generated `Python/Core.py` and `Python/Core_wrap.cxx` | Normal builds do not require a local SWIG install |
 | Cross-platform defaults | GUI, renderer, OpenMP, native CPU flags, and p4est are off by default | Fewer Windows/MSVC/MinGW, OpenMP runtime, and older-CPU build failures |
 | Python voxel backend | `pytexgen.gpu_voxelizer.voxelize_textile(...)` | OpenMP-free structured voxel output through numpy or torch |
+| Direct solver handoff | `pytexgen.gpu_voxelizer.voxelize_textile_data(...)` | Return numpy arrays or torch tensors without writing/parsing Abaqus files |
 | GPU-ready path | Optional `backend="torch"` with CUDA/MPS/CPU devices | Larger voxel grids can use torch acceleration without changing the TexGen C++ core |
 | Lightweight adaptive output | `adaptive=True` numpy mode | Exploratory non-uniform C3D8R voxel meshes without compiling p4est |
 | Performance pruning | Conservative AABB candidate pruning | Skips yarn/translation candidates that cannot intersect the current voxel chunk |
+| Tetra/FEM examples | `script/tetgen_2d_weave_tetra.py`, `script/tet_fem_solve.py` | End-to-end mesh generation, C3D4 export, PNG preview, and scipy sparse FEM smoke solve |
+| Local build helpers | `build.sh`, `build.bat`, `build.ps1` | Create/use a uv virtual environment, install build dependencies, compile, and install pytexgen |
 | Verification tools | Backend tests and a synthetic benchmark script | Easier to check numpy, torch, adaptive, and pruning behavior after changes |
 
 The goal is not to replace the TexGen C++ engine. The goal is to keep the
@@ -36,12 +48,14 @@ adaptive-mesh dependencies behind portable Python or opt-in build paths.
 pip install pytexgen
 ```
 
-The base package depends only on numpy. Install the GPU extra when you want the
-torch backend:
+The base package depends only on numpy. Install extras when you want torch,
+tqdm progress bars, or the example scripts:
 
 ```bash
-pip install pytexgen         # TexGen bindings + numpy voxel backend
-pip install "pytexgen[gpu]"  # add torch backend support
+pip install pytexgen              # TexGen bindings + numpy voxel backend
+pip install "pytexgen[gpu]"       # add torch backend support
+pip install "pytexgen[progress]"  # add tqdm progress bars
+pip install "pytexgen[examples]"  # add scipy/matplotlib for example scripts
 ```
 
 For CUDA, install a torch wheel that matches your Python version, GPU driver,
@@ -130,6 +144,30 @@ info = voxelize_textile(
 print(info["backend"], len(info["yarn_id"]))
 ```
 
+The default structured path is now the OpenMP-free numpy backend. Numpy
+parallelism is chunk based: the default `chunk_voxels=8192` gives a `40x40x40`
+grid eight classification tasks, and `info["workers"]` reports the effective
+worker count after chunk-count clamping.
+Set `progress=True` to show tqdm bars for classification and `.inp` writing;
+the package imports tqdm lazily so normal installs do not require it.
+
+Return structured voxel data directly for another solver:
+
+```python
+from pytexgen.gpu_voxelizer import voxelize_textile_data
+
+data = voxelize_textile_data(
+    textile,
+    nx=64, ny=64, nz=64,
+    backend="torch",
+    device="cuda",
+    output="backend",
+)
+
+material_grid = data.material_id()  # torch.Tensor with shape (nz, ny, nx)
+flat_yarn_ids = data.yarn_id        # ix + iy*nx + iz*nx*ny order
+```
+
 Use torch when an accelerator is available:
 
 ```python
@@ -171,6 +209,7 @@ those guarantees.
 | TexGen C++ structured voxels | `CRectangularVoxelMesh.SaveVoxelMesh(...)` | bundled TexGen core | Reference-compatible structured output |
 | Python numpy backend | `voxelize_textile(..., backend="numpy")` | `numpy` | Portable CPU voxelization without OpenMP |
 | Python torch backend | `voxelize_textile(..., backend="torch")` | `torch` | CUDA/MPS/torch CPU acceleration for larger grids |
+| Direct solver data | `voxelize_textile_data(...)` | `numpy`, optional `torch` | Structured arrays/tensors without `.inp` file round trip |
 | Python adaptive numpy backend | `voxelize_textile(..., adaptive=True)` | `numpy` | Lightweight non-uniform exploratory meshes |
 | TexGen p4est octree | `COctreeVoxelMesh.SaveVoxelMesh(...)` | local p4est/sc build | Full p4est-style adaptive octree workflows |
 
@@ -264,16 +303,16 @@ Backend smoke tests:
 python test_gpu_voxelizer_backends.py
 ```
 
-Synthetic pruning benchmark:
+Synthetic pruning and direct data benchmark:
 
 ```bash
-python bench_gpu_voxelizer_backends.py --resolution 32 --yarn-grid 4 --workers 4
+python bench_gpu_voxelizer_backends.py --resolution 64 --yarn-grid 4 --workers 4
 ```
 
 The Python voxelizer enables conservative AABB candidate pruning with
 `aabb_pruning=True` by default in the examples. The synthetic benchmark is the
-quick way to compare pruning behavior after changes; increase `--yarn-grid` or
-`--resolution` to make candidate skipping more visible.
+quick way to compare pruning behavior and the direct `VoxelGridData` handoff;
+it also runs a matrix norm workload on the returned voxel material grid.
 
 Torch/CUDA benchmark when torch is installed:
 
@@ -415,6 +454,14 @@ Preview the central knit RVE:
 pip install plotly
 uv run python script/inp_viewer.py Saved_Weft_Knit_Composite/RVE/weft_knit_composite_rve_W03_W04_C03_C04_mesh_64x64x32.inp --backend plotly --output build/weft_knit_rve.html --background white
 ```
+
+## Codex Skill
+
+AI agents working with this repository can use the companion Codex skill
+[`use-pytexgen`](https://github.com/yufangjie1643/use-pytexgen). It summarizes
+the project interfaces for TexGen model creation, `.tg3`/Abaqus export,
+numpy/torch voxelization, direct `VoxelGridData` handoff, Voxel-ACDM coupling,
+and the repository scripts/tests.
 
 ## Project Layout
 
