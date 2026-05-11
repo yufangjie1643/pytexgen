@@ -43,6 +43,9 @@ TexGen CTextile
 `extract_snapshot_bundle(...)` 会优先寻找可选 `_fastdata` provider；没有
 provider 时回退到现有 SWIG 对象遍历。这样后续 nanobind/pybind11 扩展只
 需要实现一个窄接口并返回连续数组，不需要替换整套 SWIG 建模 API。
+`SnapshotBundle` 构造入口会校验 shape、offset 单调性、offset 终点和 yarn
+数量一致性；`fastdata_provider_status()` 可以让上层代码明确判断当前是否
+真正加载了 `_fastdata`，避免把 fallback 误当成 C++ 快路径。
 `VoxelGridData.to_dlpack(...)` 则提供了 `yarn_id`、`material_id`、
 `occupancy` 的 DLPack 出口，方便 torch/CuPy/JAX 类张量库消费结果。
 

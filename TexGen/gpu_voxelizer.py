@@ -133,6 +133,36 @@ class YarnSnapshot:
     translations: np.ndarray   # (K, 3) periodic-image translations (includes origin)
 
 
+def _snapshot_matrix(name: str, value: Any, width: int) -> np.ndarray:
+    """Coerce a provider array to a 2D numpy matrix with a fixed column count."""
+    arr = np.asarray(value)
+    if arr.ndim != 2 or arr.shape[1] != width:
+        raise ValueError(f"{name} must have shape (N, {width})")
+    return arr
+
+
+def _snapshot_offsets(name: str, value: Any, total: int) -> np.ndarray:
+    """Coerce and validate a monotonic offset table for flat snapshot arrays."""
+    raw = np.asarray(value)
+    if raw.ndim != 1:
+        raise ValueError(f"{name} must be a 1D offset array")
+    if not np.issubdtype(raw.dtype, np.integer):
+        raise ValueError(f"{name} must contain integer offsets")
+    offsets = raw.astype(np.int64, copy=False)
+    if len(offsets) == 0:
+        raise ValueError(f"{name} must contain at least the initial zero offset")
+    if int(offsets[0]) != 0:
+        raise ValueError(f"{name} must start at 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError(f"{name} must be nondecreasing")
+    if int(offsets[-1]) != int(total):
+        raise ValueError(
+            f"{name} final offset {int(offsets[-1])} does not match flat array "
+            f"length {int(total)}"
+        )
+    return offsets
+
+
 @dataclass
 class AdaptiveVoxelCells:
     """Leaf cells for lightweight linear-octree voxel output."""
@@ -161,6 +191,48 @@ class SnapshotBundle:
     translations: np.ndarray
     translation_offsets: np.ndarray
     aabb: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.positions = _snapshot_matrix("positions", self.positions, 3)
+        self.tangents = _snapshot_matrix("tangents", self.tangents, 3)
+        self.ups = _snapshot_matrix("ups", self.ups, 3)
+        self.sides = _snapshot_matrix("sides", self.sides, 3)
+        self.sections = _snapshot_matrix("sections", self.sections, 2)
+        self.translations = _snapshot_matrix("translations", self.translations, 3)
+        self.aabb = np.asarray(self.aabb, dtype=np.float64)
+        if self.aabb.shape != (2, 3):
+            raise ValueError("aabb must have shape (2, 3)")
+
+        self.node_offsets = _snapshot_offsets(
+            "node_offsets", self.node_offsets, self.positions.shape[0]
+        )
+        self.section_offsets = _snapshot_offsets(
+            "section_offsets", self.section_offsets, self.sections.shape[0]
+        )
+        self.translation_offsets = _snapshot_offsets(
+            "translation_offsets",
+            self.translation_offsets,
+            self.translations.shape[0],
+        )
+
+        for name in ("tangents", "ups", "sides"):
+            arr = getattr(self, name)
+            if arr.shape != self.positions.shape:
+                raise ValueError(
+                    f"{name} must have the same shape as positions "
+                    f"{self.positions.shape}"
+                )
+
+        offset_lengths = {
+            len(self.node_offsets),
+            len(self.section_offsets),
+            len(self.translation_offsets),
+        }
+        if len(offset_lengths) != 1:
+            raise ValueError(
+                "node_offsets, section_offsets, and translation_offsets must "
+                "have the same length"
+            )
 
     @property
     def num_yarns(self) -> int:
@@ -867,26 +939,62 @@ def _coerce_snapshot_bundle(value: Any) -> SnapshotBundle:
     )
 
 
-def _load_fastdata_provider():
-    """Return an optional compiled fastdata provider module, if installed."""
+def _fastdata_provider_candidates() -> List[str]:
+    """Return module names to probe for the optional compiled provider."""
     candidates = []
     package = __package__
     if package:
         candidates.append(f"{package}._fastdata")
     candidates.append("TexGen._fastdata")
+    return list(dict.fromkeys(candidates))
 
-    seen = set()
-    for module_name in candidates:
-        if module_name in seen:
-            continue
-        seen.add(module_name)
+
+def _load_fastdata_provider():
+    """Return an optional compiled fastdata provider module, if installed."""
+    for module_name in _fastdata_provider_candidates():
         try:
             provider = importlib.import_module(module_name)
-        except ImportError:
+        except (ImportError, OSError):
             continue
         if hasattr(provider, "extract_snapshot_bundle"):
             return provider
     return None
+
+
+def fastdata_provider_status() -> Dict[str, Any]:
+    """Report whether the optional compiled snapshot provider is available.
+
+    This is intentionally side-effect free apart from normal Python imports; it
+    gives applications and benchmarks a clear signal that the high-throughput
+    Python/C handoff is active.
+    """
+    checked = []
+    errors = {}
+    for module_name in _fastdata_provider_candidates():
+        checked.append(module_name)
+        try:
+            provider = importlib.import_module(module_name)
+        except (ImportError, OSError) as exc:
+            errors[module_name] = str(exc)
+            continue
+        if not hasattr(provider, "extract_snapshot_bundle"):
+            errors[module_name] = "missing extract_snapshot_bundle"
+            continue
+        return {
+            "available": True,
+            "module": module_name,
+            "checked": checked,
+            "error": None,
+            "errors": errors,
+        }
+
+    return {
+        "available": False,
+        "module": None,
+        "checked": checked,
+        "error": "no _fastdata provider with extract_snapshot_bundle found",
+        "errors": errors,
+    }
 
 
 def extract_snapshot_bundle(textile: CTextile,
@@ -2607,6 +2715,7 @@ __all__ = [
     "voxelize_snapshot_bundle_data",
     "extract_snapshots",
     "extract_snapshot_bundle",
+    "fastdata_provider_status",
     "YarnSnapshot",
     "SnapshotBundle",
     "AdaptiveVoxelCells",

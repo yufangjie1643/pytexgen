@@ -134,8 +134,10 @@ aabb
 `_fastdata` provider with `extract_snapshot_bundle(...)`. If no provider is
 installed, it falls back to the current SWIG-based extraction. Providers may
 return either a `SnapshotBundle` instance or a mapping with the same array
-fields. Use `voxelize_snapshot_bundle_data(...)` when a compiled provider or a
-precomputed bundle already exists.
+fields; both paths are validated for array shapes, monotonic offsets, and
+consistent yarn counts. Use `fastdata_provider_status()` to report whether the
+compiled provider is active, and use `voxelize_snapshot_bundle_data(...)` when
+a compiled provider or a precomputed bundle already exists.
 
 `VoxelGridData.to_dlpack("yarn_id" | "material_id" | "occupancy")` exports a
 DLPack capsule through torch when a downstream tensor library wants to consume

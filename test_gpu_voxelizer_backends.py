@@ -350,6 +350,59 @@ class VoxelizerBackendTest(unittest.TestCase):
         np.testing.assert_allclose(bundle.aabb, self.aabb)
         np.testing.assert_allclose(bundle.positions, snap.positions)
 
+    def test_fastdata_provider_status_reports_loaded_module(self):
+        module_name = "TexGen._fastdata"
+        old_module = sys.modules.get(module_name)
+        provider = types.ModuleType(module_name)
+        provider.extract_snapshot_bundle = lambda _textile: None
+        sys.modules[module_name] = provider
+
+        def restore_module():
+            if old_module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = old_module
+
+        self.addCleanup(restore_module)
+
+        status = self.voxelizer.fastdata_provider_status()
+
+        self.assertTrue(status["available"])
+        self.assertEqual(status["module"], module_name)
+        self.assertIn(module_name, status["checked"])
+        self.assertIsNone(status["error"])
+
+    def test_snapshot_bundle_rejects_invalid_provider_arrays(self):
+        snap = synthetic_snapshot(self.voxelizer)
+        valid = {
+            "positions": snap.positions,
+            "tangents": snap.tangents,
+            "ups": snap.ups,
+            "sides": snap.sides,
+            "node_offsets": np.array([0, 2], dtype=np.int64),
+            "sections": snap.section,
+            "section_offsets": np.array([0, 5], dtype=np.int64),
+            "translations": snap.translations,
+            "translation_offsets": np.array([0, 1], dtype=np.int64),
+            "aabb": self.aabb.copy(),
+        }
+
+        cases = [
+            ("positions", {"positions": np.zeros((2, 2), dtype=np.float32)}),
+            ("tangents", {"tangents": np.zeros((1, 3), dtype=np.float32)}),
+            ("node_offsets", {"node_offsets": np.array([1, 2], dtype=np.int64)}),
+            ("section_offsets", {"section_offsets": np.array([0, 4], dtype=np.int64)}),
+            ("same length", {"translation_offsets": np.array([0, 1, 1], dtype=np.int64)}),
+            ("aabb", {"aabb": np.zeros((3, 2), dtype=np.float64)}),
+        ]
+
+        for message, overrides in cases:
+            with self.subTest(message=message):
+                payload = dict(valid)
+                payload.update(overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.voxelizer.SnapshotBundle(**payload)
+
     def test_voxel_grid_data_to_dlpack_roundtrip_or_missing_error(self):
         self.patch_extract_snapshots()
         data = self.voxelizer.voxelize_textile_data(
