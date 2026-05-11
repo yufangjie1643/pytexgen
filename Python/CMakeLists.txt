@@ -117,6 +117,29 @@ IF(BUILD_PYTHON_INTERFACE)
     TARGET_LINK_LIBRARIES(_Core Python::Module)
 
     # ========================================================================
+    # Optional fast data extraction provider
+    #
+    # This CPython extension deliberately does not link TexGenCore. In wheel
+    # mode TexGenCore is statically linked into _Core, and linking it again here
+    # would create a second TexGen singleton. Instead, _fastdata consumes the
+    # existing SWIG proxy through the Python C API and returns contiguous numpy
+    # arrays for the Python voxelizer contract.
+    # ========================================================================
+    ADD_LIBRARY(_fastdata MODULE fastdata.cpp)
+    SET_TARGET_PROPERTIES(_fastdata PROPERTIES PREFIX "" DEBUG_POSTFIX "_d")
+    IF(WIN32)
+        SET_TARGET_PROPERTIES(_fastdata PROPERTIES SUFFIX ".pyd")
+    ENDIF()
+    IF(UNIX)
+        SET_TARGET_PROPERTIES(_fastdata PROPERTIES
+            INSTALL_RPATH_USE_LINK_PATH 1
+            BUILD_WITH_INSTALL_RPATH 1
+            INSTALL_RPATH "${_TEXGEN_EXTENSION_RPATH}")
+    ENDIF()
+    TARGET_LINK_LIBRARIES(_fastdata Python::Module)
+    target_compile_features(_fastdata PRIVATE cxx_std_11)
+
+    # ========================================================================
     # Python utility modules list
     # ========================================================================
     FILE(GLOB PYTHON_MODULE_FILES Lib/*.py)
@@ -133,6 +156,9 @@ IF(BUILD_PYTHON_INTERFACE)
 
         # The compiled _Core extension module
         install(TARGETS _Core
+            LIBRARY DESTINATION ${PYTEXGEN_INSTALL_DIR}
+            RUNTIME DESTINATION ${PYTEXGEN_INSTALL_DIR})
+        install(TARGETS _fastdata
             LIBRARY DESTINATION ${PYTEXGEN_INSTALL_DIR}
             RUNTIME DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
@@ -183,11 +209,15 @@ IF(BUILD_PYTHON_INTERFACE)
 
         INSTALL(TARGETS _Core
             LIBRARY DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
+        INSTALL(TARGETS _fastdata
+            LIBRARY DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
 
         IF(WIN32)
             INSTALL(FILES ${PYTHON_SAMPLE_SCRIPTS}
                 DESTINATION ${CMAKE_INSTALL_PREFIX}/Scripts)
             INSTALL(TARGETS _Core
+                LIBRARY DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../Installer)
+            INSTALL(TARGETS _fastdata
                 LIBRARY DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/../Installer)
         ELSE()
             INSTALL(FILES ${PYTHON_SAMPLE_SCRIPTS}

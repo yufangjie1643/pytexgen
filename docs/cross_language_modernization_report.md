@@ -46,6 +46,11 @@ provider 时回退到现有 SWIG 对象遍历。这样后续 nanobind/pybind11 �
 `SnapshotBundle` 构造入口会校验 shape、offset 单调性、offset 终点和 yarn
 数量一致性；`fastdata_provider_status()` 可以让上层代码明确判断当前是否
 真正加载了 `_fastdata`，避免把 fallback 误当成 C++ 快路径。
+当前 `_fastdata` 的第一版实现是 CPython extension：它不重复链接
+`TexGenCore`，而是消费现有 SWIG `CTextile` proxy，并通过
+`numpy.frombuffer` 返回连续数组。这避免了 wheel 静态链接场景下的 TexGen
+singleton 分裂问题。真正的 C++ 指针直连应作为下一阶段，通过共享
+`TexGenCore` 或 `_Core` 内安全 capsule/export 函数实现。
 `VoxelGridData.to_dlpack(...)` 则提供了 `yarn_id`、`material_id`、
 `occupancy` 的 DLPack 出口，方便 torch/CuPy/JAX 类张量库消费结果。
 

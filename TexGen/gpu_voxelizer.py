@@ -961,6 +961,20 @@ def _load_fastdata_provider():
     return None
 
 
+def _fastdata_provider_info(provider: Any) -> Dict[str, Any]:
+    """Return optional provider metadata in a normalized dictionary."""
+    info_func = getattr(provider, "provider_info", None)
+    if info_func is None:
+        return {"capabilities": []}
+    info = info_func()
+    if not isinstance(info, MappingABC):
+        raise TypeError("fastdata provider_info() must return a mapping")
+    normalized = dict(info)
+    capabilities = normalized.get("capabilities", [])
+    normalized["capabilities"] = list(capabilities)
+    return normalized
+
+
 def fastdata_provider_status() -> Dict[str, Any]:
     """Report whether the optional compiled snapshot provider is available.
 
@@ -980,12 +994,15 @@ def fastdata_provider_status() -> Dict[str, Any]:
         if not hasattr(provider, "extract_snapshot_bundle"):
             errors[module_name] = "missing extract_snapshot_bundle"
             continue
+        provider_info = _fastdata_provider_info(provider)
         return {
             "available": True,
             "module": module_name,
             "checked": checked,
             "error": None,
             "errors": errors,
+            "capabilities": provider_info.get("capabilities", []),
+            "provider_info": provider_info,
         }
 
     return {
@@ -994,6 +1011,8 @@ def fastdata_provider_status() -> Dict[str, Any]:
         "checked": checked,
         "error": "no _fastdata provider with extract_snapshot_bundle found",
         "errors": errors,
+        "capabilities": [],
+        "provider_info": {},
     }
 
 
