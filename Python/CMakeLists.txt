@@ -28,7 +28,8 @@ IF(BUILD_PYTHON_INTERFACE)
     #
     # Wheel builds use committed generated files by default so users and CI do
     # not need a system SWIG install.  Set TEXGEN_REGENERATE_SWIG=ON only when
-    # Core.i or wrapped C++ APIs change.
+    # Core.i or wrapped C++ APIs change. If Core_wrap.cxx is regenerated, keep
+    # the _fastdata_extract_snapshot_bundle_direct hook near the method table.
     # ========================================================================
     set(TEXGEN_CORE_SWIG_PY "${CMAKE_CURRENT_SOURCE_DIR}/Core.py")
     set(TEXGEN_CORE_SWIG_CXX "${CMAKE_CURRENT_SOURCE_DIR}/Core_wrap.cxx")
@@ -74,7 +75,7 @@ IF(BUILD_PYTHON_INTERFACE)
     # ========================================================================
     # Build _Core extension module
     # ========================================================================
-    ADD_LIBRARY(_Core MODULE "${TEXGEN_CORE_SWIG_CXX}")
+    ADD_LIBRARY(_Core MODULE "${TEXGEN_CORE_SWIG_CXX}" core_fastdata.cpp)
 
     # Naming conventions: _Core.pyd (Windows) or _Core.so (Unix)
     SET_TARGET_PROPERTIES(_Core PROPERTIES PREFIX "" DEBUG_POSTFIX "_d")
@@ -115,15 +116,15 @@ IF(BUILD_PYTHON_INTERFACE)
     # Link to TexGenCore and Python
     TARGET_LINK_LIBRARIES(_Core TexGenCore)
     TARGET_LINK_LIBRARIES(_Core Python::Module)
+    target_compile_features(_Core PRIVATE cxx_std_11)
 
     # ========================================================================
     # Optional fast data extraction provider
     #
-    # This CPython extension deliberately does not link TexGenCore. In wheel
-    # mode TexGenCore is statically linked into _Core, and linking it again here
-    # would create a second TexGen singleton. Instead, _fastdata consumes the
-    # existing SWIG proxy through the Python C API and returns contiguous numpy
-    # arrays for the Python voxelizer contract.
+    # The direct fast-data extractor is linked into _Core so it sees the same
+    # CTextile pointers and TexGenCore singleton as the SWIG wrapper.  The
+    # separate _fastdata module is only a CPython facade that delegates to
+    # _Core; it deliberately does not link TexGenCore a second time.
     # ========================================================================
     ADD_LIBRARY(_fastdata MODULE fastdata.cpp)
     SET_TARGET_PROPERTIES(_fastdata PROPERTIES PREFIX "" DEBUG_POSTFIX "_d")

@@ -138233,8 +138233,31 @@ fail:
   return NULL;
 }
 
+/* pytexgen fastdata hook: keep this adjacent to the SWIG method table because
+   SWIG_ConvertPtr and SWIGTYPE_p_TexGen__CTextile are wrapper-local symbols. */
+extern "C" PyObject* TexGenCore_ExtractSnapshotBundleDirect(TexGen::CTextile* textile);
+
+SWIGINTERN PyObject *_wrap__fastdata_extract_snapshot_bundle_direct(PyObject *self, PyObject *args) {
+  TexGen::CTextile *arg1 = (TexGen::CTextile *) 0 ;
+  void *argp1 = 0 ;
+  int res1 = 0 ;
+  PyObject *swig_obj[1] ;
+
+  (void)self;
+  if (!SWIG_Python_UnpackTuple(args, "_fastdata_extract_snapshot_bundle_direct", 1, 1, swig_obj)) SWIG_fail;
+  res1 = SWIG_ConvertPtr(swig_obj[0], &argp1,SWIGTYPE_p_TexGen__CTextile, 0 |  0 );
+  if (!SWIG_IsOK(res1)) {
+    SWIG_exception_fail(SWIG_ArgError(res1), "in method '" "_fastdata_extract_snapshot_bundle_direct" "', argument " "1"" of type '" "TexGen::CTextile *""'");
+  }
+  arg1 = reinterpret_cast< TexGen::CTextile * >(argp1);
+  return TexGenCore_ExtractSnapshotBundleDirect(arg1);
+fail:
+  return NULL;
+}
+
 
 static PyMethodDef SwigMethods[] = {
+	 { "_fastdata_extract_snapshot_bundle_direct", _wrap__fastdata_extract_snapshot_bundle_direct, METH_VARARGS, NULL},
 	 { "delete_SwigPyIterator", _wrap_delete_SwigPyIterator, METH_O, NULL},
 	 { "SwigPyIterator_value", _wrap_SwigPyIterator_value, METH_O, NULL},
 	 { "SwigPyIterator_incr", _wrap_SwigPyIterator_incr, METH_VARARGS, NULL},

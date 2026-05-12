@@ -4,8 +4,9 @@ import numpy as np
 
 
 class FastDataExtensionTest(unittest.TestCase):
-    def test_swig_proxy_snapshot_bundle_uses_compiled_provider(self):
+    def test_core_pointer_snapshot_bundle_uses_compiled_provider(self):
         import pytexgen as tg
+        import pytexgen._Core as core
         from pytexgen.gpu_voxelizer import (
             SnapshotBundle,
             extract_snapshot_bundle,
@@ -21,11 +22,16 @@ class FastDataExtensionTest(unittest.TestCase):
 
         status = fastdata_provider_status()
         self.assertTrue(status["available"], status)
-        self.assertIn("extract_from_swig_proxy", status["capabilities"])
+        self.assertIn("extract_from_core_pointer", status["capabilities"])
+
+        direct_mapping = core._fastdata_extract_snapshot_bundle_direct(textile)
+        direct_bundle = SnapshotBundle(**direct_mapping)
+        self.assertGreater(direct_bundle.num_yarns, 0)
 
         bundle = extract_snapshot_bundle(textile)
 
         self.assertIsInstance(bundle, SnapshotBundle)
+        self.assertEqual(bundle.num_yarns, direct_bundle.num_yarns)
         self.assertGreater(bundle.num_yarns, 0)
         self.assertEqual(bundle.positions.shape[1], 3)
         self.assertEqual(bundle.sections.shape[1], 2)

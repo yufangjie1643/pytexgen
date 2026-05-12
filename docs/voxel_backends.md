@@ -139,13 +139,14 @@ consistent yarn counts. Use `fastdata_provider_status()` to report whether the
 compiled provider is active, and use `voxelize_snapshot_bundle_data(...)` when
 a compiled provider or a precomputed bundle already exists.
 
-The first compiled provider is `pytexgen._fastdata`, a small CPython extension
-that consumes the existing SWIG `CTextile` proxy and returns contiguous numpy
-arrays through `numpy.frombuffer`. It deliberately does not link `TexGenCore`,
-because wheel builds currently link `TexGenCore` statically into `_Core`; linking
-it again would create a second TexGen singleton. A future direct C++ pointer
-handoff should use either a shared `TexGenCore` runtime or an explicit safe
-capsule/export function inside `_Core`.
+The compiled provider is `pytexgen._fastdata`, a small CPython facade over
+`pytexgen._Core._fastdata_extract_snapshot_bundle_direct(...)`. `_Core` converts
+the SWIG proxy to a `TexGen::CTextile*` once, then extracts yarn geometry
+directly in C++ and returns contiguous numpy arrays. `_fastdata` deliberately
+does not link `TexGenCore`, because wheel builds link `TexGenCore` statically
+into `_Core`; linking it again would create a second TexGen singleton. If the
+SWIG wrapper is regenerated, keep the `_fastdata_extract_snapshot_bundle_direct`
+shim in `_Core` or add an equivalent explicit export.
 
 `VoxelGridData.to_dlpack("yarn_id" | "material_id" | "occupancy")` exports a
 DLPack capsule through torch when a downstream tensor library wants to consume

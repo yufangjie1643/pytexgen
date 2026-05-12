@@ -46,11 +46,12 @@ provider 时回退到现有 SWIG 对象遍历。这样后续 nanobind/pybind11 �
 `SnapshotBundle` 构造入口会校验 shape、offset 单调性、offset 终点和 yarn
 数量一致性；`fastdata_provider_status()` 可以让上层代码明确判断当前是否
 真正加载了 `_fastdata`，避免把 fallback 误当成 C++ 快路径。
-当前 `_fastdata` 的第一版实现是 CPython extension：它不重复链接
-`TexGenCore`，而是消费现有 SWIG `CTextile` proxy，并通过
-`numpy.frombuffer` 返回连续数组。这避免了 wheel 静态链接场景下的 TexGen
-singleton 分裂问题。真正的 C++ 指针直连应作为下一阶段，通过共享
-`TexGenCore` 或 `_Core` 内安全 capsule/export 函数实现。
+当前 `_fastdata` 是 CPython facade：它不重复链接 `TexGenCore`，而是导入
+`_Core._fastdata_extract_snapshot_bundle_direct(...)`。`_Core` 先用 SWIG
+runtime 把 Python proxy 安全转换成 `TexGen::CTextile*`，随后在同一个
+`TexGenCore` 静态实例内直接遍历 `CTextile/CYarn/CSlaveNode`，一次性返回
+连续 numpy arrays。这已经完成了真正的 C++ 指针直连，同时避免了 wheel
+静态链接场景下的 TexGen singleton 分裂问题。
 `VoxelGridData.to_dlpack(...)` 则提供了 `yarn_id`、`material_id`、
 `occupancy` 的 DLPack 出口，方便 torch/CuPy/JAX 类张量库消费结果。
 
@@ -162,18 +163,18 @@ nanobind 是更现代的 C++/Python 绑定库，目标与 pybind11 类似，但�
 TexGenCore -> nanobind extension -> contiguous numpy arrays
 ```
 
-推荐新增模块名：
+当前模块名：
 
 ```text
 pytexgen._fastdata
 ```
 
-可能接口：
+当前接口：
 
 ```python
-from pytexgen._fastdata import extract_snapshots_arrays
+from pytexgen._fastdata import extract_snapshot_bundle
 
-snap = extract_snapshots_arrays(textile)
+bundle = extract_snapshot_bundle(textile)
 ```
 
 迁移难度：
@@ -233,7 +234,9 @@ data.to("numpy")
 data.to("torch", device="cuda")
 ```
 
-下一步应该把 C++ 侧的数据也尽量一次性导出为 numpy array，而不是 Python 循环读 SWIG 对象。
+当前已把 yarn 快照从 `_Core` 内一次性导出为 numpy array，避免 Python
+循环逐点读取 SWIG 对象。后续优化应继续把更靠近 voxel/solver 的数据保持为
+连续数组或 DLPack tensor，减少对象级跨语言调用。
 
 迁移难度：
 
@@ -550,24 +553,26 @@ orientation field -> build_stiffness_field for FFT
 
 目标：减少 `extract_snapshots` 的 Python/SWIG 开销。
 
-建议新增：
+当前已新增：
 
 ```text
 pytexgen._fastdata
+pytexgen._Core._fastdata_extract_snapshot_bundle_direct
 ```
 
-技术选型：
+当前技术选型：
 
 ```text
-nanobind 优先
-pybind11 备选
+_Core 内 C++ 直连提取
+SWIG runtime 只负责入口指针转换
+_fastdata 只做 provider facade
 ```
 
 接口：
 
 ```python
-extract_snapshots_arrays(textile)
-extract_domain_aabb(textile)
+extract_snapshot_bundle(textile)
+_Core._fastdata_extract_snapshot_bundle_direct(textile)
 ```
 
 难度：中。
@@ -633,9 +638,9 @@ Python 侧：
 
 ```python
 try:
-    from ._fastdata import extract_snapshots_arrays
+    from ._fastdata import extract_snapshot_bundle
 except ImportError:
-    extract_snapshots_arrays = None
+    extract_snapshot_bundle = None
 ```
 
 这样 wheel 构建可以先不强制依赖新扩展；没有 fastdata 时走当前 Python fallback。
