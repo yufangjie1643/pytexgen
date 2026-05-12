@@ -152,6 +152,20 @@ shim in `_Core` or add an equivalent explicit export.
 DLPack capsule through torch when a downstream tensor library wants to consume
 the voxel labels without an Abaqus text-file round trip.
 
+### Fastdata Pipeline Benchmark
+
+Use `bench_fastdata_pipeline.py` to measure the real TexGen pipeline in phases:
+
+```powershell
+.\.venv\Scripts\python.exe bench_fastdata_pipeline.py --resolution 16 --repeat 1
+```
+
+The benchmark reports `construct_assign_domain`, `build_refine`,
+`snapshot_direct_core`, `snapshot_python_fallback`, and
+`voxel_numpy_from_direct` separately. Pass `--refine` for TexGen's refined weave
+path, increase `--resolution` to stress voxel classification, and use
+`--json-out path.json` when comparing optimization commits.
+
 See [torch_voxel_data_flow.md](torch_voxel_data_flow.md) for the full data flow
 from TexGen model generation to torch tensor output and matrix norm benchmark.
 See [voxel_acdm_interface.md](voxel_acdm_interface.md) for the direct
