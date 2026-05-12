@@ -1303,6 +1303,22 @@ def _snapshots_as_dtype(snapshots: List[YarnSnapshot], dtype) -> List[YarnSnapsh
     ]
 
 
+def _bundle_as_dtype(bundle: SnapshotBundle, dtype) -> SnapshotBundle:
+    """Cast flat snapshot bundle arrays once for a selected numpy dtype."""
+    return SnapshotBundle(
+        positions=bundle.positions.astype(dtype, copy=False),
+        tangents=bundle.tangents.astype(dtype, copy=False),
+        ups=bundle.ups.astype(dtype, copy=False),
+        sides=bundle.sides.astype(dtype, copy=False),
+        node_offsets=bundle.node_offsets,
+        sections=bundle.sections.astype(dtype, copy=False),
+        section_offsets=bundle.section_offsets,
+        translations=bundle.translations.astype(dtype, copy=False),
+        translation_offsets=bundle.translation_offsets,
+        aabb=bundle.aabb,
+    )
+
+
 def _snapshot_search_radius(snap: YarnSnapshot) -> float:
     """Estimate a conservative search radius for one yarn snapshot.
 
@@ -1347,6 +1363,42 @@ def _snapshot_translation_bounds(snap: YarnSnapshot) -> Tuple[np.ndarray, np.nda
     return base_lo[None, :] + translations, base_hi[None, :] + translations
 
 
+def _bundle_yarn_slices(bundle: SnapshotBundle, index: int) -> Tuple[slice, slice, slice]:
+    """Return node, section, and translation slices for one flat bundle yarn."""
+    n0, n1 = bundle.node_offsets[index:index + 2]
+    s0, s1 = bundle.section_offsets[index:index + 2]
+    t0, t1 = bundle.translation_offsets[index:index + 2]
+    return slice(int(n0), int(n1)), slice(int(s0), int(s1)), slice(int(t0), int(t1))
+
+
+def _bundle_search_radius(bundle: SnapshotBundle, index: int) -> float:
+    """Estimate a conservative search radius for one flat-bundle yarn."""
+    node_slice, section_slice, _ = _bundle_yarn_slices(bundle, index)
+    section = bundle.sections[section_slice]
+    positions = bundle.positions[node_slice]
+    section_radius = float(np.sqrt(np.max(np.einsum("ij,ij->i", section, section))))
+    if positions.shape[0] > 1:
+        segment_lengths = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+        segment_margin = float(segment_lengths.max(initial=0.0)) * 0.5
+    else:
+        segment_margin = 0.0
+    return section_radius + segment_margin + 1e-6
+
+
+def _bundle_translation_bounds(bundle: SnapshotBundle) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Build per-yarn, per-translation AABBs for a flat snapshot bundle."""
+    bounds = []
+    for index in range(bundle.num_yarns):
+        node_slice, _, translation_slice = _bundle_yarn_slices(bundle, index)
+        positions = bundle.positions[node_slice]
+        translations = bundle.translations[translation_slice]
+        radius = _bundle_search_radius(bundle, index)
+        base_lo = positions.min(axis=0) - radius
+        base_hi = positions.max(axis=0) + radius
+        bounds.append((base_lo[None, :] + translations, base_hi[None, :] + translations))
+    return bounds
+
+
 def _point_in_polygon_batch_numpy(points_uv: np.ndarray,
                                   polygon: np.ndarray,
                                   poly_len: int) -> np.ndarray:
@@ -1384,6 +1436,84 @@ def _point_in_polygon_batch_numpy(points_uv: np.ndarray,
     xi = x1 + (v - y1) * (x2 - x1) / denom
     hits = (cond1 & (u < xi)).sum(axis=-1)
     return (hits % 2) == 1
+
+
+def _classify_voxel_chunk_bundle_numpy(
+    pts: np.ndarray,
+    bundle: SnapshotBundle,
+    bounds: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+    aabb_pruning: bool = True,
+) -> np.ndarray:
+    """Classify a center chunk directly from flat snapshot bundle arrays."""
+    C = pts.shape[0]
+    best_dist = np.full(C, np.inf, dtype=pts.dtype)
+    best_yarn = np.full(C, -1, dtype=np.int32)
+    chunk_lo = pts.min(axis=0)
+    chunk_hi = pts.max(axis=0)
+
+    for y_idx in range(bundle.num_yarns):
+        node_slice, section_slice, translation_slice = _bundle_yarn_slices(bundle, y_idx)
+        Py = bundle.positions[node_slice]
+        if Py.shape[0] < 2:
+            continue
+        Ty = bundle.tangents[node_slice]
+        Uy = bundle.ups[node_slice]
+        Sy = bundle.sides[node_slice]
+        poly = bundle.sections[section_slice]
+        translations = bundle.translations[translation_slice]
+        n = poly.shape[0]
+        bounds_lo = bounds_hi = None
+        if aabb_pruning and bounds is not None:
+            bounds_lo, bounds_hi = bounds[y_idx]
+
+        for t_idx, offset in enumerate(translations):
+            active_idx = None
+            active_pts = pts
+            if bounds_lo is not None and bounds_hi is not None:
+                lo = bounds_lo[t_idx]
+                hi = bounds_hi[t_idx]
+                if np.any(chunk_hi < lo) or np.any(chunk_lo > hi):
+                    continue
+                mask = np.all((pts >= lo) & (pts <= hi), axis=1)
+                if not np.any(mask):
+                    continue
+                active_idx = np.nonzero(mask)[0]
+                active_pts = pts[active_idx]
+
+            Pt = Py + offset
+            local_count = active_pts.shape[0]
+            d2 = (
+                np.einsum("ij,ij->i", active_pts, active_pts)[:, None]
+                + np.einsum("ij,ij->i", Pt, Pt)[None, :]
+                - 2.0 * (active_pts @ Pt.T)
+            )
+            np.maximum(d2, 0.0, out=d2)
+            nn = np.argmin(d2, axis=1)
+
+            rel = active_pts - Pt[nn]
+            tan = Ty[nn]
+            up = Uy[nn]
+            sid = Sy[nn]
+            u_coord = np.einsum("cd,cd->c", rel, sid)
+            v_coord = np.einsum("cd,cd->c", rel, up)
+            t_coord = np.einsum("cd,cd->c", rel, tan)
+
+            uv = np.stack([u_coord, v_coord], axis=-1)
+            inside = _point_in_polygon_batch_numpy(uv, poly, n)
+
+            nearest_d2 = d2[np.arange(local_count), nn]
+            dist = np.sqrt(nearest_d2) + np.abs(t_coord) * 0.1
+            if active_idx is None:
+                update = inside & (dist < best_dist)
+                best_dist[update] = dist[update]
+                best_yarn[update] = y_idx
+            else:
+                update = inside & (dist < best_dist[active_idx])
+                target = active_idx[update]
+                best_dist[target] = dist[update]
+                best_yarn[target] = y_idx
+
+    return best_yarn
 
 
 def _classify_voxel_chunk_numpy(pts: np.ndarray,
@@ -1475,6 +1605,45 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
                 best_yarn[target] = y_idx
 
     return best_yarn
+
+
+def _classify_voxels_bundle_numpy(
+    centers: np.ndarray,
+    bundle: SnapshotBundle,
+    chunk: int = DEFAULT_NUMPY_CHUNK_VOXELS,
+    workers: Optional[int] = None,
+    aabb_pruning: bool = True,
+    progress: Any = False,
+) -> np.ndarray:
+    """Classify voxel centers directly from a flat ``SnapshotBundle``."""
+    V = centers.shape[0]
+    yarn_id = np.full(V, -1, dtype=np.int32)
+    ranges = [(v0, min(v0 + chunk, V)) for v0 in range(0, V, chunk)]
+    bounds_list = _bundle_translation_bounds(bundle) if aabb_pruning else None
+    worker_count = _effective_numpy_workers(V, chunk, workers)
+
+    def classify_range(range_bounds):
+        v0, v1 = range_bounds
+        return v0, v1, _classify_voxel_chunk_bundle_numpy(
+            centers[v0:v1], bundle, bounds=bounds_list, aabb_pruning=aabb_pruning
+        )
+
+    if worker_count == 1:
+        for range_bounds in _progress_iter(
+            ranges, progress, total=len(ranges),
+            desc="classify numpy bundle voxels", unit="chunk"
+        ):
+            v0, v1, ids = classify_range(range_bounds)
+            yarn_id[v0:v1] = ids
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = executor.map(classify_range, ranges)
+            for v0, v1, ids in _progress_iter(
+                results, progress, total=len(ranges),
+                desc="classify numpy bundle voxels", unit="chunk"
+            ):
+                yarn_id[v0:v1] = ids
+    return yarn_id
 
 
 def _default_numpy_workers() -> int:
@@ -2339,23 +2508,97 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
     existing numpy/torch classification and data-return code remains unchanged.
     """
     bundle = _coerce_snapshot_bundle(bundle)
-    return voxelize_snapshots_data(
-        bundle.to_snapshots(),
-        bundle.aabb,
-        nx=nx,
-        ny=ny,
-        nz=nz,
-        backend=backend,
-        device=device,
-        dtype=dtype,
-        chunk_voxels=chunk_voxels,
-        workers=workers,
-        verbose=verbose,
-        include_centers=include_centers,
-        output=output,
+    backend = backend.lower()
+    output = output.lower()
+    if output not in {"backend", "numpy", "torch"}:
+        raise ValueError('output must be one of "backend", "numpy", or "torch"')
+
+    _validate_voxelizer_args(
+        nx, ny, nz, backend, dtype, chunk_voxels,
+        adaptive_levels=0, max_adaptive_cells=nx * ny * nz
+    )
+    if bundle.num_yarns == 0:
+        raise RuntimeError("No yarn snapshots provided")
+
+    backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
+
+    if backend_cfg.backend == "torch":
+        t0 = time.perf_counter()
+        snapshots = bundle.to_snapshots()
+        t_unpack = time.perf_counter() - t0
+        data = voxelize_snapshots_data(
+            snapshots,
+            bundle.aabb,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            backend=backend_cfg.backend,
+            device=backend_cfg.device,
+            dtype=dtype,
+            chunk_voxels=chunk_voxels,
+            workers=workers,
+            verbose=verbose,
+            include_centers=include_centers,
+            output=output,
+            aabb_pruning=aabb_pruning,
+            progress=progress,
+        )
+        data.timings["unpack"] = t_unpack
+        return data
+
+    def log(msg):
+        """Print one timing/status line when verbose output is enabled."""
+        if verbose:
+            print(f"[voxelizer] {msg}")
+
+    aabb_np = np.asarray(bundle.aabb, dtype=np.float64)
+    if aabb_np.shape != (2, 3):
+        raise ValueError(f"aabb must have shape (2, 3), got {aabb_np.shape}")
+
+    lo, hi = aabb_np[0], aabb_np[1]
+    centers_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
+    centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz, dtype=centers_dtype)
+    centers_out = None
+
+    t0 = time.perf_counter()
+    bundle_np = _bundle_as_dtype(bundle, backend_cfg.np_dtype)
+    centers_np = centers_np.astype(backend_cfg.np_dtype, copy=False)
+    t_pack = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    actual_workers = _effective_numpy_workers(
+        centers_np.shape[0], chunk_voxels, backend_cfg.workers
+    )
+    yarn_id = _classify_voxels_bundle_numpy(
+        centers_np,
+        bundle_np,
+        chunk=chunk_voxels,
+        workers=backend_cfg.workers,
         aabb_pruning=aabb_pruning,
         progress=progress,
     )
+    t_classify = time.perf_counter() - t0
+    log(
+        f"classified {centers_np.shape[0]:,} bundle voxels with numpy/"
+        f"{actual_workers} workers in {t_classify:.3f}s"
+    )
+    if include_centers:
+        centers_out = centers_np
+
+    data = VoxelGridData(
+        yarn_id=yarn_id,
+        aabb=aabb_np,
+        resolution=(nx, ny, nz),
+        backend=backend_cfg.backend,
+        device=backend_cfg.device,
+        workers=actual_workers,
+        dtype=dtype,
+        timings=dict(extract=0.0, unpack=0.0, pack=t_pack, classify=t_classify),
+        centers=centers_out,
+        aabb_pruning=aabb_pruning,
+        storage="numpy",
+    )
+    return _coerce_voxel_grid_output(data, output, device=device)
 
 
 def voxelize_textile_data(textile: CTextile,
@@ -2435,15 +2678,37 @@ def voxelize_textile_data(textile: CTextile,
 
     t0 = time.perf_counter()
     bundle = extract_snapshot_bundle(textile)
-    snapshots, aabb = bundle.to_snapshots(), bundle.aabb
+    aabb = bundle.aabb
     t_extract = time.perf_counter() - t0
     log(
-        f"extracted {len(snapshots)} yarns, AABB={aabb.tolist()}, "
+        f"extracted {bundle.num_yarns} yarns, AABB={aabb.tolist()}, "
         f"backend={backend_cfg.backend}, workers={backend_cfg.workers}, {t_extract:.3f}s"
     )
 
-    if len(snapshots) == 0:
+    if bundle.num_yarns == 0:
         raise RuntimeError("No yarns extracted - textile may be empty or unbuilt")
+
+    if backend_cfg.backend == "numpy":
+        data = voxelize_snapshot_bundle_data(
+            bundle,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            backend=backend_cfg.backend,
+            device=backend_cfg.device,
+            dtype=dtype,
+            chunk_voxels=chunk_voxels,
+            workers=workers,
+            verbose=verbose,
+            include_centers=include_centers,
+            output=output,
+            aabb_pruning=aabb_pruning,
+            progress=progress,
+        )
+        data.timings["extract"] = t_extract
+        return data
+
+    snapshots = bundle.to_snapshots()
 
     lo, hi = aabb[0], aabb[1]
     centers_dtype = {"float32": np.float32, "float64": np.float64}[dtype]

@@ -142,11 +142,14 @@ a compiled provider or a precomputed bundle already exists.
 The compiled provider is `pytexgen._fastdata`, a small CPython facade over
 `pytexgen._Core._fastdata_extract_snapshot_bundle_direct(...)`. `_Core` converts
 the SWIG proxy to a `TexGen::CTextile*` once, then extracts yarn geometry
-directly in C++ and returns contiguous numpy arrays. `_fastdata` deliberately
-does not link `TexGenCore`, because wheel builds link `TexGenCore` statically
-into `_Core`; linking it again would create a second TexGen singleton. If the
-SWIG wrapper is regenerated, keep the `_fastdata_extract_snapshot_bundle_direct`
-shim in `_Core` or add an equivalent explicit export.
+directly in C++ and returns owned contiguous numpy ndarrays through the NumPy C
+API. `voxelize_snapshot_bundle_data(...)` consumes this flat bundle directly on
+the numpy backend, avoiding a round trip back to per-yarn `YarnSnapshot` Python
+objects. `_fastdata` deliberately does not link `TexGenCore`, because wheel
+builds link `TexGenCore` statically into `_Core`; linking it again would create
+a second TexGen singleton. If the SWIG wrapper is regenerated, keep the
+`_fastdata_extract_snapshot_bundle_direct` shim in `_Core` or add an equivalent
+explicit export.
 
 `VoxelGridData.to_dlpack("yarn_id" | "material_id" | "occupancy")` exports a
 DLPack capsule through torch when a downstream tensor library wants to consume
@@ -162,9 +165,10 @@ Use `bench_fastdata_pipeline.py` to measure the real TexGen pipeline in phases:
 
 The benchmark reports `construct_assign_domain`, `build_refine`,
 `snapshot_direct_core`, `snapshot_python_fallback`, and
-`voxel_numpy_from_direct` separately. Pass `--refine` for TexGen's refined weave
-path, increase `--resolution` to stress voxel classification, and use
-`--json-out path.json` when comparing optimization commits.
+`bundle_numpy_pack`, `voxel_centers`, `voxel_classify_numpy_flat`, and
+`voxel_numpy_from_direct_total` separately. Pass `--refine` for TexGen's
+refined weave path, increase `--resolution` to stress voxel classification, and
+use `--json-out path.json` when comparing optimization commits.
 
 See [torch_voxel_data_flow.md](torch_voxel_data_flow.md) for the full data flow
 from TexGen model generation to torch tensor output and matrix norm benchmark.

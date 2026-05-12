@@ -164,6 +164,32 @@ class VoxelizerBackendTest(unittest.TestCase):
         self.assertEqual(int(materials.max()), 1)
         self.assertEqual(int(materials.min()), 0)
 
+    def test_numpy_textile_data_uses_flat_provider_bundle(self):
+        snap = synthetic_snapshot(self.voxelizer)
+        bundle = self.voxelizer.SnapshotBundle.from_snapshots([snap], self.aabb.copy())
+        old_extract_bundle = self.voxelizer.extract_snapshot_bundle
+        self.voxelizer.extract_snapshot_bundle = lambda _textile: bundle
+        self.addCleanup(
+            lambda: setattr(self.voxelizer, "extract_snapshot_bundle", old_extract_bundle)
+        )
+
+        def fail_to_snapshots():
+            raise AssertionError("voxelize_textile_data should keep provider bundle flat")
+
+        bundle.to_snapshots = fail_to_snapshots
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        self.assertEqual(int(data.occupancy().sum()), 16)
+        self.assertEqual(data.timings["unpack"], 0.0)
+
     def test_default_backend_is_numpy_and_reports_effective_workers(self):
         self.patch_extract_snapshots()
         data = self.voxelizer.voxelize_textile_data(
@@ -325,6 +351,40 @@ class VoxelizerBackendTest(unittest.TestCase):
             verbose=False,
         )
         np.testing.assert_array_equal(bundled.yarn_id, direct.yarn_id)
+
+    def test_snapshot_bundle_numpy_path_consumes_flat_arrays(self):
+        snap = synthetic_snapshot(self.voxelizer)
+        bundle = self.voxelizer.SnapshotBundle.from_snapshots(
+            [snap],
+            self.aabb.copy(),
+        )
+        direct = self.voxelizer.voxelize_snapshots_data(
+            [snap],
+            self.aabb.copy(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        def fail_to_snapshots():
+            raise AssertionError("flat SnapshotBundle path should not unpack to YarnSnapshot")
+
+        bundle.to_snapshots = fail_to_snapshots
+        bundled = self.voxelizer.voxelize_snapshot_bundle_data(
+            bundle,
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        np.testing.assert_array_equal(bundled.yarn_id, direct.yarn_id)
+        self.assertEqual(bundled.timings["unpack"], 0.0)
 
     def test_extract_snapshot_bundle_uses_provider_mapping(self):
         snap = synthetic_snapshot(self.voxelizer)

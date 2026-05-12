@@ -46,6 +46,15 @@ class FastDataPipelineBenchmarkTest(unittest.TestCase):
         self.assertEqual(payload["records"][1]["metadata"]["nodes"], 12)
         self.assertIn("snapshot", report.format_table())
 
+    def test_real_phase_list_splits_flat_voxel_work(self):
+        args = bench.parse_args(["--resolution", "4", "--skip-python-fallback"])
+        names = bench.real_phase_names(args)
+
+        self.assertIn("bundle_numpy_pack", names)
+        self.assertIn("voxel_centers", names)
+        self.assertIn("voxel_classify_numpy_flat", names)
+        self.assertNotIn("voxel_numpy_from_direct", names)
+
 
 if __name__ == "__main__":
     unittest.main()

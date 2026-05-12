@@ -172,6 +172,27 @@ def _voxel_metadata(data: Any) -> Dict[str, Any]:
     }
 
 
+def real_phase_names(args: argparse.Namespace, backend: str = "numpy") -> List[str]:
+    """Return the real benchmark phase names without importing pytexgen."""
+    names = [
+        "construct_assign_domain",
+        "build_refine",
+        "snapshot_direct_core",
+    ]
+    if not args.skip_python_fallback:
+        names.append("snapshot_python_fallback")
+    if not args.skip_voxel:
+        if backend != "numpy":
+            raise ValueError("split flat voxel benchmark currently supports the numpy backend")
+        names.extend([
+            "bundle_numpy_pack",
+            "voxel_centers",
+            "voxel_classify_numpy_flat",
+            "voxel_numpy_from_direct_total",
+        ])
+    return names
+
+
 def make_real_phases(args: argparse.Namespace) -> List[BenchmarkPhase]:
     import pytexgen._Core as core
     import pytexgen.gpu_voxelizer as gv
@@ -202,21 +223,61 @@ def make_real_phases(args: argparse.Namespace) -> List[BenchmarkPhase]:
         mapping = core._fastdata_extract_snapshot_bundle_direct(textile)
         return gv.SnapshotBundle(**mapping)
 
-    def voxelize_bundle(bundle: Any, _context: MutableMapping[str, Any]):
-        return gv.voxelize_snapshot_bundle_data(
+    backend_cfg = gv._resolve_backend(args.backend, args.device, args.dtype, args.workers, adaptive=False)
+
+    def existing_direct_bundle(context: MutableMapping[str, Any]):
+        return context["snapshot_direct_core"]
+
+    def pack_bundle(bundle: Any, _context: MutableMapping[str, Any]):
+        return gv._bundle_as_dtype(bundle, backend_cfg.np_dtype)
+
+    def pack_metadata(bundle: Any) -> Dict[str, Any]:
+        metadata = _bundle_metadata(bundle)
+        metadata["dtype"] = args.dtype
+        return metadata
+
+    def centers_from_bundle(_prepared: Any, context: MutableMapping[str, Any]):
+        bundle = context["snapshot_direct_core"]
+        aabb = np.asarray(bundle.aabb, dtype=np.float64)
+        centers_dtype = {"float32": np.float32, "float64": np.float64}[args.dtype]
+        return gv._structured_voxel_centers(
+            aabb[0],
+            aabb[1],
+            args.resolution,
+            args.resolution,
+            args.resolution,
+            dtype=centers_dtype,
+        )
+
+    def centers_metadata(centers: Any) -> Dict[str, Any]:
+        return {
+            "voxels": int(centers.shape[0]),
+            "resolution": [args.resolution, args.resolution, args.resolution],
+            "dtype": str(centers.dtype),
+        }
+
+    def classify_flat_bundle(_prepared: Any, context: MutableMapping[str, Any]):
+        bundle = context["bundle_numpy_pack"]
+        centers = context["voxel_centers"].astype(backend_cfg.np_dtype, copy=False)
+        return gv._classify_voxels_bundle_numpy(
+            centers,
             bundle,
-            nx=args.resolution,
-            ny=args.resolution,
-            nz=args.resolution,
-            backend=args.backend,
-            device=args.device,
-            dtype=args.dtype,
-            chunk_voxels=args.chunk_voxels,
-            workers=args.workers,
-            verbose=False,
-            output="backend",
+            chunk=args.chunk_voxels,
+            workers=backend_cfg.workers,
             aabb_pruning=not args.no_aabb_pruning,
         )
+
+    def classify_metadata(yarn_id: Any) -> Dict[str, Any]:
+        return {
+            "occupied": int((np.asarray(yarn_id) >= 0).sum()),
+            "backend": backend_cfg.backend,
+            "workers": int(gv._effective_numpy_workers(
+                int(np.asarray(yarn_id).shape[0]),
+                args.chunk_voxels,
+                backend_cfg.workers,
+            )),
+            "aabb_pruning": not args.no_aabb_pruning,
+        }
 
     phases = [
         BenchmarkPhase(
@@ -251,11 +312,46 @@ def make_real_phases(args: argparse.Namespace) -> List[BenchmarkPhase]:
             )
         )
     if not args.skip_voxel:
+        if backend_cfg.backend != "numpy":
+            raise ValueError("split flat voxel benchmark currently supports the numpy backend")
+        phases.extend(
+            [
+                BenchmarkPhase(
+                    "bundle_numpy_pack",
+                    prepare=existing_direct_bundle,
+                    run=pack_bundle,
+                    metadata=pack_metadata,
+                ),
+                BenchmarkPhase(
+                    "voxel_centers",
+                    run=centers_from_bundle,
+                    metadata=centers_metadata,
+                ),
+                BenchmarkPhase(
+                    "voxel_classify_numpy_flat",
+                    run=classify_flat_bundle,
+                    metadata=classify_metadata,
+                ),
+            ]
+        )
         phases.append(
             BenchmarkPhase(
-                "voxel_numpy_from_direct",
+                "voxel_numpy_from_direct_total",
                 prepare=direct_bundle,
-                run=voxelize_bundle,
+                run=lambda bundle, _context: gv.voxelize_snapshot_bundle_data(
+                    bundle,
+                    nx=args.resolution,
+                    ny=args.resolution,
+                    nz=args.resolution,
+                    backend=args.backend,
+                    device=args.device,
+                    dtype=args.dtype,
+                    chunk_voxels=args.chunk_voxels,
+                    workers=args.workers,
+                    verbose=False,
+                    output="backend",
+                    aabb_pruning=not args.no_aabb_pruning,
+                ),
                 metadata=_voxel_metadata,
             )
         )

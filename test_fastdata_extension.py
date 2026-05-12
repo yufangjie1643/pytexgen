@@ -25,6 +25,15 @@ class FastDataExtensionTest(unittest.TestCase):
         self.assertIn("extract_from_core_pointer", status["capabilities"])
 
         direct_mapping = core._fastdata_extract_snapshot_bundle_direct(textile)
+        for array_name in (
+            "positions", "tangents", "ups", "sides", "node_offsets",
+            "sections", "section_offsets", "translations",
+            "translation_offsets", "aabb",
+        ):
+            self.assertTrue(
+                direct_mapping[array_name].flags.owndata,
+                f"{array_name} should be owned by a direct NumPy ndarray",
+            )
         direct_bundle = SnapshotBundle(**direct_mapping)
         self.assertGreater(direct_bundle.num_yarns, 0)
 

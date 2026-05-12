@@ -50,8 +50,10 @@ provider 时回退到现有 SWIG 对象遍历。这样后续 nanobind/pybind11 �
 `_Core._fastdata_extract_snapshot_bundle_direct(...)`。`_Core` 先用 SWIG
 runtime 把 Python proxy 安全转换成 `TexGen::CTextile*`，随后在同一个
 `TexGenCore` 静态实例内直接遍历 `CTextile/CYarn/CSlaveNode`，一次性返回
-连续 numpy arrays。这已经完成了真正的 C++ 指针直连，同时避免了 wheel
-静态链接场景下的 TexGen singleton 分裂问题。
+通过 NumPy C API 分配的 owned contiguous numpy arrays。numpy voxelizer 的
+`SnapshotBundle` 路径会直接消费 flat arrays，不再拆回 per-yarn
+`YarnSnapshot` Python 对象。这已经完成了真正的 C++ 指针直连，同时避免了
+wheel 静态链接场景下的 TexGen singleton 分裂问题。
 `VoxelGridData.to_dlpack(...)` 则提供了 `yarn_id`、`material_id`、
 `occupancy` 的 DLPack 出口，方便 torch/CuPy/JAX 类张量库消费结果。
 

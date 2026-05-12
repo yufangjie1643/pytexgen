@@ -1,12 +1,16 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+#include <numpy/arrayobject.h>
+
 #include "../Core/PrecompiledHeaders.h"
 #include "../Core/TexGen.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -32,6 +36,16 @@ public:
 private:
     PyObject* obj_;
 };
+
+bool ensure_numpy_api() {
+    static bool ready = false;
+    if (ready) {
+        return true;
+    }
+    import_array1(false);
+    ready = true;
+    return true;
+}
 
 struct FlatBundle {
     std::vector<double> positions;
@@ -228,50 +242,26 @@ void append_domain_aabb(const TexGen::CDomain& domain, FlatBundle& bundle) {
 
 template <typename T>
 PyObject* array_from_vector(const std::vector<T>& values,
-                            const char* array_typecode,
-                            const char* numpy_dtype,
+                            int numpy_type,
                             Py_ssize_t rows,
                             Py_ssize_t cols) {
-    PyRef array_mod(PyImport_ImportModule("array"));
-    if (!array_mod) {
-        return nullptr;
+    npy_intp dims[2] = {static_cast<npy_intp>(rows), static_cast<npy_intp>(cols)};
+    int ndim = 2;
+    if (cols <= 0) {
+        dims[0] = static_cast<npy_intp>(values.size());
+        ndim = 1;
     }
-    PyRef array_cls(PyObject_GetAttrString(array_mod.get(), "array"));
-    PyRef typecode(PyUnicode_FromString(array_typecode));
-    if (!array_cls || !typecode) {
-        return nullptr;
-    }
-    PyRef storage(PyObject_CallFunctionObjArgs(array_cls.get(), typecode.get(), nullptr));
-    if (!storage) {
+    PyObject* array = PyArray_SimpleNew(ndim, dims, numpy_type);
+    if (!array) {
         return nullptr;
     }
     if (!values.empty()) {
-        const char* bytes = reinterpret_cast<const char*>(values.data());
-        const Py_ssize_t nbytes =
-            static_cast<Py_ssize_t>(values.size() * sizeof(T));
-        PyRef loaded(PyObject_CallMethod(storage.get(), "frombytes", "y#", bytes, nbytes));
-        if (!loaded) {
-            return nullptr;
-        }
+        std::memcpy(
+            PyArray_DATA(reinterpret_cast<PyArrayObject*>(array)),
+            values.data(),
+            values.size() * sizeof(T));
     }
-
-    PyRef numpy(PyImport_ImportModule("numpy"));
-    PyRef dtype(PyUnicode_FromString(numpy_dtype));
-    if (!numpy || !dtype) {
-        return nullptr;
-    }
-    PyRef flat(PyObject_CallMethod(numpy.get(), "frombuffer", "OO", storage.get(), dtype.get()));
-    if (!flat) {
-        return nullptr;
-    }
-    if (cols <= 0) {
-        return flat.release();
-    }
-    PyRef shape(Py_BuildValue("(nn)", rows, cols));
-    if (!shape) {
-        return nullptr;
-    }
-    return PyObject_CallMethod(flat.get(), "reshape", "O", shape.get());
+    return array;
 }
 
 bool dict_set_steal(PyObject* dict, const char* key, PyObject* value) {
@@ -292,34 +282,34 @@ PyObject* bundle_to_dict(const FlatBundle& bundle) {
     }
 
     if (!dict_set_steal(dict.get(), "positions",
-                        array_from_vector(bundle.positions, "d", "float64",
+                        array_from_vector(bundle.positions, NPY_DOUBLE,
                                           static_cast<Py_ssize_t>(bundle.positions.size() / 3), 3))
         || !dict_set_steal(dict.get(), "tangents",
-                           array_from_vector(bundle.tangents, "d", "float64",
+                           array_from_vector(bundle.tangents, NPY_DOUBLE,
                                              static_cast<Py_ssize_t>(bundle.tangents.size() / 3), 3))
         || !dict_set_steal(dict.get(), "ups",
-                           array_from_vector(bundle.ups, "d", "float64",
+                           array_from_vector(bundle.ups, NPY_DOUBLE,
                                              static_cast<Py_ssize_t>(bundle.ups.size() / 3), 3))
         || !dict_set_steal(dict.get(), "sides",
-                           array_from_vector(bundle.sides, "d", "float64",
+                           array_from_vector(bundle.sides, NPY_DOUBLE,
                                              static_cast<Py_ssize_t>(bundle.sides.size() / 3), 3))
         || !dict_set_steal(dict.get(), "node_offsets",
-                           array_from_vector(bundle.node_offsets, "q", "int64",
+                           array_from_vector(bundle.node_offsets, NPY_INT64,
                                              static_cast<Py_ssize_t>(bundle.node_offsets.size()), 0))
         || !dict_set_steal(dict.get(), "sections",
-                           array_from_vector(bundle.sections, "d", "float64",
+                           array_from_vector(bundle.sections, NPY_DOUBLE,
                                              static_cast<Py_ssize_t>(bundle.sections.size() / 2), 2))
         || !dict_set_steal(dict.get(), "section_offsets",
-                           array_from_vector(bundle.section_offsets, "q", "int64",
+                           array_from_vector(bundle.section_offsets, NPY_INT64,
                                              static_cast<Py_ssize_t>(bundle.section_offsets.size()), 0))
         || !dict_set_steal(dict.get(), "translations",
-                           array_from_vector(bundle.translations, "d", "float64",
+                           array_from_vector(bundle.translations, NPY_DOUBLE,
                                              static_cast<Py_ssize_t>(bundle.translations.size() / 3), 3))
         || !dict_set_steal(dict.get(), "translation_offsets",
-                           array_from_vector(bundle.translation_offsets, "q", "int64",
+                           array_from_vector(bundle.translation_offsets, NPY_INT64,
                                              static_cast<Py_ssize_t>(bundle.translation_offsets.size()), 0))
         || !dict_set_steal(dict.get(), "aabb",
-                           array_from_vector(bundle.aabb, "d", "float64", 2, 3))) {
+                           array_from_vector(bundle.aabb, NPY_DOUBLE, 2, 3))) {
         return nullptr;
     }
     return dict.release();
@@ -330,6 +320,9 @@ PyObject* bundle_to_dict(const FlatBundle& bundle) {
 extern "C" PyObject* TexGenCore_ExtractSnapshotBundleDirect(TexGen::CTextile* textile) {
     if (!textile) {
         PyErr_SetString(PyExc_TypeError, "expected a non-null CTextile pointer");
+        return nullptr;
+    }
+    if (!ensure_numpy_api()) {
         return nullptr;
     }
 

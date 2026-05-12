@@ -22,6 +22,14 @@ IF(BUILD_PYTHON_INTERFACE)
     # ========================================================================
     INCLUDE_DIRECTORIES(${Python_INCLUDE_DIRS})
     INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../OctreeRefinement/include)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -c "import numpy; print(numpy.get_include())"
+        OUTPUT_VARIABLE TEXGEN_NUMPY_INCLUDE_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE TEXGEN_NUMPY_INCLUDE_RESULT)
+    if(NOT TEXGEN_NUMPY_INCLUDE_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to query NumPy include directory")
+    endif()
 
     # ========================================================================
     # SWIG Core wrapper
@@ -116,6 +124,7 @@ IF(BUILD_PYTHON_INTERFACE)
     # Link to TexGenCore and Python
     TARGET_LINK_LIBRARIES(_Core TexGenCore)
     TARGET_LINK_LIBRARIES(_Core Python::Module)
+    target_include_directories(_Core PRIVATE "${TEXGEN_NUMPY_INCLUDE_DIR}")
     target_compile_features(_Core PRIVATE cxx_std_11)
 
     # ========================================================================
