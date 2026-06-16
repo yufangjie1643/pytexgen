@@ -151,21 +151,25 @@ worker count after chunk-count clamping.
 Set `progress=True` to show tqdm bars for classification and `.inp` writing;
 the package imports tqdm lazily so normal installs do not require it.
 
-Return structured voxel data directly for another solver:
+Return structured voxel data directly in memory for another solver, with
+optional `.npz` persistence:
 
 ```python
-from pytexgen.gpu_voxelizer import voxelize_textile_data
+from pytexgen.gpu_voxelizer import VoxelGridData, voxelize_textile_data
 
 data = voxelize_textile_data(
     textile,
     nx=64, ny=64, nz=64,
-    backend="torch",
-    device="cuda",
-    output="backend",
+    backend="numpy",
+    workers=4,
 )
 
-material_grid = data.material_id()  # torch.Tensor with shape (nz, ny, nx)
-flat_yarn_ids = data.yarn_id        # ix + iy*nx + iz*nx*ny order
+yarn_grid = data.grid              # shape: (nz, ny, nx)
+material_grid = data.material_id() # matrix=0, yarns=1..N
+flat_yarn_ids = data.yarn_id       # ix + iy*nx + iz*nx*ny order
+data.save_npz("voxel_data.npz")
+
+loaded = VoxelGridData.load_npz("voxel_data.npz")
 ```
 
 Use torch when an accelerator is available:

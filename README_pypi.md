@@ -151,6 +151,27 @@ worker count after chunk-count clamping.
 Set `progress=True` to show tqdm bars for classification and `.inp` writing;
 the package imports tqdm lazily so normal installs do not require it.
 
+Return structured voxel data directly in memory for another solver, with
+optional `.npz` persistence:
+
+```python
+from pytexgen.gpu_voxelizer import VoxelGridData, voxelize_textile_data
+
+data = voxelize_textile_data(
+    textile,
+    nx=64, ny=64, nz=64,
+    backend="numpy",
+    workers=4,
+)
+
+yarn_grid = data.grid              # shape: (nz, ny, nx)
+material_grid = data.material_id() # matrix=0, yarns=1..N
+flat_yarn_ids = data.yarn_id       # ix + iy*nx + iz*nx*ny order
+data.save_npz("voxel_data.npz")
+
+loaded = VoxelGridData.load_npz("voxel_data.npz")
+```
+
 Use torch when an accelerator is available:
 
 ```python
@@ -191,6 +212,7 @@ those guarantees.
 |---|---|---|---|
 | TexGen C++ structured voxels | `CRectangularVoxelMesh.SaveVoxelMesh(...)` | bundled TexGen core | Reference-compatible structured output |
 | Python numpy backend | `voxelize_textile(..., backend="numpy")` | `numpy` | Portable CPU voxelization without OpenMP |
+| Python direct data backend | `voxelize_textile_data(...)` | `numpy`, optional `torch` | In-memory yarn/material grids and `.npz` handoff without `.inp` |
 | Python torch backend | `voxelize_textile(..., backend="torch")` | `torch` | CUDA/MPS/torch CPU acceleration for larger grids |
 | Python adaptive numpy backend | `voxelize_textile(..., adaptive=True)` | `numpy` | Lightweight non-uniform exploratory meshes |
 | TexGen p4est octree | `COctreeVoxelMesh.SaveVoxelMesh(...)` | local p4est/sc build | Full p4est-style adaptive octree workflows |

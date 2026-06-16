@@ -49,6 +49,9 @@ whose conservative bounding boxes cannot overlap the current voxel chunk. This
 does not change classification results in the backend tests, but the speedup
 depends on textile density, yarn count, and voxel resolution.
 
+Use the direct solver data path below when downstream code needs arrays or
+tensors instead of an Abaqus input deck.
+
 Use `backend="torch"` when torch is installed:
 
 ```python
