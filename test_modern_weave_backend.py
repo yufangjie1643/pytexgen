@@ -12,7 +12,7 @@ class ModernWeaveApiTest(unittest.TestCase):
 
         self.assertEqual(textile.name, "PlainWeave2D")
         self.assertEqual(len(textile.yarns), 4)
-        np.testing.assert_allclose(textile.aabb, [[0.0, 0.0, 0.0], [2.0, 2.0, 0.2]])
+        np.testing.assert_allclose(textile.aabb, [[-0.5, -0.5, -0.01], [1.5, 1.5, 0.21]])
         self.assertEqual(textile.yarns[0].positions.shape, (3, 3))
         self.assertEqual(textile.yarns[0].section.points.shape[1], 2)
 

@@ -81,10 +81,15 @@ class PlainWeave2D:
             )
             yarns.append(_yarn(positions, section, direction="y"))
 
+        z_margin = 0.1 * self.yarn_height
         aabb = np.array(
             [
-                [0.0, 0.0, 0.0],
-                [self.width * self.spacing, self.height * self.spacing, self.thickness],
+                [-0.5 * self.spacing, -0.5 * self.spacing, -z_margin],
+                [
+                    (self.width - 0.5) * self.spacing,
+                    (self.height - 0.5) * self.spacing,
+                    self.thickness + z_margin,
+                ],
             ],
             dtype=np.float64,
         )

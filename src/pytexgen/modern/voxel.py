@@ -166,10 +166,15 @@ def _numpy_dtype(dtype: str):
 
 
 def _plain_weave_aabb(model) -> np.ndarray:
+    z_margin = 0.1 * model.yarn_height
     return np.array(
         [
-            [0.0, 0.0, 0.0],
-            [model.width * model.spacing, model.height * model.spacing, model.thickness],
+            [-0.5 * model.spacing, -0.5 * model.spacing, -z_margin],
+            [
+                (model.width - 0.5) * model.spacing,
+                (model.height - 0.5) * model.spacing,
+                model.thickness + z_margin,
+            ],
         ],
         dtype=np.float64,
     )
