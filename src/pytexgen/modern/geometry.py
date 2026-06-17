@@ -75,3 +75,37 @@ class ModernTextileModel:
             raise ValueError("aabb must have shape (2, 3)")
         if np.any(self.aabb[1] <= self.aabb[0]):
             raise ValueError("aabb max corner must be greater than min corner")
+
+    def to_snapshots(self, gpu_voxelizer):
+        """Convert to ``gpu_voxelizer.YarnSnapshot`` objects."""
+        snapshots = []
+        for yarn in self.yarns:
+            positions = yarn.positions.astype(np.float64, copy=False)
+            tangents = _node_tangents(positions)
+            ups = np.tile(yarn.up.astype(np.float64, copy=False), (positions.shape[0], 1))
+            sides = np.tile(yarn.side.astype(np.float64, copy=False), (positions.shape[0], 1))
+            snapshots.append(
+                gpu_voxelizer.YarnSnapshot(
+                    positions=positions,
+                    tangents=tangents,
+                    ups=ups,
+                    sides=sides,
+                    section=yarn.section.points.astype(np.float64, copy=False),
+                    translations=yarn.translations.astype(np.float64, copy=False),
+                )
+            )
+        return snapshots
+
+
+def _node_tangents(positions: np.ndarray) -> np.ndarray:
+    tangents = np.empty_like(positions, dtype=np.float64)
+    tangents[0] = positions[1] - positions[0]
+    tangents[-1] = positions[-1] - positions[-2]
+    if positions.shape[0] > 2:
+        tangents[1:-1] = positions[2:] - positions[:-2]
+    norms = np.linalg.norm(tangents, axis=1)
+    invalid = norms <= 0.0
+    if np.any(invalid):
+        tangents[invalid] = np.array([1.0, 0.0, 0.0])
+        norms[invalid] = 1.0
+    return tangents / norms[:, None]
