@@ -58,6 +58,28 @@ class ModernWeaveApiTest(unittest.TestCase):
 
         np.testing.assert_array_equal(automatic.yarn_id, serial.yarn_id)
 
+    def test_plain_weave_fast_path_matches_generic_numpy(self):
+        from pytexgen.modern import PlainWeave2D, voxelize_model_data
+
+        model = PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2)
+        fast = voxelize_model_data(
+            model,
+            resolution=(8, 8, 4),
+            backend="numpy",
+            workers=2,
+        )
+        generic = voxelize_model_data(
+            model,
+            resolution=(8, 8, 4),
+            backend="numpy",
+            workers=1,
+            fast_path=False,
+        )
+
+        np.testing.assert_array_equal(fast.yarn_id, generic.yarn_id)
+        self.assertEqual(fast.backend, "numpy")
+        self.assertEqual(fast.storage, "numpy")
+
     def test_modern_auto_worker_policy_stays_conservative(self):
         from unittest.mock import patch
 
@@ -66,6 +88,7 @@ class ModernWeaveApiTest(unittest.TestCase):
         with patch("pytexgen.modern.voxel.os.cpu_count", return_value=12):
             self.assertEqual(_resolve_modern_workers("numpy", "auto", (8, 8, 4)), 1)
             self.assertEqual(_resolve_modern_workers("numpy", "auto", (64, 64, 64)), 2)
+            self.assertEqual(_resolve_modern_workers("numpy", "auto", (128, 128, 128)), 4)
             self.assertEqual(_resolve_modern_workers("numpy", 12, (64, 64, 64)), 12)
             self.assertIsNone(_resolve_modern_workers("torch", "auto", (64, 64, 64)))
 

@@ -209,8 +209,10 @@ The initial modern modelling surface covers plain weave and a shallow-cross
 layer-to-layer subset. It returns the same `VoxelGridData` contract as the
 legacy voxelizer, so numpy/torch conversion and `.npz` handoff stay unchanged.
 Modern numpy voxelization uses `workers="auto"` by default: one worker for tiny
-grids and at most two workers from `64^3` upward. Use explicit values such as
-`workers=12` only for benchmarking on your machine.
+grids, two around `64^3`, and at most four from `128^3` upward. Use explicit
+values such as `workers=12` only for benchmarking on your machine. `PlainWeave2D`
+uses a structure-aware fast path by default; pass `fast_path=False` to compare
+against the generic snapshot voxelizer.
 
 Create a lightweight adaptive numpy mesh:
 

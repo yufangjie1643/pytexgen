@@ -44,11 +44,13 @@ write_inp_from_voxel_data(data, "modern_plain_weave.inp")
 
 The current front end covers `PlainWeave2D` and a simplified
 `ShallowCrossLayerToLayer` subset. Modern numpy voxelization defaults to
-`workers="auto"`, which uses one worker for tiny grids and at most two workers
-from `64^3` upward. Wider pools such as 8 or 12 workers are still accepted for
-experiments, but local 64^3 and 128^3 benchmarks show they are slower for the
-current model geometry. `backend="triton"` is reserved until a real kernel is
-added; use `backend="torch", device="cuda"` for GPU acceleration now.
+`workers="auto"`, which uses one worker for tiny grids, two around `64^3`, and
+at most four from `128^3` upward. Wider pools such as 8 or 12 workers are still
+accepted for experiments, but local 64^3 and 128^3 benchmarks show they are
+slower for the current model geometry. `PlainWeave2D` uses a structure-aware
+fast path by default; pass `fast_path=False` to compare against the generic
+snapshot voxelizer. `backend="triton"` is reserved until a real kernel is added;
+use `backend="torch", device="cuda"` for GPU acceleration now.
 
 ## Python Structured Backend
 
