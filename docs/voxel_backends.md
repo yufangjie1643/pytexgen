@@ -1,7 +1,8 @@
 # Voxel Backends
 
-pytexgen exposes two practical voxelization paths in normal wheel installs and
-one advanced local-build path for p4est users.
+pytexgen exposes practical voxelization paths in normal wheel installs, a
+Python-first modelling front end for small weave prototypes, and one advanced
+local-build path for p4est users.
 
 ## Backend Selection
 
@@ -11,12 +12,39 @@ one advanced local-build path for p4est users.
 | Python numpy backend | `voxelize_textile(..., backend="numpy")` | `numpy` | Portable OpenMP-free CPU voxelization |
 | Python torch backend | `voxelize_textile(..., backend="torch")` | `torch`, optional CUDA/MPS | GPU or torch-accelerated structured voxelization |
 | Direct data handoff | `voxelize_textile_data(...)` | `numpy`, optional `torch` | Solver integration without `.inp` write/read overhead |
+| Modern model data | `pytexgen.modern.voxelize_model_data(...)` | `numpy`, optional `torch` | Python-first plain weave and shallow-cross prototypes |
 | Python adaptive numpy backend | `voxelize_textile(..., backend="numpy", adaptive=True)` | `numpy` | Lightweight non-uniform exploratory voxel output |
 | C++ p4est octree mesh | `COctreeVoxelMesh.SaveVoxelMesh(...)` | local p4est/sc build | Advanced p4est-based octree refinement |
 
 Default wheels intentionally avoid OpenMP, p4est, native CPU flags, and SWIG at
 install time. That keeps `pip install pytexgen` more reliable across Windows,
 Linux, macOS, and older CPUs.
+
+## Modern Python-First Models
+
+Use `pytexgen.modern` when you want to build the initial supported weave models
+without direct SWIG/Core calls, then hand the result to the same numpy/torch data
+pipeline:
+
+```python
+from pytexgen.modern import PlainWeave2D, voxelize_model_data, write_inp_from_voxel_data
+
+model = PlainWeave2D(width=4, height=4, spacing=1.0, thickness=0.2)
+data = voxelize_model_data(
+    model,
+    resolution=(64, 64, 32),
+    backend="numpy",
+    workers=4,
+)
+
+grid = data.grid
+data.save_npz("modern_plain_weave.npz")
+write_inp_from_voxel_data(data, "modern_plain_weave.inp")
+```
+
+The current front end covers `PlainWeave2D` and a simplified
+`ShallowCrossLayerToLayer` subset. `backend="triton"` is reserved until a real
+kernel is added; use `backend="torch", device="cuda"` for GPU acceleration now.
 
 ## Python Structured Backend
 

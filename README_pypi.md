@@ -31,6 +31,7 @@ across Windows, Linux, and macOS.
 | Cross-platform defaults | GUI, renderer, OpenMP, native CPU flags, and p4est are off by default | Fewer Windows/MSVC/MinGW, OpenMP runtime, and older-CPU build failures |
 | Python voxel backend | `pytexgen.gpu_voxelizer.voxelize_textile(...)` | OpenMP-free structured voxel output through numpy or torch |
 | Direct solver handoff | `pytexgen.gpu_voxelizer.voxelize_textile_data(...)` | Return numpy arrays or torch tensors without writing/parsing Abaqus files |
+| Python-first models | `pytexgen.modern.PlainWeave2D` and `ShallowCrossLayerToLayer` | Build small weave models without calling the SWIG/Core API directly |
 | GPU-ready path | Optional `backend="torch"` with CUDA/MPS/CPU devices | Larger voxel grids can use torch acceleration without changing the TexGen C++ core |
 | Lightweight adaptive output | `adaptive=True` numpy mode | Exploratory non-uniform C3D8R voxel meshes without compiling p4est |
 | Performance pruning | Conservative AABB candidate pruning | Skips yarn/translation candidates that cannot intersect the current voxel chunk |
@@ -186,6 +187,28 @@ info = voxelize_textile(
 )
 ```
 
+Build and voxelize through the Python-first modern API when you want portable
+model construction without direct SWIG/Core calls:
+
+```python
+from pytexgen.modern import PlainWeave2D, voxelize_model_data, write_inp_from_voxel_data
+
+model = PlainWeave2D(width=4, height=4, spacing=1.0, thickness=0.2)
+data = voxelize_model_data(
+    model,
+    resolution=(64, 64, 32),
+    backend="torch",
+    device="cuda",
+)
+
+data.save_npz("modern_plain_weave.npz")
+write_inp_from_voxel_data(data, "modern_plain_weave.inp")
+```
+
+The initial modern modelling surface covers plain weave and a shallow-cross
+layer-to-layer subset. It returns the same `VoxelGridData` contract as the
+legacy voxelizer, so numpy/torch conversion and `.npz` handoff stay unchanged.
+
 Create a lightweight adaptive numpy mesh:
 
 ```python
@@ -214,6 +237,7 @@ those guarantees.
 | Python numpy backend | `voxelize_textile(..., backend="numpy")` | `numpy` | Portable CPU voxelization without OpenMP |
 | Python direct data backend | `voxelize_textile_data(...)` | `numpy`, optional `torch` | In-memory yarn/material grids and `.npz` handoff without `.inp` |
 | Python torch backend | `voxelize_textile(..., backend="torch")` | `torch` | CUDA/MPS/torch CPU acceleration for larger grids |
+| Modern model data | `pytexgen.modern.voxelize_model_data(...)` | `numpy`, optional `torch` | Python-first weave prototypes with the same `VoxelGridData` output |
 | Python adaptive numpy backend | `voxelize_textile(..., adaptive=True)` | `numpy` | Lightweight non-uniform exploratory meshes |
 | TexGen p4est octree | `COctreeVoxelMesh.SaveVoxelMesh(...)` | local p4est/sc build | Full p4est-style adaptive octree workflows |
 
@@ -328,6 +352,7 @@ Python/Core.py           committed SWIG Python proxy
 Python/Core_wrap.cxx      committed SWIG C++ wrapper
 TexGen/gpu_voxelizer.py   portable numpy/torch voxelization backend
 src/pytexgen/             installed Python package
+src/pytexgen/modern/      Python-first weave, voxel, and export helpers
 docs/voxel_backends.md    backend selection and p4est notes
 pyproject.toml            Python packaging and wheel build configuration
 ```
