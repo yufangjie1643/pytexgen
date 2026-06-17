@@ -92,6 +92,70 @@ class ModernWeaveApiTest(unittest.TestCase):
             self.assertEqual(_resolve_modern_workers("numpy", 12, (64, 64, 64)), 12)
             self.assertIsNone(_resolve_modern_workers("torch", "auto", (64, 64, 64)))
 
+    def test_batch_voxelize_models_uses_process_pool_and_matches_serial(self):
+        from pytexgen.modern import PlainWeave2D, voxelize_model_data, voxelize_models_data
+
+        models = [
+            PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2),
+            PlainWeave2D(width=3, height=2, spacing=0.8, thickness=0.18),
+            PlainWeave2D(width=2, height=3, spacing=1.1, thickness=0.22),
+        ]
+        models[1].swap_position(1, 0)
+        models[2].swap_position(0, 2)
+
+        serial = [
+            voxelize_model_data(model, resolution=(8, 8, 4), backend="numpy", workers=1)
+            for model in models
+        ]
+        batch = voxelize_models_data(
+            models,
+            resolution=(8, 8, 4),
+            backend="numpy",
+            workers=2,
+            inner_workers=1,
+            return_data=True,
+            chunksize=1,
+        )
+
+        self.assertEqual(len(batch), len(models))
+        for expected, actual in zip(serial, batch):
+            np.testing.assert_array_equal(actual.yarn_id, expected.yarn_id)
+            np.testing.assert_allclose(actual.aabb, expected.aabb)
+
+    def test_batch_voxelize_models_can_write_worker_npz_files(self):
+        import tempfile
+        from pathlib import Path
+
+        from pytexgen.modern import PlainWeave2D, VoxelBatchFile, voxelize_models_data
+        from pytexgen.modern.compat import load_gpu_voxelizer
+
+        models = [
+            PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2),
+            PlainWeave2D(width=2, height=2, spacing=0.9, thickness=0.16),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            results = voxelize_models_data(
+                models,
+                resolution=(4, 4, 2),
+                backend="numpy",
+                workers=1,
+                binary_dir=tmp,
+                file_prefix="case",
+                compressed=False,
+                return_data=False,
+            )
+
+            self.assertEqual(len(results), 2)
+            self.assertIsInstance(results[0], VoxelBatchFile)
+            self.assertEqual(Path(results[0].path).name, "case_000000.npz")
+            self.assertTrue(Path(results[1].path).exists())
+
+            VoxelGridData = load_gpu_voxelizer().VoxelGridData
+            loaded = VoxelGridData.load_npz(results[0].path)
+            self.assertEqual(loaded.resolution, (4, 4, 2))
+            self.assertEqual(int((loaded.yarn_id >= 0).sum()), results[0].occupied)
+
     def test_torch_backend_matches_numpy_when_available(self):
         import torch  # noqa: F401
         from pytexgen.modern import PlainWeave2D, voxelize_model_data

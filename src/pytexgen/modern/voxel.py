@@ -4,11 +4,36 @@ from __future__ import annotations
 
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from .compat import load_gpu_voxelizer
+
+
+@dataclass(frozen=True)
+class VoxelBatchSummary:
+    """Lightweight result for batch jobs that do not return full voxel arrays."""
+
+    index: int
+    resolution: tuple[int, int, int]
+    aabb: np.ndarray
+    backend: str
+    dtype: str
+    storage: str
+    occupied: int
+    yarn_count: int
+    checksum: int
+    timings: dict
+
+
+@dataclass(frozen=True)
+class VoxelBatchFile(VoxelBatchSummary):
+    """Metadata for a batch result written directly by a worker process."""
+
+    path: str
 
 
 def voxelize_model_data(
@@ -72,6 +97,200 @@ def voxelize_model_data(
         workers=workers,
         **kwargs,
     )
+
+
+def voxelize_models_data(
+    models,
+    resolution=(64, 64, 64),
+    *,
+    backend: str = "numpy",
+    device=None,
+    dtype: str = "float32",
+    workers: int | str | None = "auto",
+    inner_workers: int | str | None = 1,
+    fast_path: bool = True,
+    output: str = "numpy",
+    binary_dir: str | os.PathLike | None = None,
+    file_prefix: str = "voxel",
+    compressed: bool = False,
+    save_centers: bool = True,
+    return_data: bool = True,
+    sink=None,
+    ordered: bool = True,
+    chunksize: int | str | None = "auto",
+    **kwargs,
+):
+    """Voxelize many modern models with true model-level CPU parallelism.
+
+    This is the high-throughput entry point for many small CPU jobs. Unlike
+    ``voxelize_model_data(..., workers=N)``, which splits one grid internally,
+    this function distributes whole models across a persistent process pool.
+    Each worker defaults to ``inner_workers=1`` so 12 processes mean 12 CPU
+    workers instead of 12 nested thread pools.
+
+    When ``binary_dir`` is provided, each worker writes a ``.npz`` file with
+    ``VoxelGridData.save_npz(...)`` and returns only ``VoxelBatchFile``
+    metadata. This avoids copying large voxel arrays back to the parent process.
+    Set ``return_data=False`` without ``binary_dir`` to return lightweight
+    ``VoxelBatchSummary`` objects for throughput probes.
+    """
+    backend = backend.lower()
+    output = output.lower()
+    if backend not in {"numpy", "torch", "auto"}:
+        raise ValueError('backend must be one of "numpy", "torch", or "auto"')
+
+    indexed_models = list(enumerate(models))
+    worker_count = _resolve_batch_workers(workers, len(indexed_models))
+    if worker_count > 1 and backend != "numpy":
+        raise ValueError("multi-process batch voxelization currently supports backend='numpy' only")
+    if worker_count > 1 and device is not None:
+        raise ValueError("device is only valid for serial or torch batch voxelization")
+
+    chunk_count = _resolve_batch_chunksize(chunksize, len(indexed_models), worker_count)
+    binary_root = str(Path(binary_dir)) if binary_dir is not None else None
+    if binary_root is not None:
+        Path(binary_root).mkdir(parents=True, exist_ok=True)
+
+    tasks = [
+        (
+            index,
+            model,
+            tuple(int(value) for value in resolution),
+            backend,
+            device,
+            dtype,
+            inner_workers,
+            fast_path,
+            output,
+            binary_root,
+            file_prefix,
+            bool(compressed),
+            bool(save_centers),
+            bool(return_data),
+            kwargs,
+        )
+        for index, model in indexed_models
+    ]
+
+    if not tasks:
+        return [] if sink is None else None
+
+    if sink is None:
+        results = [None] * len(tasks)
+    else:
+        results = None
+
+    if worker_count == 1:
+        iterator = (_voxelize_batch_task(task) for task in tasks)
+        _consume_batch_results(iterator, results, sink)
+        return results
+
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        if ordered:
+            iterator = executor.map(_voxelize_batch_task, tasks, chunksize=chunk_count)
+            _consume_batch_results(iterator, results, sink)
+        else:
+            futures = [executor.submit(_voxelize_batch_task, task) for task in tasks]
+            iterator = (future.result() for future in as_completed(futures))
+            _consume_batch_results(iterator, results, sink)
+    return results
+
+
+def _resolve_batch_workers(workers: int | str | None, model_count: int) -> int:
+    if model_count < 1:
+        return 1
+    if workers is None:
+        return 1
+    if isinstance(workers, str):
+        if workers.lower() != "auto":
+            raise ValueError('workers must be an integer, None, or "auto"')
+        return max(1, min(os.cpu_count() or 1, model_count))
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+    return max(1, min(int(workers), model_count))
+
+
+def _resolve_batch_chunksize(chunksize: int | str | None, model_count: int, workers: int) -> int:
+    if chunksize is None:
+        return 1
+    if isinstance(chunksize, str):
+        if chunksize.lower() != "auto":
+            raise ValueError('chunksize must be an integer, None, or "auto"')
+        if workers <= 1:
+            return 1
+        return max(1, min(32, model_count // max(1, workers * 4)))
+    if chunksize < 1:
+        raise ValueError("chunksize must be >= 1")
+    return int(chunksize)
+
+
+def _consume_batch_results(iterator, results, sink) -> None:
+    for index, result in iterator:
+        if sink is not None:
+            sink(index, result)
+        else:
+            results[index] = result
+
+
+def _voxelize_batch_task(task):
+    (
+        index,
+        model,
+        resolution,
+        backend,
+        device,
+        dtype,
+        inner_workers,
+        fast_path,
+        output,
+        binary_root,
+        file_prefix,
+        compressed,
+        save_centers,
+        return_data,
+        kwargs,
+    ) = task
+    data = voxelize_model_data(
+        model,
+        resolution=resolution,
+        backend=backend,
+        device=device,
+        dtype=dtype,
+        workers=inner_workers,
+        fast_path=fast_path,
+        output=output,
+        **kwargs,
+    )
+    if binary_root is not None:
+        path = Path(binary_root) / f"{file_prefix}_{index:06d}.npz"
+        data.save_npz(path, compressed=compressed, include_centers=save_centers)
+        return index, _summarize_voxel_data(index, data, path=str(path))
+    if return_data:
+        return index, data
+    return index, _summarize_voxel_data(index, data)
+
+
+def _summarize_voxel_data(index: int, data, path: str | None = None):
+    numpy_data = data.to_numpy()
+    yarn_id = numpy_data.yarn_id
+    occupied = int(np.count_nonzero(yarn_id >= 0))
+    yarn_count = int(np.unique(yarn_id[yarn_id >= 0]).size) if occupied else 0
+    checksum = int(yarn_id.astype(np.int64, copy=False).sum())
+    common = dict(
+        index=int(index),
+        resolution=tuple(int(value) for value in numpy_data.resolution),
+        aabb=np.asarray(numpy_data.aabb, dtype=np.float64),
+        backend=str(numpy_data.backend),
+        dtype=str(numpy_data.dtype),
+        storage=str(numpy_data.storage),
+        occupied=occupied,
+        yarn_count=yarn_count,
+        checksum=checksum,
+        timings=dict(numpy_data.timings),
+    )
+    if path is not None:
+        return VoxelBatchFile(path=path, **common)
+    return VoxelBatchSummary(**common)
 
 
 def _resolve_modern_workers(

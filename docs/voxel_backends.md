@@ -12,7 +12,7 @@ local-build path for p4est users.
 | Python numpy backend | `voxelize_textile(..., backend="numpy")` | `numpy` | Portable OpenMP-free CPU voxelization |
 | Python torch backend | `voxelize_textile(..., backend="torch")` | `torch`, optional CUDA/MPS | GPU or torch-accelerated structured voxelization |
 | Direct data handoff | `voxelize_textile_data(...)` | `numpy`, optional `torch` | Solver integration without `.inp` write/read overhead |
-| Modern model data | `pytexgen.modern.voxelize_model_data(...)` | `numpy`, optional `torch` | Python-first plain weave and shallow-cross prototypes |
+| Modern model data | `pytexgen.modern.voxelize_model_data(...)` / `voxelize_models_data(...)` | `numpy`, optional `torch` | Python-first plain weave and shallow-cross prototypes, including model-level CPU batching |
 | Python adaptive numpy backend | `voxelize_textile(..., backend="numpy", adaptive=True)` | `numpy` | Lightweight non-uniform exploratory voxel output |
 | C++ p4est octree mesh | `COctreeVoxelMesh.SaveVoxelMesh(...)` | local p4est/sc build | Advanced p4est-based octree refinement |
 
@@ -41,6 +41,32 @@ grid = data.grid
 data.save_npz("modern_plain_weave.npz")
 write_inp_from_voxel_data(data, "modern_plain_weave.inp")
 ```
+
+For many small models, parallelize across models instead of splitting one
+`64^3` grid into many tiny thread tasks:
+
+```python
+from pytexgen.modern import PlainWeave2D, voxelize_models_data
+
+models = [PlainWeave2D(width=4, height=4, spacing=1.0, thickness=0.2) for _ in range(4000)]
+results = voxelize_models_data(
+    models,
+    resolution=(64, 64, 64),
+    backend="numpy",
+    workers=12,
+    inner_workers=1,
+    binary_dir="voxel_npz",
+    return_data=False,
+)
+print(results[0].path, results[0].occupied)
+```
+
+`voxelize_models_data` uses a persistent `ProcessPoolExecutor`, so it can use
+multiple CPU cores despite Python's GIL. With `binary_dir`, each worker writes a
+`VoxelGridData.save_npz(...)` file directly and returns only lightweight
+metadata, avoiding large array copies back to the parent process. On Windows,
+call it from an `if __name__ == "__main__":` guarded script, as with normal
+Python multiprocessing.
 
 The current front end covers `PlainWeave2D` and a simplified
 `ShallowCrossLayerToLayer` subset. Modern numpy voxelization defaults to
