@@ -39,6 +39,36 @@ class ModernWeaveApiTest(unittest.TestCase):
         self.assertEqual(data.order, "ix + iy*nx + iz*nx*ny")
         self.assertGreaterEqual(int(data.material_id().max()), 1)
 
+    def test_numpy_auto_workers_matches_serial_output(self):
+        from pytexgen.modern import PlainWeave2D, voxelize_model_data
+
+        model = PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2)
+        serial = voxelize_model_data(
+            model,
+            resolution=(8, 8, 4),
+            backend="numpy",
+            workers=1,
+        )
+        automatic = voxelize_model_data(
+            model,
+            resolution=(8, 8, 4),
+            backend="numpy",
+            workers="auto",
+        )
+
+        np.testing.assert_array_equal(automatic.yarn_id, serial.yarn_id)
+
+    def test_modern_auto_worker_policy_stays_conservative(self):
+        from unittest.mock import patch
+
+        from pytexgen.modern.voxel import _resolve_modern_workers
+
+        with patch("pytexgen.modern.voxel.os.cpu_count", return_value=12):
+            self.assertEqual(_resolve_modern_workers("numpy", "auto", (8, 8, 4)), 1)
+            self.assertEqual(_resolve_modern_workers("numpy", "auto", (64, 64, 64)), 2)
+            self.assertEqual(_resolve_modern_workers("numpy", 12, (64, 64, 64)), 12)
+            self.assertIsNone(_resolve_modern_workers("torch", "auto", (64, 64, 64)))
+
     def test_torch_backend_matches_numpy_when_available(self):
         import torch  # noqa: F401
         from pytexgen.modern import PlainWeave2D, voxelize_model_data

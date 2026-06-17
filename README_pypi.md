@@ -197,8 +197,8 @@ model = PlainWeave2D(width=4, height=4, spacing=1.0, thickness=0.2)
 data = voxelize_model_data(
     model,
     resolution=(64, 64, 32),
-    backend="torch",
-    device="cuda",
+    backend="numpy",
+    workers="auto",
 )
 
 data.save_npz("modern_plain_weave.npz")
@@ -208,6 +208,9 @@ write_inp_from_voxel_data(data, "modern_plain_weave.inp")
 The initial modern modelling surface covers plain weave and a shallow-cross
 layer-to-layer subset. It returns the same `VoxelGridData` contract as the
 legacy voxelizer, so numpy/torch conversion and `.npz` handoff stay unchanged.
+Modern numpy voxelization uses `workers="auto"` by default: one worker for tiny
+grids and at most two workers from `64^3` upward. Use explicit values such as
+`workers=12` only for benchmarking on your machine.
 
 Create a lightweight adaptive numpy mesh:
 
@@ -335,6 +338,12 @@ Synthetic pruning benchmark:
 
 ```bash
 python bench_gpu_voxelizer_backends.py --resolution 32 --yarn-grid 4 --workers 4
+```
+
+Modern Python-first CPU/GPU worker sweep:
+
+```bash
+python bench_modern_weave_backend.py --resolutions 64 128 --workers auto 1 2 4 8 12 --repeat 2 --include-cuda
 ```
 
 Torch/CUDA benchmark when torch is installed:

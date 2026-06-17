@@ -34,7 +34,7 @@ data = voxelize_model_data(
     model,
     resolution=(64, 64, 32),
     backend="numpy",
-    workers=4,
+    workers="auto",
 )
 
 grid = data.grid
@@ -43,8 +43,12 @@ write_inp_from_voxel_data(data, "modern_plain_weave.inp")
 ```
 
 The current front end covers `PlainWeave2D` and a simplified
-`ShallowCrossLayerToLayer` subset. `backend="triton"` is reserved until a real
-kernel is added; use `backend="torch", device="cuda"` for GPU acceleration now.
+`ShallowCrossLayerToLayer` subset. Modern numpy voxelization defaults to
+`workers="auto"`, which uses one worker for tiny grids and at most two workers
+from `64^3` upward. Wider pools such as 8 or 12 workers are still accepted for
+experiments, but local 64^3 and 128^3 benchmarks show they are slower for the
+current model geometry. `backend="triton"` is reserved until a real kernel is
+added; use `backend="torch", device="cuda"` for GPU acceleration now.
 
 ## Python Structured Backend
 
@@ -287,6 +291,12 @@ Synthetic pruning and direct data benchmark:
 
 ```bash
 python bench_gpu_voxelizer_backends.py --resolution 64 --yarn-grid 4 --workers 4
+```
+
+Modern Python-first CPU/GPU worker sweep:
+
+```bash
+python bench_modern_weave_backend.py --resolutions 64 128 --workers auto 1 2 4 8 12 --repeat 2 --include-cuda
 ```
 
 Torch/CUDA benchmark when torch is installed:
