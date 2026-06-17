@@ -3,13 +3,15 @@
 from .export import write_inp_from_voxel_data
 from .geometry import ModernTextileModel, Section, YarnPath
 from .voxel import voxelize_model_data
-from .weave import PlainWeave2D
+from .weave import PlainWeave2D, ShallowCrossLayerToLayer, auto_binder_positions
 
 __all__ = [
     "ModernTextileModel",
     "PlainWeave2D",
     "Section",
+    "ShallowCrossLayerToLayer",
     "YarnPath",
+    "auto_binder_positions",
     "voxelize_model_data",
     "write_inp_from_voxel_data",
 ]

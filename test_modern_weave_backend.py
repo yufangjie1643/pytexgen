@@ -85,6 +85,36 @@ class ModernWeaveApiTest(unittest.TestCase):
         self.assertIn("*Element, type=C3D8R", text)
         self.assertIn("1, 2, 5, 4, 1, 11, 14, 13, 10", text)
 
+    def test_shallow_cross_auto_binder_positions_match_current_script_rules(self):
+        from pytexgen.modern import auto_binder_positions
+
+        positions = auto_binder_positions(
+            "straight",
+            num_x_yarns=2,
+            num_y_yarns=4,
+            z_layers=5,
+            binder_depth=3,
+        )
+        self.assertEqual(len(positions), 8)
+        self.assertEqual(positions[:4], [(0, 0, 0), (1, 0, 1), (2, 0, 2), (3, 0, 1)])
+        self.assertEqual(positions[4:], [(0, 1, 2), (1, 1, 1), (2, 1, 0), (3, 1, 1)])
+
+    def test_shallow_cross_subset_builds_snapshot_compatible_model(self):
+        from pytexgen.modern import ShallowCrossLayerToLayer
+
+        model = ShallowCrossLayerToLayer(
+            num_x_yarns=2,
+            num_y_yarns=4,
+            x_spacing=1.4,
+            y_spacing=2.2,
+            z_layers=5,
+            binder_depth=3,
+        )
+        textile = model.to_model()
+        self.assertEqual(textile.name, "ShallowCrossLayerToLayer")
+        self.assertGreaterEqual(len(textile.yarns), 6)
+        self.assertEqual(textile.aabb.shape, (2, 3))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
