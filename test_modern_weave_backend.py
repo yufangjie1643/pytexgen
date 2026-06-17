@@ -65,6 +65,26 @@ class ModernWeaveApiTest(unittest.TestCase):
                 backend="triton",
             )
 
+    def test_write_inp_from_voxel_data_uses_legacy_node_and_element_order(self):
+        import tempfile
+        from pathlib import Path
+
+        from pytexgen.modern import PlainWeave2D, voxelize_model_data, write_inp_from_voxel_data
+
+        data = voxelize_model_data(
+            PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2),
+            resolution=(2, 2, 1),
+            backend="numpy",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "modern.inp"
+            write_inp_from_voxel_data(data, out, textile_name="ModernPlain")
+            text = out.read_text()
+
+        self.assertIn("*Node", text)
+        self.assertIn("*Element, type=C3D8R", text)
+        self.assertIn("1, 2, 5, 4, 1, 11, 14, 13, 10", text)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
