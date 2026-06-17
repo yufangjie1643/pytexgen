@@ -39,6 +39,32 @@ class ModernWeaveApiTest(unittest.TestCase):
         self.assertEqual(data.order, "ix + iy*nx + iz*nx*ny")
         self.assertGreaterEqual(int(data.material_id().max()), 1)
 
+    def test_torch_backend_matches_numpy_when_available(self):
+        import torch  # noqa: F401
+        from pytexgen.modern import PlainWeave2D, voxelize_model_data
+
+        model = PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2)
+        numpy_data = voxelize_model_data(model, resolution=(4, 4, 2), backend="numpy")
+        torch_data = voxelize_model_data(
+            model,
+            resolution=(4, 4, 2),
+            backend="torch",
+            device="cpu",
+        )
+
+        self.assertEqual(torch_data.storage, "torch")
+        np.testing.assert_array_equal(torch_data.to_numpy().yarn_id, numpy_data.yarn_id)
+
+    def test_triton_backend_is_reserved_until_kernel_exists(self):
+        from pytexgen.modern import PlainWeave2D, voxelize_model_data
+
+        with self.assertRaises(NotImplementedError):
+            voxelize_model_data(
+                PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2),
+                resolution=(4, 4, 2),
+                backend="triton",
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

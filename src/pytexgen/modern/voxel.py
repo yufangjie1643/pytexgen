@@ -15,11 +15,19 @@ def voxelize_model_data(
     **kwargs,
 ):
     """Voxelize a modern textile model and return ``VoxelGridData``."""
+    backend = backend.lower()
+    if backend == "triton":
+        raise NotImplementedError(
+            "backend='triton' is reserved; use backend='torch' until a Triton "
+            "kernel is implemented"
+        )
+    if backend not in {"numpy", "torch", "auto"}:
+        raise ValueError('backend must be one of "numpy", "torch", "auto", or "triton"')
     textile = model.to_model() if hasattr(model, "to_model") else model
     gv = load_gpu_voxelizer()
     snapshots = textile.to_snapshots(gv)
     nx, ny, nz = (int(value) for value in resolution)
-    output = "backend" if backend.lower() == "torch" else "numpy"
+    output = "backend" if backend == "torch" else "numpy"
     return gv.voxelize_snapshots_data(
         snapshots,
         textile.aabb,
