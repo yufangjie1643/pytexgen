@@ -90,7 +90,6 @@ class ModernWeaveApiTest(unittest.TestCase):
             self.assertEqual(_resolve_modern_workers("numpy", "auto", (64, 64, 64)), 2)
             self.assertEqual(_resolve_modern_workers("numpy", "auto", (128, 128, 128)), 4)
             self.assertEqual(_resolve_modern_workers("numpy", 12, (64, 64, 64)), 12)
-            self.assertIsNone(_resolve_modern_workers("torch", "auto", (64, 64, 64)))
 
     def test_batch_voxelize_models_uses_process_pool_and_matches_serial(self):
         from pytexgen.modern import PlainWeave2D, voxelize_model_data, voxelize_models_data
@@ -156,21 +155,15 @@ class ModernWeaveApiTest(unittest.TestCase):
             self.assertEqual(loaded.resolution, (4, 4, 2))
             self.assertEqual(int((loaded.yarn_id >= 0).sum()), results[0].occupied)
 
-    def test_torch_backend_matches_numpy_when_available(self):
-        import torch  # noqa: F401
+    def test_torch_backend_is_reserved_for_future_gpu_kernel(self):
         from pytexgen.modern import PlainWeave2D, voxelize_model_data
 
-        model = PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2)
-        numpy_data = voxelize_model_data(model, resolution=(4, 4, 2), backend="numpy")
-        torch_data = voxelize_model_data(
-            model,
-            resolution=(4, 4, 2),
-            backend="torch",
-            device="cpu",
-        )
-
-        self.assertEqual(torch_data.storage, "torch")
-        np.testing.assert_array_equal(torch_data.to_numpy().yarn_id, numpy_data.yarn_id)
+        with self.assertRaises(NotImplementedError):
+            voxelize_model_data(
+                PlainWeave2D(width=2, height=2, spacing=1.0, thickness=0.2),
+                resolution=(4, 4, 2),
+                backend="torch",
+            )
 
     def test_triton_backend_is_reserved_until_kernel_exists(self):
         from pytexgen.modern import PlainWeave2D, voxelize_model_data

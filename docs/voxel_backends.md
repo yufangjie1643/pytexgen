@@ -12,7 +12,7 @@ local-build path for p4est users.
 | Python numpy backend | `voxelize_textile(..., backend="numpy")` | `numpy` | Portable OpenMP-free CPU voxelization |
 | Python torch backend | `voxelize_textile(..., backend="torch")` | `torch`, optional CUDA/MPS | GPU or torch-accelerated structured voxelization |
 | Direct data handoff | `voxelize_textile_data(...)` | `numpy`, optional `torch` | Solver integration without `.inp` write/read overhead |
-| Modern model data | `pytexgen.modern.voxelize_model_data(...)` / `voxelize_models_data(...)` | `numpy`, optional `torch` | Python-first plain weave and shallow-cross prototypes, including model-level CPU batching |
+| Modern model data | `pytexgen.modern.voxelize_model_data(...)` / `voxelize_models_data(...)` | `numpy` | Python-first plain weave and shallow-cross prototypes, including model-level CPU batching |
 | Python adaptive numpy backend | `voxelize_textile(..., backend="numpy", adaptive=True)` | `numpy` | Lightweight non-uniform exploratory voxel output |
 | C++ p4est octree mesh | `COctreeVoxelMesh.SaveVoxelMesh(...)` | local p4est/sc build | Advanced p4est-based octree refinement |
 
@@ -23,8 +23,8 @@ Linux, macOS, and older CPUs.
 ## Modern Python-First Models
 
 Use `pytexgen.modern` when you want to build the initial supported weave models
-without direct SWIG/Core calls, then hand the result to the same numpy/torch data
-pipeline:
+without direct SWIG/Core calls, then hand the result to the NumPy
+`VoxelGridData` pipeline:
 
 ```python
 from pytexgen.modern import PlainWeave2D, voxelize_model_data, write_inp_from_voxel_data
@@ -75,9 +75,9 @@ at most four from `128^3` upward. Wider pools such as 8 or 12 workers are still
 accepted for experiments, but local 64^3 and 128^3 benchmarks show they are
 slower for the current model geometry. `PlainWeave2D` uses a structure-aware
 fast path and TexGen 3.13.1 default domain by default; pass `fast_path=False` to
-compare against the generic snapshot voxelizer. `backend="triton"` is reserved
-until a real kernel is added; use `backend="torch", device="cuda"` for GPU
-acceleration now.
+compare against the generic snapshot voxelizer. `backend="torch"` and
+`backend="triton"` remain reserved API values for a future fused GPU kernel,
+but the current modern implementation is intentionally NumPy-only.
 
 ## Python Structured Backend
 
@@ -322,10 +322,10 @@ Synthetic pruning and direct data benchmark:
 python bench_gpu_voxelizer_backends.py --resolution 64 --yarn-grid 4 --workers 4
 ```
 
-Modern Python-first CPU/GPU worker sweep:
+Modern Python-first NumPy worker sweep:
 
 ```bash
-python bench_modern_weave_backend.py --resolutions 64 128 --workers auto 1 2 4 8 12 --repeat 2 --include-cuda
+python bench_modern_weave_backend.py --resolutions 64 128 --workers auto 1 2 4 8 12 --repeat 2
 ```
 
 Torch/CUDA benchmark when torch is installed:

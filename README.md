@@ -230,12 +230,14 @@ inside the worker and returns lightweight metadata to the parent process.
 
 The initial modern modelling surface covers plain weave and a shallow-cross
 layer-to-layer subset. It returns the same `VoxelGridData` contract as the
-legacy voxelizer, so numpy/torch conversion and `.npz` handoff stay unchanged.
+legacy voxelizer, so NumPy conversion and `.npz` handoff stay unchanged.
 Modern numpy voxelization uses `workers="auto"` by default: one worker for tiny
 grids, two around `64^3`, and at most four from `128^3` upward. Use explicit
 values such as `workers=12` only for benchmarking on your machine. `PlainWeave2D`
 uses a structure-aware fast path by default; pass `fast_path=False` to compare
-against the generic snapshot voxelizer.
+against the generic snapshot voxelizer. `backend="torch"` and
+`backend="triton"` remain reserved for a future fused GPU backend, but the
+current modern implementation is NumPy-only.
 
 Create a lightweight adaptive numpy mesh:
 
@@ -265,7 +267,7 @@ those guarantees.
 | Python numpy backend | `voxelize_textile(..., backend="numpy")` | `numpy` | Portable CPU voxelization without OpenMP |
 | Python torch backend | `voxelize_textile(..., backend="torch")` | `torch` | CUDA/MPS/torch CPU acceleration for larger grids |
 | Direct solver data | `voxelize_textile_data(...)` | `numpy`, optional `torch` | Structured arrays/tensors without `.inp` file round trip |
-| Modern model data | `pytexgen.modern.voxelize_model_data(...)` / `voxelize_models_data(...)` | `numpy`, optional `torch` | Python-first weave prototypes with the same `VoxelGridData` output |
+| Modern model data | `pytexgen.modern.voxelize_model_data(...)` / `voxelize_models_data(...)` | `numpy` | Python-first weave prototypes with the same `VoxelGridData` output |
 | Python adaptive numpy backend | `voxelize_textile(..., adaptive=True)` | `numpy` | Lightweight non-uniform exploratory meshes |
 | TexGen p4est octree | `COctreeVoxelMesh.SaveVoxelMesh(...)` | local p4est/sc build | Full p4est-style adaptive octree workflows |
 
@@ -365,10 +367,10 @@ Synthetic pruning and direct data benchmark:
 python bench_gpu_voxelizer_backends.py --resolution 64 --yarn-grid 4 --workers 4
 ```
 
-Modern Python-first CPU/GPU worker sweep:
+Modern Python-first NumPy worker sweep:
 
 ```bash
-python bench_modern_weave_backend.py --resolutions 64 128 --workers auto 1 2 4 8 12 --repeat 2 --include-cuda
+python bench_modern_weave_backend.py --resolutions 64 128 --workers auto 1 2 4 8 12 --repeat 2
 ```
 
 The Python voxelizer enables conservative AABB candidate pruning with

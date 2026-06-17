@@ -1,8 +1,8 @@
 """Benchmark pytexgen.modern voxelization backends.
 
 The benchmark uses the Python-first ``PlainWeave2D`` model and reports
-end-to-end ``voxelize_model_data(...)`` time for numpy workers and optional
-Torch/CUDA. It also checks every result against the numpy serial baseline.
+end-to-end ``voxelize_model_data(...)`` time for numpy workers. It also checks
+every result against the numpy serial baseline.
 """
 
 from __future__ import annotations
@@ -74,27 +74,6 @@ def _bench_numpy(
     )
 
 
-def _bench_cuda(
-    model: PlainWeave2D,
-    resolution: tuple[int, int, int],
-    repeat: int,
-    chunk_voxels: int,
-):
-    import torch
-
-    return _best_time(
-        lambda: voxelize_model_data(
-            model,
-            resolution=resolution,
-            backend="torch",
-            device="cuda",
-            chunk_voxels=chunk_voxels,
-        ),
-        repeat=repeat,
-        sync=torch.cuda.synchronize,
-    )
-
-
 def _print_row(name: str, seconds: float, resolution: tuple[int, int, int], speedup: float, equal: bool):
     print(
         f"{name:<20} {seconds:>9.6f}s  "
@@ -108,18 +87,8 @@ def run_benchmark(
     workers_values,
     repeat: int,
     chunk_voxels: int,
-    include_cuda: bool,
 ):
     model = PlainWeave2D(width=4, height=4, spacing=1.0, thickness=0.2)
-
-    torch = None
-    if include_cuda:
-        try:
-            import torch as torch_module
-
-            torch = torch_module
-        except Exception:
-            torch = None
 
     for resolution in resolutions:
         voxels = resolution[0] * resolution[1] * resolution[2]
@@ -152,18 +121,6 @@ def run_benchmark(
                 equal,
             )
 
-        if not include_cuda:
-            continue
-        if torch is None:
-            print("torch cuda           unavailable: torch import failed")
-            continue
-        if not torch.cuda.is_available():
-            print(f"torch cuda           unavailable: torch={torch.__version__} cuda_available=False")
-            continue
-        seconds, data = _bench_cuda(model, resolution, repeat=repeat, chunk_voxels=chunk_voxels)
-        equal = np.array_equal(serial_data.yarn_id, data.to_numpy().yarn_id)
-        _print_row("torch cuda", seconds, resolution, serial_time / seconds, equal)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -183,7 +140,6 @@ def main() -> None:
     )
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--chunk-voxels", type=int, default=8192)
-    parser.add_argument("--include-cuda", action="store_true")
     args = parser.parse_args()
 
     run_benchmark(
@@ -191,7 +147,6 @@ def main() -> None:
         workers_values=args.workers,
         repeat=args.repeat,
         chunk_voxels=args.chunk_voxels,
-        include_cuda=args.include_cuda,
     )
 
 

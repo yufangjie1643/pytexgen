@@ -54,25 +54,26 @@ def voxelize_model_data(
     pools are still accepted explicitly for local benchmarks.
     """
     backend = backend.lower()
-    if backend == "triton":
+    if backend in {"torch", "triton"}:
         raise NotImplementedError(
-            "backend='triton' is reserved; use backend='torch' until a Triton "
-            "kernel is implemented"
+            f"pytexgen.modern backend='{backend}' is reserved for a future "
+            "fused GPU kernel; the current implementation is NumPy-only"
         )
-    if backend not in {"numpy", "torch", "auto"}:
-        raise ValueError('backend must be one of "numpy", "torch", "auto", or "triton"')
+    if backend == "auto":
+        backend = "numpy"
+    if backend != "numpy":
+        raise ValueError('backend must be "numpy" or "auto"')
     nx, ny, nz = (int(value) for value in resolution)
-    output = kwargs.pop("output", "backend" if backend == "torch" else "numpy")
+    output = kwargs.pop("output", "numpy")
     output = output.lower()
     workers = _resolve_modern_workers(backend, workers, resolution=(nx, ny, nz))
-    if fast_path and backend in {"numpy", "torch"} and _is_plain_weave_model(model):
+    if fast_path and _is_plain_weave_model(model):
         fast_kwargs = {"chunk_voxels", "include_centers", "aabb_pruning", "progress"}
         if set(kwargs).issubset(fast_kwargs):
             return _voxelize_plain_weave_fast(
                 model,
                 resolution=(nx, ny, nz),
                 backend=backend,
-                device=device,
                 dtype=dtype,
                 workers=workers,
                 output=output,
@@ -90,7 +91,7 @@ def voxelize_model_data(
         ny=ny,
         nz=nz,
         backend=backend,
-        device=device,
+        device=None,
         dtype=dtype,
         output=output,
         verbose=False,
@@ -136,15 +137,20 @@ def voxelize_models_data(
     """
     backend = backend.lower()
     output = output.lower()
-    if backend not in {"numpy", "torch", "auto"}:
-        raise ValueError('backend must be one of "numpy", "torch", or "auto"')
+    if backend in {"torch", "triton"}:
+        raise NotImplementedError(
+            f"pytexgen.modern batch backend='{backend}' is reserved for a "
+            "future fused GPU kernel; the current implementation is NumPy-only"
+        )
+    if backend == "auto":
+        backend = "numpy"
+    if backend != "numpy":
+        raise ValueError('backend must be "numpy" or "auto"')
+    if device is not None:
+        raise ValueError("device is not used by the NumPy-only modern backend")
 
     indexed_models = list(enumerate(models))
     worker_count = _resolve_batch_workers(workers, len(indexed_models))
-    if worker_count > 1 and backend != "numpy":
-        raise ValueError("multi-process batch voxelization currently supports backend='numpy' only")
-    if worker_count > 1 and device is not None:
-        raise ValueError("device is only valid for serial or torch batch voxelization")
 
     chunk_count = _resolve_batch_chunksize(chunksize, len(indexed_models), worker_count)
     binary_root = str(Path(binary_dir)) if binary_dir is not None else None
@@ -330,7 +336,6 @@ def _voxelize_plain_weave_fast(
     *,
     resolution: tuple[int, int, int],
     backend: str,
-    device,
     dtype: str,
     workers: int | None,
     output: str,
@@ -341,40 +346,29 @@ def _voxelize_plain_weave_fast(
     np_dtype = _numpy_dtype(dtype)
     aabb = _plain_weave_aabb(model)
     t0 = time.perf_counter()
-    if backend == "torch":
-        data = _voxelize_plain_weave_torch(
-            gv,
-            model,
-            resolution=resolution,
-            device=device,
-            dtype=dtype,
-            include_centers=include_centers,
-            aabb_pruning=aabb_pruning,
-        )
-    else:
-        worker_count = 1 if workers is None else int(workers)
-        yarn_id = _classify_plain_weave_numpy(
-            model,
-            resolution=resolution,
-            dtype=np_dtype,
-            workers=worker_count,
-        )
-        centers = _structured_centers_numpy(aabb, resolution, np_dtype) if include_centers else None
-        data = gv.VoxelGridData(
-            yarn_id=yarn_id,
-            aabb=aabb,
-            resolution=resolution,
-            backend="numpy",
-            device="cpu",
-            workers=max(1, worker_count),
-            dtype=dtype,
-            timings={"extract": 0.0, "pack": 0.0, "classify": 0.0},
-            centers=centers,
-            aabb_pruning=aabb_pruning,
-            storage="numpy",
-        )
+    worker_count = 1 if workers is None else int(workers)
+    yarn_id = _classify_plain_weave_numpy(
+        model,
+        resolution=resolution,
+        dtype=np_dtype,
+        workers=worker_count,
+    )
+    centers = _structured_centers_numpy(aabb, resolution, np_dtype) if include_centers else None
+    data = gv.VoxelGridData(
+        yarn_id=yarn_id,
+        aabb=aabb,
+        resolution=resolution,
+        backend=backend,
+        device="cpu",
+        workers=max(1, worker_count),
+        dtype=dtype,
+        timings={"extract": 0.0, "pack": 0.0, "classify": 0.0},
+        centers=centers,
+        aabb_pruning=aabb_pruning,
+        storage="numpy",
+    )
     data.timings["classify"] = time.perf_counter() - t0
-    return _coerce_output(data, output, device=device)
+    return _coerce_output(data, output)
 
 
 def _numpy_dtype(dtype: str):
@@ -598,202 +592,14 @@ def _points_in_polygon_numpy(u: np.ndarray, v: np.ndarray, polygon: np.ndarray) 
     return (hits % 2) == 1
 
 
-def _voxelize_plain_weave_torch(
-    gv,
-    model,
-    *,
-    resolution: tuple[int, int, int],
-    device,
-    dtype: str,
-    include_centers: bool,
-    aabb_pruning: bool,
-):
-    torch = gv._require_torch()
-    torch_dtype = {"float32": torch.float32, "float64": torch.float64}[dtype]
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    aabb_np = _plain_weave_aabb(model)
-    yarn_grid = _classify_plain_weave_torch_grid(
-        model,
-        resolution=resolution,
-        device=device,
-        torch_dtype=torch_dtype,
-        torch=torch,
-    )
-    centers = None
-    if include_centers:
-        centers = torch.as_tensor(
-            _structured_centers_numpy(aabb_np, resolution, _numpy_dtype(dtype)),
-            device=device,
-            dtype=torch_dtype,
-        )
-    return gv.VoxelGridData(
-        yarn_id=yarn_grid.reshape(-1),
-        aabb=torch.as_tensor(aabb_np, device=device, dtype=torch_dtype),
-        resolution=resolution,
-        backend="torch",
-        device=str(device),
-        workers=1,
-        dtype=dtype,
-        timings={"extract": 0.0, "pack": 0.0, "classify": 0.0},
-        centers=centers,
-        aabb_pruning=aabb_pruning,
-        storage="torch",
-    )
-
-
-def _classify_plain_weave_torch_grid(model, *, resolution, device, torch_dtype, torch):
-    nx, ny, nz = resolution
-    aabb = _plain_weave_aabb(model)
-    xs_np, ys_np, zs_np = _voxel_axes_numpy(aabb, resolution, np.float64)
-    xs = torch.as_tensor(xs_np, device=device, dtype=torch_dtype)
-    ys = torch.as_tensor(ys_np, device=device, dtype=torch_dtype)
-    zs = torch.as_tensor(zs_np, device=device, dtype=torch_dtype)
-    best_dist = torch.full((nz, ny, nx), float("inf"), device=device, dtype=torch_dtype)
-    yarn_id = torch.full((nz, ny, nx), -1, device=device, dtype=torch.int32)
-    polygon = torch.as_tensor(
-        _ellipse_polygon(model.yarn_width, model.yarn_height, dtype=np.float64),
-        device=device,
-        dtype=torch_dtype,
-    )
-    half_width = float(model.yarn_width * 0.5)
-    half_height = float(model.yarn_height * 0.5)
-    x_nodes = torch.linspace(
-        0.0, model.width * model.spacing, model.width + 1, device=device, dtype=torch_dtype
-    )
-    y_nodes = torch.linspace(
-        0.0, model.height * model.spacing, model.height + 1, device=device, dtype=torch_dtype
-    )
-
-    for row in range(model.height):
-        z_nodes = torch.as_tensor(
-            [model._cell_z(column % model.width, row, "x") for column in range(model.width + 1)],
-            device=device,
-            dtype=torch_dtype,
-        )
-        nn, dx_nn, dz_nn = _nearest_node_components_torch(xs, zs, x_nodes, z_nodes, torch)
-        _update_torch_yarn(
-            yarn_id,
-            best_dist,
-            yarn_index=row,
-            u_axis=-(ys - row * model.spacing),
-            v_grid=dz_nn,
-            t_grid=dx_nn,
-            nearest_grid=nn,
-            polygon=polygon,
-            half_width=half_width,
-            half_height=half_height,
-            mode="x",
-            torch=torch,
-        )
-
-    for column in range(model.width):
-        z_nodes = torch.as_tensor(
-            [model._cell_z(column, row % model.height, "y") for row in range(model.height + 1)],
-            device=device,
-            dtype=torch_dtype,
-        )
-        nn, dy_nn, dz_nn = _nearest_node_components_torch(ys, zs, y_nodes, z_nodes, torch)
-        _update_torch_yarn(
-            yarn_id,
-            best_dist,
-            yarn_index=model.height + column,
-            u_axis=xs - column * model.spacing,
-            v_grid=dz_nn,
-            t_grid=dy_nn,
-            nearest_grid=nn,
-            polygon=polygon,
-            half_width=half_width,
-            half_height=half_height,
-            mode="y",
-            torch=torch,
-        )
-    return yarn_id
-
-
-def _nearest_node_components_torch(axis_values, z_values, axis_nodes, z_nodes, torch):
-    axis_delta = axis_values[:, None] - axis_nodes[None, :]
-    z_delta = z_values[:, None] - z_nodes[None, :]
-    d2 = z_delta[:, None, :] ** 2 + axis_delta[None, :, :] ** 2
-    nn = torch.argmin(d2, dim=2)
-    axis_nn = axis_values[None, :] - axis_nodes[nn]
-    z_nn = z_values[:, None] - z_nodes[nn]
-    return d2.gather(2, nn.unsqueeze(-1)).squeeze(-1), axis_nn, z_nn
-
-
-def _update_torch_yarn(
-    yarn_id,
-    best_dist,
-    *,
-    yarn_index: int,
-    u_axis,
-    v_grid,
-    t_grid,
-    nearest_grid,
-    polygon,
-    half_width: float,
-    half_height: float,
-    mode: str,
-    torch,
-) -> None:
-    if mode == "x":
-        bbox = (torch.abs(u_axis)[None, :, None] <= half_width) & (
-            torch.abs(v_grid)[:, None, :] <= half_height
-        )
-        iz, iy, ix = torch.nonzero(bbox, as_tuple=True)
-        if iz.numel() == 0:
-            return
-        u = u_axis[iy]
-        v = v_grid[iz, ix]
-        t = t_grid[iz, ix]
-        d2 = nearest_grid[iz, ix] + u ** 2
-    else:
-        bbox = (torch.abs(u_axis)[None, None, :] <= half_width) & (
-            torch.abs(v_grid)[:, :, None] <= half_height
-        )
-        iz, iy, ix = torch.nonzero(bbox, as_tuple=True)
-        if iz.numel() == 0:
-            return
-        u = u_axis[ix]
-        v = v_grid[iz, iy]
-        t = t_grid[iz, iy]
-        d2 = nearest_grid[iz, iy] + u ** 2
-
-    inside = _points_in_polygon_torch(u, v, polygon, torch)
-    if not bool(torch.any(inside)):
-        return
-    iz, iy, ix = iz[inside], iy[inside], ix[inside]
-    t = t[inside]
-    dist = torch.sqrt(d2[inside]) + torch.abs(t) * 0.1
-    update = dist < best_dist[iz, iy, ix]
-    if bool(torch.any(update)):
-        iz, iy, ix = iz[update], iy[update], ix[update]
-        best_dist[iz, iy, ix] = dist[update]
-        yarn_id[iz, iy, ix] = int(yarn_index)
-
-
-def _points_in_polygon_torch(u, v, polygon, torch):
-    poly = polygon[:-1]
-    p_next = polygon[1:]
-    u2 = u[:, None]
-    v2 = v[:, None]
-    x1 = poly[:, 0]
-    y1 = poly[:, 1]
-    x2 = p_next[:, 0]
-    y2 = p_next[:, 1]
-    cond1 = (y1 > v2) != (y2 > v2)
-    denom = y2 - y1
-    denom = torch.where(torch.abs(denom) < 1e-12, torch.full_like(denom, 1e-12), denom)
-    xi = x1 + (v2 - y1) * (x2 - x1) / denom
-    hits = (cond1 & (u2 < xi)).sum(dim=-1)
-    return (hits % 2) == 1
-
-
-def _coerce_output(data, output: str, *, device):
+def _coerce_output(data, output: str):
     if output == "backend":
         return data
     if output == "numpy":
         return data.to_numpy()
     if output == "torch":
-        return data.to_torch(device=device)
+        raise NotImplementedError(
+            "pytexgen.modern output='torch' is reserved for a future GPU backend; "
+            "use output='numpy' or output='backend'"
+        )
     raise ValueError('output must be one of "backend", "numpy", or "torch"')
