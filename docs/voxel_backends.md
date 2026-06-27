@@ -126,7 +126,15 @@ from pytexgen.gpu_voxelizer import VoxelGridData
 data.save_npz("weave_64.npz")
 loaded = VoxelGridData.load_npz("weave_64.npz", output="numpy")
 torch_loaded = VoxelGridData.load_npz("weave_64.npz", output="torch", device="cuda")
+
+data.save_npy_dir("weave_64_npy")
+mmap_loaded = VoxelGridData.load_npy_dir("weave_64_npy", mmap_mode="r")
 ```
+
+`.npz` is convenient for compact single-file storage. The directory-based
+`.npy` format stores `metadata.json` plus one raw array file per field, so large
+datasets can be loaded with `mmap_mode="r"` and avoid zip decompression CPU
+overhead during training.
 
 When the same textile is voxelized repeatedly, cache the TexGen geometry
 snapshot once:

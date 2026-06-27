@@ -16,7 +16,8 @@ across Windows, Linux, and macOS.
 ## Version 1.1.1 Highlights
 
 - Direct voxel data handoff with `VoxelGridData.to("numpy" | "torch")`,
-  `save_npz(...)`, and `load_npz(...)`.
+  `save_npz(...)`, `load_npz(...)`, `save_npy_dir(...)`, and
+  `load_npy_dir(...)`.
 - Optional Voxel-ACDM adapter for numpy/torch voxel grids.
 - 2x2 weave tetrahedral mesh and small numpy/scipy FEM example scripts.
 - Root `build.sh`, `build.bat`, and `build.ps1` helpers for uv-based local
@@ -152,7 +153,7 @@ Set `progress=True` to show tqdm bars for classification and `.inp` writing;
 the package imports tqdm lazily so normal installs do not require it.
 
 Return structured voxel data directly in memory for another solver, with
-optional `.npz` persistence:
+optional `.npz` or directory-based `.npy` persistence:
 
 ```python
 from pytexgen.gpu_voxelizer import VoxelGridData, voxelize_textile_data
@@ -168,9 +169,15 @@ yarn_grid = data.grid              # shape: (nz, ny, nx)
 material_grid = data.material_id() # matrix=0, yarns=1..N
 flat_yarn_ids = data.yarn_id       # ix + iy*nx + iz*nx*ny order
 data.save_npz("voxel_data.npz")
+data.save_npy_dir("voxel_data_npy")
 
 loaded = VoxelGridData.load_npz("voxel_data.npz")
+mmap_loaded = VoxelGridData.load_npy_dir("voxel_data_npy", mmap_mode="r")
 ```
+
+Use `.npz` for a compact single-file artifact. Use `save_npy_dir(...)` when
+large training runs should avoid zip decompression overhead or memory-map
+individual arrays such as `yarn_id`, `orientation1`, and `orientation2`.
 
 For anisotropic solvers, request per-voxel yarn directions:
 

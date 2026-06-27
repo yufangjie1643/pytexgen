@@ -567,6 +567,55 @@ class VoxelGridData:
         saver = np.savez_compressed if compressed else np.savez
         saver(out_path, **payload)
 
+    def save_npy_dir(self, path: str,
+                     *,
+                     include_centers: bool = True) -> None:
+        """Save voxel data as a directory of raw ``.npy`` arrays.
+
+        Compared with ``.npz``, this avoids zip packaging/decompression and
+        allows :meth:`load_npy_dir` to memory-map individual arrays. Tensor-
+        backed data is copied to CPU numpy arrays before writing.
+        """
+        out_dir = Path(path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        arrays = {
+            "yarn_id": "yarn_id.npy",
+            "aabb": "aabb.npy",
+        }
+        if include_centers and self.centers is not None:
+            arrays["centers"] = "centers.npy"
+        if self.orientation1 is not None:
+            arrays["orientation1"] = "orientation1.npy"
+        if self.orientation2 is not None:
+            arrays["orientation2"] = "orientation2.npy"
+
+        for field, filename in arrays.items():
+            np.save(
+                out_dir / filename,
+                _array_to_numpy(getattr(self, field), copy=False),
+                allow_pickle=False,
+            )
+
+        metadata = {
+            "format": "pytexgen.voxel_grid_npy_dir",
+            "format_version": 1,
+            "resolution": list(self.resolution),
+            "aabb_pruning": bool(self.aabb_pruning),
+            "backend": self.backend,
+            "device": self.device,
+            "dtype": self.dtype,
+            "storage": self.storage,
+            "order": self.order,
+            "workers": int(self.workers),
+            "timings": dict(self.timings),
+            "arrays": arrays,
+        }
+        (out_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
     @classmethod
     def load_npz(cls, path: str,
                  *,
@@ -610,6 +659,68 @@ class VoxelGridData:
                 storage="numpy",
                 order=str(data["order"].item()),
             )
+
+        if output == "torch":
+            return obj.to_torch(device=device, copy=False)
+        return obj
+
+    @classmethod
+    def load_npy_dir(cls, path: str,
+                     *,
+                     output: str = "numpy",
+                     device: Optional[str] = None,
+                     mmap_mode: Optional[str] = None) -> "VoxelGridData":
+        """Load voxel data saved by :meth:`save_npy_dir`.
+
+        Parameters
+        ----------
+        output : {"numpy", "torch"}
+            Storage backend for the returned object.
+        device : str or None
+            Torch device when ``output="torch"``.
+        mmap_mode : str or None
+            Passed to ``numpy.load`` for numpy output. Use ``"r"`` for
+            read-only memory-mapped numpy arrays, which reduces CPU and memory
+            pressure for large grids.
+        """
+        output = output.lower()
+        if output not in {"numpy", "torch"}:
+            raise ValueError('output must be "numpy" or "torch"')
+        array_mmap_mode = mmap_mode if output == "numpy" else None
+
+        in_dir = Path(path)
+        metadata_path = in_dir / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        arrays = metadata.get("arrays", {})
+
+        def load_array(field: str, *, required: bool = False):
+            filename = arrays.get(field)
+            if filename is None:
+                if required:
+                    raise ValueError(f"metadata.json does not list {field!r}")
+                return None
+            return np.load(
+                in_dir / filename,
+                allow_pickle=False,
+                mmap_mode=array_mmap_mode,
+            )
+
+        obj = cls(
+            yarn_id=load_array("yarn_id", required=True),
+            aabb=load_array("aabb", required=True),
+            resolution=tuple(int(v) for v in metadata["resolution"]),
+            backend=str(metadata.get("backend", "numpy")),
+            device="cpu",
+            workers=int(metadata.get("workers", 1)),
+            dtype=str(metadata.get("dtype", "float64")),
+            timings=dict(metadata.get("timings", {})),
+            centers=load_array("centers"),
+            orientation1=load_array("orientation1"),
+            orientation2=load_array("orientation2"),
+            aabb_pruning=bool(metadata.get("aabb_pruning", True)),
+            storage="numpy",
+            order=str(metadata.get("order", "ix + iy*nx + iz*nx*ny")),
+        )
 
         if output == "torch":
             return obj.to_torch(device=device, copy=False)

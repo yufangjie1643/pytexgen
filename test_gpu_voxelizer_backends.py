@@ -303,6 +303,61 @@ class VoxelizerBackendTest(unittest.TestCase):
         np.testing.assert_allclose(loaded.orientation1, data.orientation1)
         np.testing.assert_allclose(loaded.orientation2, data.orientation2)
 
+    def test_voxel_grid_data_npy_dir_roundtrip_and_mmap(self):
+        self.patch_extract_snapshots()
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_centers=True,
+            include_orientations=True,
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "voxel_npy"
+            data.save_npy_dir(str(path))
+
+            expected = {
+                "metadata.json",
+                "yarn_id.npy",
+                "aabb.npy",
+                "centers.npy",
+                "orientation1.npy",
+                "orientation2.npy",
+            }
+            self.assertTrue(expected.issubset({item.name for item in path.iterdir()}))
+
+            loaded = self.voxelizer.VoxelGridData.load_npy_dir(str(path))
+            mmap_loaded = self.voxelizer.VoxelGridData.load_npy_dir(
+                str(path), mmap_mode="r"
+            )
+            self.assertIsInstance(mmap_loaded.yarn_id, np.memmap)
+            self.assertIsInstance(mmap_loaded.orientation1, np.memmap)
+            np.testing.assert_array_equal(mmap_loaded.material_id(), data.material_id())
+            del mmap_loaded
+
+        self.assertEqual(loaded.storage, "numpy")
+        self.assertEqual(loaded.resolution, (4, 4, 4))
+        np.testing.assert_array_equal(loaded.yarn_id, data.yarn_id)
+        np.testing.assert_allclose(loaded.aabb, data.aabb)
+        np.testing.assert_allclose(loaded.centers, data.centers)
+        np.testing.assert_allclose(loaded.orientation1, data.orientation1)
+        np.testing.assert_allclose(loaded.orientation2, data.orientation2)
+
+        if self.voxelizer.torch is not None:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "voxel_npy"
+                data.save_npy_dir(str(path))
+                torch_loaded = self.voxelizer.VoxelGridData.load_npy_dir(
+                    str(path), output="torch", device="cpu", mmap_mode="r"
+                )
+            self.assertTrue(self.voxelizer._is_torch_tensor(torch_loaded.yarn_id))
+            self.assertTrue(self.voxelizer._is_torch_tensor(torch_loaded.orientation1))
+
     def test_voxel_grid_data_orientation_conversion(self):
         snap = synthetic_snapshot(self.voxelizer)
         data = self.voxelizer.voxelize_snapshots_data(
