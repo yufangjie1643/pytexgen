@@ -21,7 +21,9 @@ IF(BUILD_PYTHON_INTERFACE)
     # Include directories
     # ========================================================================
     INCLUDE_DIRECTORIES(${Python_INCLUDE_DIRS})
-    INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../OctreeRefinement/include)
+    if(TEXGEN_HAS_P4EST)
+        INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../OctreeRefinement/include)
+    endif()
     execute_process(
         COMMAND "${Python_EXECUTABLE}" -c "import numpy; print(numpy.get_include())"
         OUTPUT_VARIABLE TEXGEN_NUMPY_INCLUDE_DIR

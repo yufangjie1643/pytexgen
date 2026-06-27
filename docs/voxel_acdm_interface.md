@@ -23,7 +23,7 @@ CTextile
 
 这个路径适合 matrix/yarn 都能先近似为各向同性材料的快速联调和求解器接入验证。
 
-各向异性 yarn 的完整路径需要体素化阶段额外输出 yarn orientation field，然后接 Voxel-ACDM 的 `FEMHomogenizerBatched(C_voigt_fields=...)` 或 `build_voigt_stiffness_fields_gpu(...)`。这部分尚未启用。
+各向异性 yarn 的完整路径需要体素化阶段输出 yarn orientation field，然后接 Voxel-ACDM 的 `FEMHomogenizerBatched(C_voigt_fields=...)` 或 `build_voigt_stiffness_fields_gpu(...)`。`voxelize_textile_data(..., include_orientations=True)` 已可返回 `orientation1`/`orientation2` 体素方向场；各向异性 ACDM 适配层仍需单独接入。
 
 ## 环境发现
 
@@ -147,6 +147,8 @@ data.resolution = (Nx, Ny, Nz)
 data.shape      = (Nz, Ny, Nx)
 data.voxel_size = (dx, dy, dz)
 data.grid       = (Nz, Ny, Nx)
+data.orientation1 = (Nz, Ny, Nx, 3)  # optional yarn tangent
+data.orientation2 = (Nz, Ny, Nx, 3)  # optional yarn up vector
 ```
 
 因此适配层只做布局确认和 phase id 映射，不需要重新排列体素顺序。
@@ -156,14 +158,13 @@ data.grid       = (Nz, Ny, Nx)
 - Voxel-ACDM 主 FEM 路径要求 CUDA + Triton。当前适配层只在真正调用求解器时导入 `femlib.fem_batched`。
 - 当前 pytexgen 适配层只支持各向同性 phase-LUT 快路径。
 - `FEMHomogenizerBatchedIsotropicPhases` 当前内部会把 phase ids 打包成 int4，因此即使 pytexgen 体素化输出是 torch tensor，调用该求解器前也会转成 numpy phase ids。
-- 对各向异性 yarn，需要后续在体素化阶段输出 orientation field，并装配 `C_voigt_fields`。
+- 对各向异性 yarn，orientation field 已可由体素化阶段输出；仍需要后续装配 `C_voigt_fields` 并接到各向异性求解器。
 
 ## 下一步接口
 
 优先补：
 
-1. `voxelize_textile_fields(..., fields=("yarn_id", "orientation"))`
-2. `build_acdm_voigt_field_from_voxel_data(...)`
-3. `solve_acdm_anisotropic_from_voxel_data(...)`
+1. `build_acdm_voigt_field_from_voxel_data(...)`
+2. `solve_acdm_anisotropic_from_voxel_data(...)`
 
 这样才能把 TexGen yarn 局部方向和 Voxel-ACDM 的正交各向异性刚度旋转路径完整连起来。

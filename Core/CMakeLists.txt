@@ -64,8 +64,6 @@ IF(TEXGEN_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
     TARGET_LINK_LIBRARIES(TexGenCore OpenMP::OpenMP_CXX)
 ENDIF()
 
-TARGET_INCLUDE_DIRECTORIES(TexGenCore PUBLIC ../OctreeRefinement/include)
-
 # ============================================================================
 # p4est/sc support - enables COctreeVoxelMesh
 #
@@ -119,6 +117,7 @@ endif()
 
 if(TEXGEN_HAS_P4EST)
     TARGET_COMPILE_DEFINITIONS(TexGenCore PUBLIC TEXGEN_USE_P4EST)
+    TARGET_INCLUDE_DIRECTORIES(TexGenCore PUBLIC ../OctreeRefinement/include)
 endif()
 
 # ============================================================================

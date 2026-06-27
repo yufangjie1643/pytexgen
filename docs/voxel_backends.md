@@ -88,6 +88,26 @@ materials = data.material_id() # matrix=0, yarn 0 -> 1, yarn 1 -> 2, ...
 spacing = data.voxel_size
 ```
 
+For anisotropic downstream solvers, pass `include_orientations=True` to return
+two per-voxel direction grids:
+
+```python
+data = voxelize_textile_data(
+    textile,
+    nx=64, ny=64, nz=64,
+    backend="numpy",
+    output="numpy",
+    include_orientations=True,
+)
+
+orientation1 = data.orientation1  # yarn tangent, shape (nz, ny, nx, 3)
+orientation2 = data.orientation2  # yarn up vector, shape (nz, ny, nx, 3)
+```
+
+Matrix voxels contain zero direction vectors. To receive tensors, keep
+classification on the numpy path and request `output="torch"`; the container
+conversion preserves `orientation1` and `orientation2`.
+
 `data.yarn_id` is the flat TexGen element-order array
 `ix + iy*nx + iz*nx*ny`. `data.to("numpy", dtype=...)` and
 `data.to("torch", device=..., dtype=...)` convert storage explicitly,

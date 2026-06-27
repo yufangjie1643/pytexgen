@@ -185,10 +185,30 @@ class VoxelizerBackendTest(unittest.TestCase):
             workers=1,
             chunk_voxels=16,
             verbose=False,
+            include_orientations=True,
         )
 
         self.assertEqual(int(data.occupancy().sum()), 16)
         self.assertEqual(data.timings["unpack"], 0.0)
+        self.assertEqual(data.orientation1.shape, (4, 4, 4, 3))
+        self.assertEqual(data.orientation2.shape, (4, 4, 4, 3))
+        yarn_mask = data.occupancy()
+        np.testing.assert_allclose(
+            data.orientation1[yarn_mask],
+            np.broadcast_to([1.0, 0.0, 0.0], data.orientation1[yarn_mask].shape),
+        )
+        np.testing.assert_allclose(
+            data.orientation2[yarn_mask],
+            np.broadcast_to([0.0, 0.0, 1.0], data.orientation2[yarn_mask].shape),
+        )
+        np.testing.assert_allclose(
+            data.orientation1[~yarn_mask],
+            np.zeros_like(data.orientation1[~yarn_mask]),
+        )
+        np.testing.assert_allclose(
+            data.orientation2[~yarn_mask],
+            np.zeros_like(data.orientation2[~yarn_mask]),
+        )
 
     def test_default_backend_is_numpy_and_reports_effective_workers(self):
         self.patch_extract_snapshots()
@@ -263,6 +283,7 @@ class VoxelizerBackendTest(unittest.TestCase):
             backend="numpy",
             output="numpy",
             include_centers=True,
+            include_orientations=True,
             workers=1,
             chunk_voxels=16,
             verbose=False,
@@ -279,6 +300,41 @@ class VoxelizerBackendTest(unittest.TestCase):
         np.testing.assert_array_equal(loaded.yarn_id, data.yarn_id)
         np.testing.assert_allclose(loaded.aabb, data.aabb)
         np.testing.assert_array_equal(loaded.material_id(), data.material_id())
+        np.testing.assert_allclose(loaded.orientation1, data.orientation1)
+        np.testing.assert_allclose(loaded.orientation2, data.orientation2)
+
+    def test_voxel_grid_data_orientation_conversion(self):
+        snap = synthetic_snapshot(self.voxelizer)
+        data = self.voxelizer.voxelize_snapshots_data(
+            [snap],
+            self.aabb.copy(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_orientations=True,
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        self.assertEqual(data.orientation1.shape, (4, 4, 4, 3))
+        self.assertEqual(data.orientation2.shape, (4, 4, 4, 3))
+        numpy_data = data.to("numpy", dtype=np.float64)
+        self.assertEqual(numpy_data.orientation1.dtype, np.float64)
+        self.assertEqual(numpy_data.orientation2.dtype, np.float64)
+        np.testing.assert_allclose(numpy_data.orientation1, data.orientation1)
+        np.testing.assert_allclose(numpy_data.orientation2, data.orientation2)
+
+        if self.voxelizer.torch is not None:
+            torch_data = data.to("torch", device="cpu", dtype="float64")
+            self.assertTrue(self.voxelizer._is_torch_tensor(torch_data.orientation1))
+            self.assertTrue(self.voxelizer._is_torch_tensor(torch_data.orientation2))
+            self.assertEqual(torch_data.orientation1.dtype, self.voxelizer.torch.float64)
+            self.assertEqual(torch_data.orientation2.dtype, self.voxelizer.torch.float64)
+            np.testing.assert_allclose(
+                torch_data.to("numpy").orientation1,
+                data.orientation1,
+            )
 
     def test_voxelize_snapshots_data_and_cache(self):
         snap = synthetic_snapshot(self.voxelizer)
@@ -336,6 +392,7 @@ class VoxelizerBackendTest(unittest.TestCase):
             nx=4, ny=4, nz=4,
             backend="numpy",
             output="numpy",
+            include_orientations=True,
             workers=1,
             chunk_voxels=16,
             verbose=False,
@@ -346,11 +403,14 @@ class VoxelizerBackendTest(unittest.TestCase):
             nx=4, ny=4, nz=4,
             backend="numpy",
             output="numpy",
+            include_orientations=True,
             workers=1,
             chunk_voxels=16,
             verbose=False,
         )
         np.testing.assert_array_equal(bundled.yarn_id, direct.yarn_id)
+        np.testing.assert_allclose(bundled.orientation1, direct.orientation1)
+        np.testing.assert_allclose(bundled.orientation2, direct.orientation2)
 
     def test_snapshot_bundle_numpy_path_consumes_flat_arrays(self):
         snap = synthetic_snapshot(self.voxelizer)

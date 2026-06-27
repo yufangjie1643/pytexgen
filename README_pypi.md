@@ -172,6 +172,21 @@ data.save_npz("voxel_data.npz")
 loaded = VoxelGridData.load_npz("voxel_data.npz")
 ```
 
+For anisotropic solvers, request per-voxel yarn directions:
+
+```python
+data = voxelize_textile_data(
+    textile,
+    nx=64, ny=64, nz=64,
+    backend="numpy",
+    output="numpy",
+    include_orientations=True,
+)
+
+orientation1 = data.orientation1  # yarn tangent, shape: (nz, ny, nx, 3)
+orientation2 = data.orientation2  # yarn up vector, shape: (nz, ny, nx, 3)
+```
+
 Use torch when an accelerator is available:
 
 ```python

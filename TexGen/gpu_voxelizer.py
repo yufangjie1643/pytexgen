@@ -354,6 +354,8 @@ class VoxelGridData:
     dtype: str
     timings: Dict[str, float]
     centers: Optional[Any] = None
+    orientation1: Optional[Any] = None
+    orientation2: Optional[Any] = None
     aabb_pruning: bool = True
     storage: str = "numpy"
     order: str = "ix + iy*nx + iz*nx*ny"
@@ -441,10 +443,26 @@ class VoxelGridData:
         yarn_id = _array_to_numpy(self.yarn_id, copy=copy)
         aabb = _array_to_numpy(self.aabb, copy=copy)
         centers = None if self.centers is None else _array_to_numpy(self.centers, copy=copy)
+        orientation1 = (
+            None if self.orientation1 is None
+            else _array_to_numpy(self.orientation1, copy=copy)
+        )
+        orientation2 = (
+            None if self.orientation2 is None
+            else _array_to_numpy(self.orientation2, copy=copy)
+        )
         if np_dtype is not None:
             aabb = aabb.astype(np_dtype, copy=copy or aabb.dtype != np_dtype)
             if centers is not None:
                 centers = centers.astype(np_dtype, copy=copy or centers.dtype != np_dtype)
+            if orientation1 is not None:
+                orientation1 = orientation1.astype(
+                    np_dtype, copy=copy or orientation1.dtype != np_dtype
+                )
+            if orientation2 is not None:
+                orientation2 = orientation2.astype(
+                    np_dtype, copy=copy or orientation2.dtype != np_dtype
+                )
         return VoxelGridData(
             yarn_id=yarn_id,
             aabb=aabb,
@@ -455,6 +473,8 @@ class VoxelGridData:
             dtype=self.dtype if np_dtype is None else np_dtype.name,
             timings=dict(self.timings),
             centers=centers,
+            orientation1=orientation1,
+            orientation2=orientation2,
             aabb_pruning=self.aabb_pruning,
             storage="numpy",
             order=self.order,
@@ -482,6 +502,20 @@ class VoxelGridData:
             )
             if torch_dtype is not None:
                 centers = centers.to(dtype=torch_dtype, copy=copy)
+        orientation1 = None
+        if self.orientation1 is not None:
+            orientation1 = _array_to_torch(
+                self.orientation1, torch_mod, device=str(yarn_id.device), copy=copy
+            )
+            if torch_dtype is not None:
+                orientation1 = orientation1.to(dtype=torch_dtype, copy=copy)
+        orientation2 = None
+        if self.orientation2 is not None:
+            orientation2 = _array_to_torch(
+                self.orientation2, torch_mod, device=str(yarn_id.device), copy=copy
+            )
+            if torch_dtype is not None:
+                orientation2 = orientation2.to(dtype=torch_dtype, copy=copy)
         return VoxelGridData(
             yarn_id=yarn_id,
             aabb=aabb,
@@ -492,6 +526,8 @@ class VoxelGridData:
             dtype=self.dtype if torch_dtype is None else _torch_dtype_name(torch_dtype),
             timings=dict(self.timings),
             centers=centers,
+            orientation1=orientation1,
+            orientation2=orientation2,
             aabb_pruning=self.aabb_pruning,
             storage="torch",
             order=self.order,
@@ -521,6 +557,10 @@ class VoxelGridData:
         }
         if include_centers and self.centers is not None:
             payload["centers"] = _array_to_numpy(self.centers, copy=False)
+        if self.orientation1 is not None:
+            payload["orientation1"] = _array_to_numpy(self.orientation1, copy=False)
+        if self.orientation2 is not None:
+            payload["orientation2"] = _array_to_numpy(self.orientation2, copy=False)
 
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -548,6 +588,12 @@ class VoxelGridData:
         with np.load(path, allow_pickle=False) as data:
             timings_raw = str(data["timings_json"].item())
             centers = data["centers"].copy() if "centers" in data.files else None
+            orientation1 = (
+                data["orientation1"].copy() if "orientation1" in data.files else None
+            )
+            orientation2 = (
+                data["orientation2"].copy() if "orientation2" in data.files else None
+            )
             obj = cls(
                 yarn_id=data["yarn_id"].copy(),
                 aabb=data["aabb"].copy(),
@@ -558,6 +604,8 @@ class VoxelGridData:
                 dtype=str(data["dtype"].item()),
                 timings=json.loads(timings_raw),
                 centers=centers,
+                orientation1=orientation1,
+                orientation2=orientation2,
                 aabb_pruning=bool(data["aabb_pruning"].item()),
                 storage="numpy",
                 order=str(data["order"].item()),
@@ -1443,11 +1491,14 @@ def _classify_voxel_chunk_bundle_numpy(
     bundle: SnapshotBundle,
     bounds: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
     aabb_pruning: bool = True,
-) -> np.ndarray:
+    include_orientations: bool = False,
+) -> Any:
     """Classify a center chunk directly from flat snapshot bundle arrays."""
     C = pts.shape[0]
     best_dist = np.full(C, np.inf, dtype=pts.dtype)
     best_yarn = np.full(C, -1, dtype=np.int32)
+    orientation1 = np.zeros((C, 3), dtype=pts.dtype) if include_orientations else None
+    orientation2 = np.zeros((C, 3), dtype=pts.dtype) if include_orientations else None
     chunk_lo = pts.min(axis=0)
     chunk_hi = pts.max(axis=0)
 
@@ -1507,19 +1558,28 @@ def _classify_voxel_chunk_bundle_numpy(
                 update = inside & (dist < best_dist)
                 best_dist[update] = dist[update]
                 best_yarn[update] = y_idx
+                if include_orientations:
+                    orientation1[update] = tan[update]
+                    orientation2[update] = up[update]
             else:
                 update = inside & (dist < best_dist[active_idx])
                 target = active_idx[update]
                 best_dist[target] = dist[update]
                 best_yarn[target] = y_idx
+                if include_orientations:
+                    orientation1[target] = tan[update]
+                    orientation2[target] = up[update]
 
+    if include_orientations:
+        return best_yarn, orientation1, orientation2
     return best_yarn
 
 
 def _classify_voxel_chunk_numpy(pts: np.ndarray,
                                 snapshots: List[YarnSnapshot],
                                 bounds: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
-                                aabb_pruning: bool = True) -> np.ndarray:
+                                aabb_pruning: bool = True,
+                                include_orientations: bool = False) -> Any:
     """Classify a contiguous numpy voxel-center chunk.
 
     Parameters
@@ -1543,6 +1603,8 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
     C = pts.shape[0]
     best_dist = np.full(C, np.inf, dtype=pts.dtype)
     best_yarn = np.full(C, -1, dtype=np.int32)
+    orientation1 = np.zeros((C, 3), dtype=pts.dtype) if include_orientations else None
+    orientation2 = np.zeros((C, 3), dtype=pts.dtype) if include_orientations else None
     chunk_lo = pts.min(axis=0)
     chunk_hi = pts.max(axis=0)
 
@@ -1598,12 +1660,20 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
                 update = inside & (dist < best_dist)
                 best_dist[update] = dist[update]
                 best_yarn[update] = y_idx
+                if include_orientations:
+                    orientation1[update] = tan[update]
+                    orientation2[update] = up[update]
             else:
                 update = inside & (dist < best_dist[active_idx])
                 target = active_idx[update]
                 best_dist[target] = dist[update]
                 best_yarn[target] = y_idx
+                if include_orientations:
+                    orientation1[target] = tan[update]
+                    orientation2[target] = up[update]
 
+    if include_orientations:
+        return best_yarn, orientation1, orientation2
     return best_yarn
 
 
@@ -1614,35 +1684,67 @@ def _classify_voxels_bundle_numpy(
     workers: Optional[int] = None,
     aabb_pruning: bool = True,
     progress: Any = False,
-) -> np.ndarray:
+    include_orientations: bool = False,
+) -> Any:
     """Classify voxel centers directly from a flat ``SnapshotBundle``."""
     V = centers.shape[0]
     yarn_id = np.full(V, -1, dtype=np.int32)
+    orientation1 = (
+        np.zeros((V, 3), dtype=centers.dtype) if include_orientations else None
+    )
+    orientation2 = (
+        np.zeros((V, 3), dtype=centers.dtype) if include_orientations else None
+    )
     ranges = [(v0, min(v0 + chunk, V)) for v0 in range(0, V, chunk)]
     bounds_list = _bundle_translation_bounds(bundle) if aabb_pruning else None
     worker_count = _effective_numpy_workers(V, chunk, workers)
 
     def classify_range(range_bounds):
         v0, v1 = range_bounds
-        return v0, v1, _classify_voxel_chunk_bundle_numpy(
-            centers[v0:v1], bundle, bounds=bounds_list, aabb_pruning=aabb_pruning
+        result = _classify_voxel_chunk_bundle_numpy(
+            centers[v0:v1],
+            bundle,
+            bounds=bounds_list,
+            aabb_pruning=aabb_pruning,
+            include_orientations=include_orientations,
         )
+        if include_orientations:
+            ids, ori1, ori2 = result
+            return v0, v1, ids, ori1, ori2
+        ids = result
+        return v0, v1, ids
 
     if worker_count == 1:
         for range_bounds in _progress_iter(
             ranges, progress, total=len(ranges),
             desc="classify numpy bundle voxels", unit="chunk"
         ):
-            v0, v1, ids = classify_range(range_bounds)
-            yarn_id[v0:v1] = ids
+            result = classify_range(range_bounds)
+            if include_orientations:
+                v0, v1, ids, ori1, ori2 = result
+                yarn_id[v0:v1] = ids
+                orientation1[v0:v1] = ori1
+                orientation2[v0:v1] = ori2
+            else:
+                v0, v1, ids = result
+                yarn_id[v0:v1] = ids
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             results = executor.map(classify_range, ranges)
-            for v0, v1, ids in _progress_iter(
+            for result in _progress_iter(
                 results, progress, total=len(ranges),
                 desc="classify numpy bundle voxels", unit="chunk"
             ):
-                yarn_id[v0:v1] = ids
+                if include_orientations:
+                    v0, v1, ids, ori1, ori2 = result
+                    yarn_id[v0:v1] = ids
+                    orientation1[v0:v1] = ori1
+                    orientation2[v0:v1] = ori2
+                else:
+                    v0, v1, ids = result
+                    yarn_id[v0:v1] = ids
+    if include_orientations:
+        return yarn_id, orientation1, orientation2
     return yarn_id
 
 
@@ -1674,7 +1776,8 @@ def _classify_voxels_numpy(centers: np.ndarray,
                            chunk: int = DEFAULT_NUMPY_CHUNK_VOXELS,
                            workers: Optional[int] = None,
                            aabb_pruning: bool = True,
-                           progress: Any = False) -> np.ndarray:
+                           progress: Any = False,
+                           include_orientations: bool = False) -> Any:
     """Classify all voxel centers with the numpy backend.
 
     Parameters
@@ -1702,6 +1805,12 @@ def _classify_voxels_numpy(centers: np.ndarray,
     """
     V = centers.shape[0]
     yarn_id = np.full(V, -1, dtype=np.int32)
+    orientation1 = (
+        np.zeros((V, 3), dtype=centers.dtype) if include_orientations else None
+    )
+    orientation2 = (
+        np.zeros((V, 3), dtype=centers.dtype) if include_orientations else None
+    )
     ranges = [(v0, min(v0 + chunk, V)) for v0 in range(0, V, chunk)]
     bounds_list = [_snapshot_translation_bounds(s) for s in snapshots] if aabb_pruning else None
 
@@ -1710,26 +1819,51 @@ def _classify_voxels_numpy(centers: np.ndarray,
     def classify_range(range_bounds):
         """Classify one ``(start, stop)`` center slice for executor.map."""
         v0, v1 = range_bounds
-        return v0, v1, _classify_voxel_chunk_numpy(
-            centers[v0:v1], snapshots, bounds=bounds_list, aabb_pruning=aabb_pruning
+        result = _classify_voxel_chunk_numpy(
+            centers[v0:v1],
+            snapshots,
+            bounds=bounds_list,
+            aabb_pruning=aabb_pruning,
+            include_orientations=include_orientations,
         )
+        if include_orientations:
+            ids, ori1, ori2 = result
+            return v0, v1, ids, ori1, ori2
+        ids = result
+        return v0, v1, ids
 
     if worker_count == 1:
         for range_bounds in _progress_iter(
             ranges, progress, total=len(ranges),
             desc="classify numpy voxels", unit="chunk"
         ):
-            v0, v1, ids = classify_range(range_bounds)
-            yarn_id[v0:v1] = ids
+            result = classify_range(range_bounds)
+            if include_orientations:
+                v0, v1, ids, ori1, ori2 = result
+                yarn_id[v0:v1] = ids
+                orientation1[v0:v1] = ori1
+                orientation2[v0:v1] = ori2
+            else:
+                v0, v1, ids = result
+                yarn_id[v0:v1] = ids
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             results = executor.map(classify_range, ranges)
-            for v0, v1, ids in _progress_iter(
+            for result in _progress_iter(
                 results, progress, total=len(ranges),
                 desc="classify numpy voxels", unit="chunk"
             ):
-                yarn_id[v0:v1] = ids
+                if include_orientations:
+                    v0, v1, ids, ori1, ori2 = result
+                    yarn_id[v0:v1] = ids
+                    orientation1[v0:v1] = ori1
+                    orientation2[v0:v1] = ori2
+                else:
+                    v0, v1, ids = result
+                    yarn_id[v0:v1] = ids
 
+    if include_orientations:
+        return yarn_id, orientation1, orientation2
     return yarn_id
 
 
@@ -2386,6 +2520,7 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
                             workers: Optional[int] = None,
                             verbose: bool = True,
                             include_centers: bool = False,
+                            include_orientations: bool = False,
                             output: str = "backend",
                             aabb_pruning: bool = True,
                             progress: Any = False) -> VoxelGridData:
@@ -2408,6 +2543,11 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
         raise RuntimeError("No yarn snapshots provided")
 
     backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
+    if include_orientations and backend_cfg.backend == "torch":
+        raise ValueError(
+            "include_orientations currently supports numpy classification; "
+            'use backend="numpy", output="torch" for tensor output.'
+        )
 
     def log(msg):
         """Print one timing/status line when verbose output is enabled."""
@@ -2422,6 +2562,8 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
     centers_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
     centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz, dtype=centers_dtype)
     centers_out = None
+    orientation1 = None
+    orientation2 = None
 
     t0 = time.perf_counter()
     if backend_cfg.backend == "torch":
@@ -2460,10 +2602,17 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
         actual_workers = _effective_numpy_workers(
             centers_np.shape[0], chunk_voxels, backend_cfg.workers
         )
-        yarn_id = _classify_voxels_numpy(
+        classified = _classify_voxels_numpy(
             centers_np, snapshots_np, chunk=chunk_voxels, workers=backend_cfg.workers,
-            aabb_pruning=aabb_pruning, progress=progress
+            aabb_pruning=aabb_pruning, progress=progress,
+            include_orientations=include_orientations,
         )
+        if include_orientations:
+            yarn_id, orientation1_flat, orientation2_flat = classified
+            orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+            orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+        else:
+            yarn_id = classified
         t_classify = time.perf_counter() - t0
         log(
             f"classified {centers_np.shape[0]:,} cached voxels with numpy/"
@@ -2483,6 +2632,8 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
         dtype=dtype,
         timings=dict(extract=0.0, pack=t_pack, classify=t_classify),
         centers=centers_out,
+        orientation1=orientation1,
+        orientation2=orientation2,
         aabb_pruning=aabb_pruning,
         storage="torch" if backend_cfg.backend == "torch" else "numpy",
     )
@@ -2498,6 +2649,7 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
                                   workers: Optional[int] = None,
                                   verbose: bool = True,
                                   include_centers: bool = False,
+                                  include_orientations: bool = False,
                                   output: str = "backend",
                                   aabb_pruning: bool = True,
                                   progress: Any = False) -> VoxelGridData:
@@ -2521,6 +2673,11 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
         raise RuntimeError("No yarn snapshots provided")
 
     backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
+    if include_orientations and backend_cfg.backend == "torch":
+        raise ValueError(
+            "include_orientations currently supports numpy classification; "
+            'use backend="numpy", output="torch" for tensor output.'
+        )
 
     if backend_cfg.backend == "torch":
         t0 = time.perf_counter()
@@ -2539,6 +2696,7 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
             workers=workers,
             verbose=verbose,
             include_centers=include_centers,
+            include_orientations=include_orientations,
             output=output,
             aabb_pruning=aabb_pruning,
             progress=progress,
@@ -2559,6 +2717,8 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
     centers_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
     centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz, dtype=centers_dtype)
     centers_out = None
+    orientation1 = None
+    orientation2 = None
 
     t0 = time.perf_counter()
     bundle_np = _bundle_as_dtype(bundle, backend_cfg.np_dtype)
@@ -2569,14 +2729,21 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
     actual_workers = _effective_numpy_workers(
         centers_np.shape[0], chunk_voxels, backend_cfg.workers
     )
-    yarn_id = _classify_voxels_bundle_numpy(
+    classified = _classify_voxels_bundle_numpy(
         centers_np,
         bundle_np,
         chunk=chunk_voxels,
         workers=backend_cfg.workers,
         aabb_pruning=aabb_pruning,
         progress=progress,
+        include_orientations=include_orientations,
     )
+    if include_orientations:
+        yarn_id, orientation1_flat, orientation2_flat = classified
+        orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+        orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+    else:
+        yarn_id = classified
     t_classify = time.perf_counter() - t0
     log(
         f"classified {centers_np.shape[0]:,} bundle voxels with numpy/"
@@ -2595,6 +2762,8 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
         dtype=dtype,
         timings=dict(extract=0.0, unpack=0.0, pack=t_pack, classify=t_classify),
         centers=centers_out,
+        orientation1=orientation1,
+        orientation2=orientation2,
         aabb_pruning=aabb_pruning,
         storage="numpy",
     )
@@ -2610,6 +2779,7 @@ def voxelize_textile_data(textile: CTextile,
                           workers: Optional[int] = None,
                           verbose: bool = True,
                           include_centers: bool = False,
+                          include_orientations: bool = False,
                           output: str = "backend",
                           aabb_pruning: bool = True,
                           progress: Any = False) -> VoxelGridData:
@@ -2642,6 +2812,13 @@ def voxelize_textile_data(textile: CTextile,
     include_centers : bool
         Include voxel centers in the returned data object. Disabled by default
         to keep solver handoff memory-light.
+    include_orientations : bool
+        Include ``orientation1`` and ``orientation2`` grids with shape
+        ``(nz, ny, nx, 3)``. ``orientation1`` is the yarn tangent and
+        ``orientation2`` is the yarn up vector at the nearest yarn node.
+        Matrix voxels are filled with zero vectors. The orientation field is
+        currently computed by the numpy classifier; use ``backend="numpy",
+        output="torch"`` for tensor output.
     output : {"backend", "numpy", "torch"}
         Storage backend for returned arrays. ``backend`` preserves the
         classification result storage; ``numpy`` forces CPU numpy arrays;
@@ -2670,6 +2847,11 @@ def voxelize_textile_data(textile: CTextile,
         adaptive_levels=0, max_adaptive_cells=nx * ny * nz
     )
     backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
+    if include_orientations and backend_cfg.backend == "torch":
+        raise ValueError(
+            "include_orientations currently supports numpy classification; "
+            'use backend="numpy", output="torch" for tensor output.'
+        )
 
     def log(msg):
         """Print one timing/status line when verbose output is enabled."""
@@ -2701,6 +2883,7 @@ def voxelize_textile_data(textile: CTextile,
             workers=workers,
             verbose=verbose,
             include_centers=include_centers,
+            include_orientations=include_orientations,
             output=output,
             aabb_pruning=aabb_pruning,
             progress=progress,
@@ -2714,6 +2897,8 @@ def voxelize_textile_data(textile: CTextile,
     centers_dtype = {"float32": np.float32, "float64": np.float64}[dtype]
     centers_np = _structured_voxel_centers(lo, hi, nx, ny, nz, dtype=centers_dtype)
     centers_out = None
+    orientation1 = None
+    orientation2 = None
 
     t0 = time.perf_counter()
     if backend_cfg.backend == "torch":
@@ -2749,10 +2934,17 @@ def voxelize_textile_data(textile: CTextile,
         actual_workers = _effective_numpy_workers(
             centers_np.shape[0], chunk_voxels, backend_cfg.workers
         )
-        yarn_id = _classify_voxels_numpy(
+        classified = _classify_voxels_numpy(
             centers_np, snapshots_np, chunk=chunk_voxels, workers=backend_cfg.workers,
-            aabb_pruning=aabb_pruning, progress=progress
+            aabb_pruning=aabb_pruning, progress=progress,
+            include_orientations=include_orientations,
         )
+        if include_orientations:
+            yarn_id, orientation1_flat, orientation2_flat = classified
+            orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+            orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+        else:
+            yarn_id = classified
         t_classify = time.perf_counter() - t0
         log(
             f"classified {centers_np.shape[0]:,} voxels with numpy/"
@@ -2773,6 +2965,8 @@ def voxelize_textile_data(textile: CTextile,
         dtype=dtype,
         timings=dict(extract=t_extract, pack=t_pack, classify=t_classify),
         centers=centers_out,
+        orientation1=orientation1,
+        orientation2=orientation2,
         aabb_pruning=aabb_pruning,
         storage="torch" if backend_cfg.backend == "torch" else "numpy",
     )
