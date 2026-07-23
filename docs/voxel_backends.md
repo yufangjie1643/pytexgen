@@ -410,6 +410,23 @@ dedicated stream, records consumer streams for allocator safety, and reports
 `transferred_bytes`, `wait_seconds`, and `recorded_tensors`. Individual tensors
 can be passed directly through DLPack to JAX, CuPy, or Warp.
 
+Run the correctness-gated storage and transfer benchmark on production
+hardware:
+
+```bash
+python bench_training_data.py \
+  --batch-size 8 --num-workers 4 --repeat 5 --device cuda \
+  --min-read-speedup 1.5 --min-prefetch-speedup 1.0 \
+  --json-out build/training_data_benchmark.json --check
+```
+
+The default fixture contains 32 identical logical records in native shards and
+compressed NPZ at `64³`. The command exits nonzero if values or checksums differ,
+native warm reads are less than 1.5× NPZ, prefetch wait regresses, H2D byte
+accounting differs, or the model loss/gradients are non-finite. JSON output also
+records first-pass/warm median/P90 throughput, batch waits, RSS, storage sizes,
+CPU/GPU/software versions, and the repository commit.
+
 When the same textile is voxelized repeatedly, cache the TexGen geometry
 snapshot once:
 

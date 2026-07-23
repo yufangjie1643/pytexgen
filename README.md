@@ -504,6 +504,19 @@ Torch/CUDA benchmark when torch is installed:
 python bench_gpu_voxelizer_backends.py --include-torch --device cuda
 ```
 
+Checked training-store and CUDA-prefetch acceptance:
+
+```bash
+python bench_training_data.py \
+  --batch-size 8 --num-workers 4 --repeat 5 --device cuda \
+  --min-read-speedup 1.5 --min-prefetch-speedup 1.0 \
+  --json-out build/training_data_benchmark.json --check
+```
+
+This generates identical `64³` records in native shards and compressed NPZ,
+compares every value, audits checksums, measures cold/warm throughput and H2D
+wait, checks exact selected-byte accounting, and runs one finite 3D CNN step.
+
 Correctness-gated material direction/stiffness benchmark:
 
 ```bash
