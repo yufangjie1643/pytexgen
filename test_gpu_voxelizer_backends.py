@@ -938,6 +938,12 @@ class VoxelizerBackendTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "field"):
             data.to_dlpack("bad_field")
 
+    def test_voxel_grid_data_to_dlpack_is_documented_as_legacy(self):
+        doc = inspect.getdoc(self.voxelizer.VoxelGridData.to_dlpack)
+
+        self.assertIn("legacy", doc.lower())
+        self.assertIn("SimulationSample.array", doc)
+
     def test_aabb_pruning_matches_unpruned_numpy(self):
         self.patch_extract_snapshots()
         with tempfile.TemporaryDirectory() as tmp:

@@ -594,6 +594,29 @@ class SimulationSample:
         getter = fields.get(name)
         return None if getter is None else getter()
 
+    def _materialize_voxel_field(self, name: str):
+        if name == "voxel.occupancy":
+            return self.voxels.grid >= 0
+        if name != "voxel.material_id":
+            raise KeyError(f"unknown derived field {name!r}")
+
+        shape = tuple(self.voxels.shape)
+        if _is_torch_tensor(self.stiffness.material_ids):
+            result = torch.zeros(
+                shape,
+                dtype=self.stiffness.material_ids.dtype,
+                device=self.stiffness.material_ids.device,
+            )
+            result.reshape(-1)[
+                self.stiffness.voxel_indices.to(dtype=torch.long)
+            ] = self.stiffness.material_ids
+            return result
+        result = np.zeros(shape, dtype=self.stiffness.material_ids.dtype)
+        result.reshape(-1)[
+            np.asarray(self.stiffness.voxel_indices, dtype=np.int64)
+        ] = self.stiffness.material_ids
+        return result
+
     def array(
         self,
         name: str,
@@ -608,12 +631,225 @@ class SimulationSample:
                 f"unknown or unavailable field {name!r}; "
                 f"available fields: {available}"
             )
+        if layout == "acdm":
+            if name != "stiffness.yarn_c21":
+                raise ValueError(
+                    f"layout {layout!r} is not supported for {name!r}"
+                )
+            if not copy:
+                raise ValueError("ACDM layout allocates; pass copy=True")
+            return self.stiffness.to_acdm(batch=True)
         if layout != "native":
-            raise ValueError(f"layout {layout!r} is not supported for {name!r}")
+            raise ValueError(
+                f"layout {layout!r} is not supported for {name!r}"
+            )
         resident = self._resident_field(name)
         if resident is None:
-            raise ValueError(f"{name!r} is derived; pass copy=True")
+            if not copy:
+                raise ValueError(f"{name!r} is derived; pass copy=True")
+            return self._materialize_voxel_field(name)
         return _copy_array(resident) if copy else resident
+
+    def as_dict(
+        self,
+        *,
+        layout: str = "native",
+        copy: bool = False,
+    ):
+        """Return available fields, excluding allocating fields by default."""
+        if copy:
+            names = self.field_names
+        else:
+            names = tuple(
+                name for name in self.field_names
+                if self._resident_field(name) is not None
+            )
+        return {
+            name: self.array(name, layout=layout, copy=copy)
+            for name in names
+        }
+
+    def _float_arrays(self):
+        arrays = [
+            self.voxels.aabb,
+            self.voxels.centers,
+            self.voxels.orientation1,
+            self.voxels.orientation2,
+            self.materials.c21,
+        ]
+        if self.orientation is not None:
+            arrays.extend(
+                (
+                    self.orientation.orientation1,
+                    self.orientation.orientation2,
+                )
+            )
+        if self.stiffness is not None:
+            arrays.extend(
+                (
+                    self.stiffness.matrix_c21,
+                    self.stiffness.yarn_c21,
+                )
+            )
+        return tuple(value for value in arrays if value is not None)
+
+    def _dtype_is_identity(self, storage: str, dtype: Any) -> bool:
+        if dtype is None:
+            return True
+        arrays = self._float_arrays()
+        if storage == "numpy":
+            expected = _numpy_float_dtype(dtype)
+            return all(np.dtype(value.dtype) == expected for value in arrays)
+        expected = _torch_float_dtype(dtype, arrays[0].dtype)
+        return all(value.dtype == expected for value in arrays)
+
+    def _device_is_identity(
+        self,
+        storage: str,
+        device: Optional[str],
+    ) -> bool:
+        if storage == "numpy":
+            _validate_numpy_device(device)
+            return self.storage == "numpy"
+        if self.storage != "torch":
+            return False
+        if device is None:
+            return True
+        requested = torch.device(device)
+        current = torch.device(self.device)
+        return (
+            requested.type == current.type
+            and (
+                requested.index is None
+                or requested.index == current.index
+            )
+        )
+
+    def _convert_stiffness(
+        self,
+        storage: str,
+        *,
+        device: Optional[str],
+        dtype: Any,
+        copy: bool,
+        orientation: Optional[SparseOrientationField],
+    ):
+        if self.stiffness is None:
+            return None
+        if (
+            orientation is not None
+            and _array_equal(
+                self.orientation.voxel_indices,
+                self.stiffness.voxel_indices,
+            )
+            and _array_equal(
+                self.orientation.yarn_ids,
+                self.stiffness.yarn_ids,
+            )
+        ):
+            voxel_indices = orientation.voxel_indices
+            yarn_ids = orientation.yarn_ids
+        else:
+            voxel_indices = _convert_integer_array(
+                self.stiffness.voxel_indices,
+                storage,
+                device=device,
+                copy=copy,
+            )
+            yarn_ids = _convert_integer_array(
+                self.stiffness.yarn_ids,
+                storage,
+                device=device,
+                copy=copy,
+            )
+        return SparseStiffnessField(
+            matrix_c21=_convert_float_array(
+                self.stiffness.matrix_c21,
+                storage,
+                device=device,
+                dtype=dtype,
+                copy=copy,
+            ),
+            voxel_indices=voxel_indices,
+            yarn_ids=yarn_ids,
+            material_ids=_convert_integer_array(
+                self.stiffness.material_ids,
+                storage,
+                device=device,
+                copy=copy,
+            ),
+            yarn_c21=_convert_float_array(
+                self.stiffness.yarn_c21,
+                storage,
+                device=device,
+                dtype=dtype,
+                copy=copy,
+            ),
+            grid_shape=self.stiffness.grid_shape,
+            unit=self.stiffness.unit,
+            order=self.stiffness.order,
+        )
+
+    def to(
+        self,
+        storage: Optional[str] = None,
+        *,
+        device: Optional[str] = None,
+        dtype: Any = None,
+        copy: bool = False,
+    ) -> "SimulationSample":
+        """Explicitly convert all resident arrays as one validated sample."""
+        target = _validate_storage(storage, self.storage)
+        if (
+            not copy
+            and target == self.storage
+            and self._device_is_identity(target, device)
+            and self._dtype_is_identity(target, dtype)
+        ):
+            return self
+
+        conversion_device = device if target == "torch" else None
+        if target == "numpy":
+            _validate_numpy_device(device)
+        voxels = self.voxels.to(
+            target,
+            device=conversion_device,
+            dtype=dtype,
+            copy=copy,
+        )
+        if self.orientation is None:
+            orientation = None
+        elif self.orientation is self.voxels.sparse_orientation:
+            orientation = voxels.sparse_orientation
+        else:
+            orientation = self.orientation.to(
+                target,
+                device=conversion_device,
+                dtype=dtype,
+                copy=copy,
+            )
+        stiffness = self._convert_stiffness(
+            target,
+            device=conversion_device,
+            dtype=dtype,
+            copy=copy,
+            orientation=orientation,
+        )
+        materials = self.materials.to(
+            target,
+            device=conversion_device,
+            dtype=dtype,
+            copy=copy,
+        )
+        result = SimulationSample(
+            voxels=voxels,
+            orientation=orientation,
+            stiffness=stiffness,
+            materials=materials,
+            metadata={},
+        )
+        object.__setattr__(result, "metadata", self.metadata)
+        return result
 
 
 __all__ = ["MaterialTable", "SimulationSample"]

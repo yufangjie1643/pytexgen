@@ -858,7 +858,13 @@ class VoxelGridData:
         return obj
 
     def to_dlpack(self, field: str = "yarn_id"):
-        """Export one voxel data field as a DLPack capsule.
+        """Export one voxel data field as a legacy DLPack capsule.
+
+        New simulation integrations should prefer
+        ``SimulationSample.array(name)`` and pass the returned NumPy array or
+        Torch tensor directly to a consumer such as ``torch.from_dlpack``.
+        This method remains available for callers that require a
+        single-consumption capsule.
 
         Parameters
         ----------

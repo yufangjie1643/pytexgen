@@ -410,5 +410,211 @@ class SimulationSampleValidationTest(unittest.TestCase):
             )
 
 
+class SimulationSampleFieldTest(unittest.TestCase):
+    def setUp(self):
+        fixture = SimulationSampleValidationTest(
+            "test_construction_is_zero_copy_and_adopts_voxel_orientation"
+        )
+        fixture.setUp()
+        self.fixture = fixture
+        self.sample_module = fixture.sample_module
+        self.sample = fixture.make_sample()
+
+    def test_derived_fields_require_explicit_copy_and_use_physical_ids(self):
+        with self.assertRaisesRegex(ValueError, "copy=True"):
+            self.sample.array("voxel.occupancy")
+        with self.assertRaisesRegex(ValueError, "copy=True"):
+            self.sample.array("voxel.material_id")
+
+        occupancy = self.sample.array("voxel.occupancy", copy=True)
+        material_grid = self.sample.array("voxel.material_id", copy=True)
+
+        np.testing.assert_array_equal(
+            occupancy,
+            np.array([[[False, True], [True, False]]]),
+        )
+        np.testing.assert_array_equal(
+            material_grid,
+            np.array([[[0, 7], [9, 0]]], dtype=np.int32),
+        )
+        self.assertFalse(
+            np.array_equal(material_grid, self.sample.voxels.material_id())
+        )
+
+    def test_acdm_layout_requires_copy_and_matches_sparse_reference(self):
+        with self.assertRaisesRegex(ValueError, "copy=True"):
+            self.sample.array(
+                "stiffness.yarn_c21",
+                layout="acdm",
+            )
+
+        dense = self.sample.array(
+            "stiffness.yarn_c21",
+            layout="acdm",
+            copy=True,
+        )
+
+        self.assertEqual(dense.shape, (1, 6, 6, 1, 2, 2))
+        np.testing.assert_allclose(
+            dense,
+            self.sample.stiffness.to_acdm(batch=True),
+        )
+
+    def test_native_copy_and_dictionary_semantics_are_explicit(self):
+        resident = self.sample.array("material.c21")
+        copied = self.sample.array("material.c21", copy=True)
+        zero_copy_dict = self.sample.as_dict(copy=False)
+        complete_dict = self.sample.as_dict(copy=True)
+
+        self.assertIs(resident, self.sample.materials.c21)
+        self.assertIsNot(copied, resident)
+        np.testing.assert_array_equal(copied, resident)
+        self.assertNotIn("voxel.occupancy", zero_copy_dict)
+        self.assertNotIn("voxel.material_id", zero_copy_dict)
+        self.assertIn("voxel.occupancy", complete_dict)
+        self.assertIn("voxel.material_id", complete_dict)
+        self.assertIs(
+            zero_copy_dict["orientation.voxel_indices"],
+            self.sample.orientation.voxel_indices,
+        )
+
+    def test_unknown_unavailable_and_unsupported_layouts_are_clear(self):
+        with self.assertRaisesRegex(KeyError, "available fields"):
+            self.sample.array("unknown.field")
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            self.sample.array("material.c21", layout="channels_first")
+
+        voxels = replace(self.sample.voxels, sparse_orientation=None)
+        matrix_only = self.sample_module.SimulationSample(
+            voxels=voxels,
+            materials=self.sample.materials,
+        )
+        self.assertNotIn("voxel.material_id", matrix_only.field_names)
+        self.assertNotIn("orientation.primary", matrix_only.field_names)
+        with self.assertRaisesRegex(KeyError, "unavailable"):
+            matrix_only.array("voxel.material_id", copy=True)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_to_converts_all_arrays_and_reuses_one_sparse_topology(self):
+        torch_sample = self.sample.to("torch", dtype=torch.float32)
+
+        self.assertEqual(torch_sample.storage, "torch")
+        self.assertEqual(torch_sample.device, "cpu")
+        self.assertEqual(torch_sample.materials.c21.dtype, torch.float32)
+        self.assertEqual(
+            torch_sample.orientation.orientation1.dtype,
+            torch.float32,
+        )
+        self.assertEqual(torch_sample.stiffness.yarn_c21.dtype, torch.float32)
+        self.assertEqual(
+            torch_sample.materials.material_ids.dtype,
+            torch.int32,
+        )
+        self.assertIs(
+            torch_sample.orientation,
+            torch_sample.voxels.sparse_orientation,
+        )
+        self.assertIs(
+            torch_sample.stiffness.voxel_indices,
+            torch_sample.orientation.voxel_indices,
+        )
+        self.assertIs(
+            torch_sample.stiffness.yarn_ids,
+            torch_sample.orientation.yarn_ids,
+        )
+        self.assertEqual(torch_sample.metadata, self.sample.metadata)
+
+        restored = torch_sample.to("numpy", dtype=np.float64)
+        np.testing.assert_array_equal(
+            restored.stiffness.material_ids,
+            self.sample.stiffness.material_ids,
+        )
+        np.testing.assert_allclose(
+            restored.stiffness.yarn_c21,
+            self.sample.stiffness.yarn_c21,
+        )
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_to_returns_self_for_identity_and_clones_when_requested(self):
+        torch_sample = self.sample.to("torch", dtype=torch.float64)
+
+        self.assertIs(self.sample.to(copy=False), self.sample)
+        self.assertIs(
+            torch_sample.to(
+                "torch",
+                device="cpu",
+                dtype=torch.float64,
+                copy=False,
+            ),
+            torch_sample,
+        )
+        copied = torch_sample.to(copy=True)
+        self.assertIsNot(copied, torch_sample)
+        self.assertNotEqual(
+            copied.materials.c21.data_ptr(),
+            torch_sample.materials.c21.data_ptr(),
+        )
+        self.assertNotEqual(
+            copied.voxels.yarn_id.data_ptr(),
+            torch_sample.voxels.yarn_id.data_ptr(),
+        )
+
+
+@unittest.skipIf(torch is None, "PyTorch is not installed")
+class SimulationSampleDLPackTest(unittest.TestCase):
+    def setUp(self):
+        fixture = SimulationSampleValidationTest(
+            "test_construction_is_zero_copy_and_adopts_voxel_orientation"
+        )
+        fixture.setUp()
+        self.sample = fixture.make_sample().to(
+            "torch",
+            dtype=torch.float32,
+        )
+
+    def test_cpu_fields_share_the_original_allocation(self):
+        self.assertFalse(hasattr(self.sample, "__dlpack__"))
+
+        for name, field in self.sample.as_dict(copy=False).items():
+            with self.subTest(field=name):
+                shared = torch.from_dlpack(field)
+                self.assertEqual(shared.data_ptr(), field.data_ptr())
+                self.assertEqual(tuple(shared.shape), tuple(field.shape))
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(),
+        "CUDA is not available",
+    )
+    def test_cuda_fields_share_the_original_allocation(self):
+        cuda_sample = self.sample.to("torch", device="cuda")
+
+        for name, field in cuda_sample.as_dict(copy=False).items():
+            with self.subTest(field=name):
+                shared = torch.from_dlpack(field)
+                self.assertTrue(shared.is_cuda)
+                self.assertEqual(shared.data_ptr(), field.data_ptr())
+                self.assertEqual(shared.device, field.device)
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(),
+        "CUDA is not available",
+    )
+    def test_nondefault_cuda_stream_observes_producer_write(self):
+        cuda_sample = self.sample.to("torch", device="cuda")
+        field = cuda_sample.array("stiffness.yarn_c21")
+        expected = torch.full_like(field, 37.0)
+        producer = torch.cuda.Stream(device=field.device)
+        consumer = torch.cuda.Stream(device=field.device)
+
+        with torch.cuda.stream(producer):
+            field.copy_(expected)
+        with torch.cuda.stream(consumer):
+            shared = torch.from_dlpack(field)
+            observed = shared.clone()
+        consumer.synchronize()
+
+        torch.testing.assert_close(observed, expected)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
