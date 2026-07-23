@@ -230,6 +230,31 @@ def append_sample(
 
 
 class WriterTest(unittest.TestCase):
+    def test_rejects_incomplete_sample_protocol_before_field_access(self):
+        incomplete = mock.Mock(
+            spec=["array", "materials", "storage", "device"]
+        )
+        incomplete.array = mock.Mock()
+        incomplete.materials = mock.Mock(unit="GPa")
+        incomplete.storage = "numpy"
+        incomplete.device = "cpu"
+        with tempfile.TemporaryDirectory() as directory:
+            writer = SimulationDatasetWriter.create(
+                Path(directory) / "dataset", schema=make_schema()
+            )
+
+            with self.assertRaisesRegex(
+                TypeError, "SimulationSample protocol.*voxels"
+            ):
+                writer.append(
+                    incomplete,
+                    targets={"effective_c21": effective_c21()},
+                    sample_id="s0",
+                    group_id="g0",
+                    split="train",
+                    provenance=valid_provenance(),
+                )
+
     def test_writes_validated_fields_shared_offsets_aliases_and_statistics(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "dataset"

@@ -866,7 +866,13 @@ class SimulationDatasetWriter:
     ) -> None:
         if self._finalized:
             raise RuntimeError("cannot append after finalize")
-        required = ("array", "materials", "storage", "device")
+        required = (
+            "array",
+            "materials",
+            "voxels",
+            "storage",
+            "device",
+        )
         missing = tuple(
             name for name in required if not hasattr(sample, name)
         )
@@ -879,6 +885,16 @@ class SimulationDatasetWriter:
         if not hasattr(sample.materials, "unit"):
             raise TypeError(
                 "sample materials must expose an explicit unit"
+            )
+        missing_voxel_attributes = tuple(
+            name
+            for name in ("shape", "order")
+            if not hasattr(sample.voxels, name)
+        )
+        if missing_voxel_attributes:
+            raise TypeError(
+                "sample voxels must expose "
+                + ", ".join(missing_voxel_attributes)
             )
         if sample.storage != "numpy" or sample.device != "cpu":
             raise ValueError(
