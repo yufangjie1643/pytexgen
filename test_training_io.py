@@ -1,10 +1,12 @@
 """Tests for native sharded simulation training datasets."""
 
+import dataclasses
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -20,7 +22,10 @@ from TexGen.training_data import (
     TrainingFieldSpec,
     VOXEL_ORDER,
 )
-from TexGen.training_io import SimulationDatasetWriter
+from TexGen.training_io import (
+    DatasetIntegrityError,
+    SimulationDatasetWriter,
+)
 
 try:
     import torch
@@ -200,6 +205,24 @@ def valid_provenance(**overrides):
     }
     result.update(overrides)
     return result
+
+
+def append_sample(
+    writer,
+    *,
+    sample_id,
+    group_id,
+    split="train",
+    scale=1.0,
+):
+    writer.append(
+        make_sample(),
+        targets={"effective_c21": effective_c21(scale)},
+        sample_id=sample_id,
+        group_id=group_id,
+        split=split,
+        provenance=valid_provenance(),
+    )
 
 
 class WriterTest(unittest.TestCase):
@@ -497,6 +520,290 @@ class WriterTest(unittest.TestCase):
                     split="train",
                     provenance=valid_provenance(),
                 )
+
+
+class ResumeAndFinalizeTest(unittest.TestCase):
+    @staticmethod
+    def resumable_quality():
+        return DatasetQualityPolicy(require_unique_geometry=False)
+
+    def test_resume_restores_complete_shards_identity_groups_and_statistics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            schema = make_schema(shard_size=1)
+            quality = self.resumable_quality()
+            writer = SimulationDatasetWriter.create(
+                target,
+                schema=schema,
+                quality=quality,
+                generation={"seed": 4},
+            )
+            append_sample(
+                writer, sample_id="s0", group_id="g0", scale=1.0
+            )
+            self.assertTrue(
+                (
+                    target.with_name("dataset.incomplete")
+                    / "shards"
+                    / "shard_00000"
+                    / "shard.json"
+                ).is_file()
+            )
+
+            resumed = SimulationDatasetWriter.create(
+                target,
+                schema=schema,
+                quality=quality,
+                generation={"seed": 4},
+                resume=True,
+            )
+            with self.assertRaisesRegex(ValueError, "sample_id"):
+                append_sample(
+                    resumed,
+                    sample_id="s0",
+                    group_id="g1",
+                    scale=1.1,
+                )
+            with self.assertRaisesRegex(ValueError, "group.*split"):
+                append_sample(
+                    resumed,
+                    sample_id="s-leak",
+                    group_id="g0",
+                    split="test",
+                    scale=1.1,
+                )
+            append_sample(
+                resumed, sample_id="s1", group_id="g1", scale=2.0
+            )
+            resumed.finalize()
+
+            manifest = json.loads(
+                (target / "dataset.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["sample_count"], 2)
+            self.assertEqual(manifest["shard_count"], 2)
+            expected = (
+                effective_c21(1.0) + effective_c21(2.0)
+            ) / 2.0
+            np.testing.assert_allclose(
+                manifest["statistics"]["effective_c21"]["mean"],
+                expected,
+            )
+
+    def test_resume_removes_only_unjournaled_trailing_shard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            schema = make_schema(shard_size=1)
+            quality = self.resumable_quality()
+            writer = SimulationDatasetWriter.create(
+                target, schema=schema, quality=quality
+            )
+            append_sample(writer, sample_id="s0", group_id="g0")
+            staging = target.with_name("dataset.incomplete")
+            partial = staging / "shards" / "shard_00001"
+            partial.mkdir()
+            (partial / "partial.npy").write_bytes(b"incomplete")
+
+            resumed = SimulationDatasetWriter.create(
+                target,
+                schema=schema,
+                quality=quality,
+                resume=True,
+            )
+
+            self.assertFalse(partial.exists())
+            self.assertTrue(
+                (staging / "shards" / "shard_00000").is_dir()
+            )
+            append_sample(
+                resumed, sample_id="s1", group_id="g1", scale=1.2
+            )
+            resumed.finalize()
+            self.assertTrue(
+                (target / "shards" / "shard_00001").is_dir()
+            )
+
+    def test_resume_after_final_rename_failure_preserves_rejections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            schema = make_schema(shard_size=1)
+            quality = self.resumable_quality()
+            writer = SimulationDatasetWriter.create(
+                target,
+                schema=schema,
+                quality=quality,
+                generation={"seed": 8},
+            )
+            append_sample(writer, sample_id="s0", group_id="g0")
+            writer.reject(
+                sample_id="bad",
+                stage="label",
+                reason="residual",
+                metadata={"seed": 99},
+            )
+            real_replace = __import__("os").replace
+
+            def fail_final_rename(source, destination):
+                if Path(destination) == target:
+                    raise OSError("injected final rename failure")
+                return real_replace(source, destination)
+
+            with mock.patch(
+                "TexGen.training_io.os.replace",
+                side_effect=fail_final_rename,
+            ):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    writer.finalize()
+            self.assertFalse(target.exists())
+            self.assertTrue(
+                (
+                    target.with_name("dataset.incomplete")
+                    / "dataset.json"
+                ).is_file()
+            )
+
+            resumed = SimulationDatasetWriter.create(
+                target,
+                schema=schema,
+                quality=quality,
+                generation={"seed": 8},
+                resume=True,
+            )
+            resumed.finalize()
+
+            manifest = json.loads(
+                (target / "dataset.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["rejection_count"], 1)
+            rejection = json.loads(
+                (target / "rejections.jsonl")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            self.assertEqual(rejection["sample_id"], "bad")
+
+    def test_resume_refuses_changed_configuration_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            schema = make_schema(shard_size=1)
+            quality = self.resumable_quality()
+            writer = SimulationDatasetWriter.create(
+                target,
+                schema=schema,
+                quality=quality,
+                generation={"seed": 1},
+            )
+            append_sample(writer, sample_id="s0", group_id="g0")
+            staging = target.with_name("dataset.incomplete")
+
+            def snapshot():
+                return {
+                    path.relative_to(staging).as_posix(): path.read_bytes()
+                    for path in staging.rglob("*")
+                    if path.is_file()
+                }
+
+            before = snapshot()
+            mismatches = (
+                {
+                    "schema": dataclasses.replace(
+                        schema, shard_size=2
+                    ),
+                    "quality": quality,
+                    "generation": {"seed": 1},
+                },
+                {
+                    "schema": schema,
+                    "quality": DatasetQualityPolicy(
+                        require_unique_geometry=False,
+                        maximum_solver_residual=1e-6,
+                    ),
+                    "generation": {"seed": 1},
+                },
+                {
+                    "schema": schema,
+                    "quality": quality,
+                    "generation": {"seed": 2},
+                },
+            )
+            for kwargs in mismatches:
+                with self.subTest(kwargs=kwargs):
+                    with self.assertRaisesRegex(
+                        ValueError, "configuration"
+                    ):
+                        SimulationDatasetWriter.create(
+                            target, resume=True, **kwargs
+                        )
+                    self.assertEqual(snapshot(), before)
+
+    def test_resume_verifies_journaled_shard_checksums(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            schema = make_schema(shard_size=1)
+            quality = self.resumable_quality()
+            writer = SimulationDatasetWriter.create(
+                target, schema=schema, quality=quality
+            )
+            append_sample(writer, sample_id="s0", group_id="g0")
+            staging = target.with_name("dataset.incomplete")
+            journal = json.loads(
+                (staging / "journal.jsonl")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            first_path = next(iter(journal["shard"]["files"]))
+            array_path = staging / first_path
+            with array_path.open("r+b") as stream:
+                stream.seek(-1, 2)
+                byte = stream.read(1)
+                stream.seek(-1, 2)
+                stream.write(bytes([byte[0] ^ 0xFF]))
+
+            with self.assertRaisesRegex(
+                DatasetIntegrityError, "checksum"
+            ):
+                SimulationDatasetWriter.create(
+                    target,
+                    schema=schema,
+                    quality=quality,
+                    resume=True,
+                )
+
+    def test_finalize_is_idempotent_non_overwriting_and_cleans_temps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            writer = SimulationDatasetWriter.create(
+                target, schema=make_schema()
+            )
+            append_sample(writer, sample_id="s0", group_id="g0")
+            writer.finalize()
+            writer.finalize()
+            with self.assertRaisesRegex(RuntimeError, "finalize"):
+                append_sample(
+                    writer, sample_id="s1", group_id="g1"
+                )
+            with self.assertRaises(FileExistsError):
+                SimulationDatasetWriter.create(
+                    target, schema=make_schema()
+                )
+            self.assertEqual(
+                [path for path in target.rglob("*") if ".tmp" in path.name],
+                [],
+            )
+
+            other = Path(directory) / "appeared"
+            blocked = SimulationDatasetWriter.create(
+                other, schema=make_schema()
+            )
+            append_sample(
+                blocked, sample_id="s2", group_id="g2"
+            )
+            other.mkdir()
+            with self.assertRaises(FileExistsError):
+                blocked.finalize()
+            self.assertTrue(
+                other.with_name("appeared.incomplete").exists()
+            )
 
 
 if __name__ == "__main__":

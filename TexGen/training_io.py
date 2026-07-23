@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 from collections import Counter
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -98,21 +99,52 @@ def _detached_json(value: Any, label: str) -> Any:
         raise ValueError(f"{label} must be JSON-compatible") from exc
 
 
-def _write_json(path: Path, value: Any) -> None:
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except (AttributeError, OSError):
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
     text = json.dumps(
         _thaw_json(value),
         sort_keys=True,
         indent=2,
         allow_nan=False,
     )
-    path.write_text(text + "\n", encoding="utf-8")
+    _atomic_write_text(path, text + "\n")
 
 
 def _write_jsonl(path: Path, values: Any) -> None:
-    with path.open("w", encoding="utf-8", newline="\n") as stream:
-        for value in values:
-            stream.write(_canonical_json(value))
-            stream.write("\n")
+    text = "".join(
+        _canonical_json(value) + "\n" for value in values
+    )
+    _atomic_write_text(path, text)
+
+
+def _read_json(path: Path, label: str) -> Mapping[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DatasetFormatError(f"invalid {label}: {path}") from exc
+    if not isinstance(value, Mapping):
+        raise DatasetFormatError(f"{label} must be a mapping: {path}")
+    return value
 
 
 def _sha256_file(path: Path) -> str:
@@ -367,17 +399,6 @@ class SimulationDatasetWriter:
         self.staging = self.target.with_name(
             self.target.name + ".incomplete"
         )
-        if self.staging.exists():
-            if resume:
-                raise ValueError(
-                    "resume support requires a complete staging journal"
-                )
-            raise FileExistsError(
-                f"staging target already exists: {self.staging}"
-            )
-        self.target.parent.mkdir(parents=True, exist_ok=True)
-        self.staging.mkdir()
-        (self.staging / "shards").mkdir()
         self.schema = schema
         self.quality = quality
         self.generation = _detached_json(
@@ -386,6 +407,14 @@ class SimulationDatasetWriter:
         )
         self.generation_digest = hashlib.sha256(
             _canonical_json(self.generation).encode("utf-8")
+        ).hexdigest()
+        self.configuration = {
+            "dataset_schema": schema.to_dict(),
+            "quality": quality.to_dict(),
+            "generation": self.generation,
+        }
+        self.configuration_digest = hashlib.sha256(
+            _canonical_json(self.configuration).encode("utf-8")
         ).hexdigest()
         self._buffer = []
         self._samples = []
@@ -399,17 +428,343 @@ class SimulationDatasetWriter:
             for name in schema.statistics_fields
         }
         self._finalized = False
-        _write_json(
+        if self.staging.exists():
+            if not resume:
+                raise FileExistsError(
+                    f"staging target already exists: {self.staging}"
+                )
+            self._resume()
+            return
+        if resume:
+            raise FileNotFoundError(
+                f"no resumable staging dataset: {self.staging}"
+            )
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.staging.mkdir()
+        (self.staging / "shards").mkdir()
+        _atomic_write_json(
             self.staging / "staging.json",
             {
                 "schema": _SCHEMA,
                 "version": _VERSION,
-                "dataset_schema": schema.to_dict(),
-                "quality": quality.to_dict(),
-                "generation": self.generation,
+                **self.configuration,
                 "generation_digest": self.generation_digest,
+                "configuration_digest": self.configuration_digest,
             },
         )
+
+    def _dataset_path(self, relative: Any) -> Path:
+        if not isinstance(relative, str):
+            raise DatasetFormatError(
+                "dataset paths must be relative strings"
+            )
+        candidate = Path(relative)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise DatasetFormatError(
+                f"unsafe dataset path {relative!r}"
+            )
+        root = self.staging.resolve()
+        resolved = (self.staging / candidate).resolve()
+        if root != resolved and root not in resolved.parents:
+            raise DatasetFormatError(
+                f"unsafe dataset path {relative!r}"
+            )
+        return resolved
+
+    def _append_journal(self, value: Mapping[str, Any]) -> None:
+        path = self.staging / "journal.jsonl"
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(_canonical_json(value))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_directory(self.staging)
+
+    def _verify_resumed_shard(
+        self, shard: Mapping[str, Any], expected_number: int
+    ) -> None:
+        if shard.get("number") != expected_number:
+            raise DatasetFormatError(
+                "journaled shard numbers must be contiguous"
+            )
+        expected_path = (
+            Path("shards") / f"shard_{expected_number:05d}"
+        ).as_posix()
+        if shard.get("path") != expected_path:
+            raise DatasetFormatError(
+                f"journaled shard {expected_number} has an invalid path"
+            )
+        shard_path = self._dataset_path(expected_path)
+        if not shard_path.is_dir():
+            raise DatasetFormatError(
+                f"missing journaled shard directory {expected_path}"
+            )
+        files = shard.get("files")
+        fields = shard.get("fields")
+        if not isinstance(files, Mapping) or not isinstance(
+            fields, Mapping
+        ):
+            raise DatasetFormatError(
+                f"journaled shard {expected_number} metadata is invalid"
+            )
+        for relative, entry in files.items():
+            if not isinstance(entry, Mapping):
+                raise DatasetFormatError(
+                    f"invalid file entry in shard {expected_number}"
+                )
+            path = self._dataset_path(relative)
+            if not path.is_file():
+                raise DatasetFormatError(
+                    f"missing shard file {relative!r}"
+                )
+            observed_size = path.stat().st_size
+            if observed_size != entry.get("byte_count"):
+                raise DatasetIntegrityError(
+                    f"byte count mismatch for {relative!r}: "
+                    f"expected {entry.get('byte_count')}, "
+                    f"observed {observed_size}"
+                )
+            observed_digest = _sha256_file(path)
+            if observed_digest != entry.get("sha256"):
+                raise DatasetIntegrityError(
+                    f"checksum mismatch for {relative!r}: "
+                    f"expected {entry.get('sha256')}, "
+                    f"observed {observed_digest}"
+                )
+        for name, entry in fields.items():
+            if not isinstance(entry, Mapping):
+                raise DatasetFormatError(
+                    f"invalid field entry {name!r}"
+                )
+            for key in ("values", "offsets"):
+                if key in entry and entry[key] not in files:
+                    raise DatasetFormatError(
+                        f"field {name!r} references undeclared "
+                        f"{key} file"
+                    )
+        stored_shard = _read_json(
+            shard_path / "shard.json",
+            f"shard {expected_number} metadata",
+        )
+        if _canonical_json(stored_shard) != _canonical_json(shard):
+            raise DatasetIntegrityError(
+                f"journal and shard metadata disagree for "
+                f"shard {expected_number}"
+            )
+
+    def _restore_sample_record(
+        self,
+        value: Mapping[str, Any],
+        shard_number: int,
+        expected_row: int,
+    ) -> None:
+        if not isinstance(value, Mapping):
+            raise DatasetFormatError(
+                "journal sample records must be mappings"
+            )
+        sample_id = _validate_identifier(
+            value.get("sample_id"), "sample_id"
+        )
+        group_id = _validate_identifier(
+            value.get("group_id"), "group_id"
+        )
+        split = value.get("split")
+        if split not in {"train", "validation", "test"}:
+            raise DatasetFormatError(
+                f"invalid split in resumed sample {sample_id!r}"
+            )
+        if value.get("shard") != shard_number or value.get(
+            "row"
+        ) != expected_row:
+            raise DatasetFormatError(
+                f"invalid shard row for resumed sample {sample_id!r}"
+            )
+        geometry = value.get("geometry_digest")
+        if not isinstance(geometry, str) or len(geometry) != 64:
+            raise DatasetFormatError(
+                f"invalid geometry digest for sample {sample_id!r}"
+            )
+        if sample_id in self._sample_ids:
+            raise DatasetIntegrityError(
+                f"duplicate sample_id {sample_id!r} in journal"
+            )
+        if (
+            self.quality.require_unique_geometry
+            and geometry in self._geometry_digests
+        ):
+            raise DatasetIntegrityError(
+                f"duplicate geometry digest in journal for "
+                f"sample {sample_id!r}"
+            )
+        existing_split = self._group_splits.get(group_id)
+        if existing_split is not None and existing_split != split:
+            raise DatasetIntegrityError(
+                f"group {group_id!r} leaks across resumed splits"
+            )
+        restored = json.loads(_canonical_json(value))
+        self._sample_ids.add(sample_id)
+        self._geometry_digests.add(geometry)
+        self._group_splits[group_id] = split
+        self._samples.append(restored)
+
+    def _restore_statistics(self) -> None:
+        arrays = {}
+
+        def load(relative):
+            if relative not in arrays:
+                arrays[relative] = np.load(
+                    self._dataset_path(relative),
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
+            return arrays[relative]
+
+        for sample in self._samples:
+            if sample["split"] != "train":
+                continue
+            shard = self._shards[sample["shard"]]
+            row = sample["row"]
+            for name, accumulator in self._statistics.items():
+                entry = shard["fields"].get(name)
+                if not isinstance(entry, Mapping):
+                    raise DatasetFormatError(
+                        f"statistics field {name!r} is missing from "
+                        f"shard {sample['shard']}"
+                    )
+                values = load(entry["values"])
+                if entry.get("layout") == "fixed":
+                    value = values[row]
+                elif entry.get("layout") == "ragged":
+                    offsets = load(entry["offsets"])
+                    value = values[
+                        int(offsets[row]):int(offsets[row + 1])
+                    ]
+                else:
+                    raise DatasetFormatError(
+                        f"statistics field {name!r} has invalid layout"
+                    )
+                accumulator.update(value)
+
+    def _resume(self) -> None:
+        header = _read_json(
+            self.staging / "staging.json", "staging metadata"
+        )
+        if (
+            header.get("schema") != _SCHEMA
+            or header.get("version") != _VERSION
+        ):
+            raise DatasetFormatError(
+                "unsupported resumable staging schema"
+            )
+        if header.get(
+            "configuration_digest"
+        ) != self.configuration_digest or any(
+            _canonical_json(header.get(key))
+            != _canonical_json(self.configuration[key])
+            for key in ("dataset_schema", "quality", "generation")
+        ):
+            raise ValueError(
+                "resume configuration does not match staging dataset"
+            )
+
+        journal_path = self.staging / "journal.jsonl"
+        journal_records = []
+        if journal_path.exists():
+            try:
+                lines = journal_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            except OSError as exc:
+                raise DatasetFormatError(
+                    "cannot read staging journal"
+                ) from exc
+            for line_number, line in enumerate(lines, start=1):
+                if not line:
+                    raise DatasetFormatError(
+                        f"empty journal record at line {line_number}"
+                    )
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise DatasetFormatError(
+                        f"invalid journal record at line {line_number}"
+                    ) from exc
+                if not isinstance(record, Mapping):
+                    raise DatasetFormatError(
+                        f"journal line {line_number} must be a mapping"
+                    )
+                journal_records.append(record)
+
+        for record in journal_records:
+            record_type = record.get("type")
+            if record_type == "shard":
+                shard = record.get("shard")
+                samples = record.get("samples")
+                if not isinstance(shard, Mapping) or not isinstance(
+                    samples, list
+                ):
+                    raise DatasetFormatError(
+                        "invalid shard journal record"
+                    )
+                shard_number = len(self._shards)
+                self._verify_resumed_shard(shard, shard_number)
+                if len(samples) != shard.get("row_count"):
+                    raise DatasetFormatError(
+                        f"sample count mismatch for shard {shard_number}"
+                    )
+                self._shards.append(
+                    json.loads(_canonical_json(shard))
+                )
+                for row, sample in enumerate(samples):
+                    self._restore_sample_record(
+                        sample, shard_number, row
+                    )
+            elif record_type == "rejection":
+                rejection = record.get("rejection")
+                if not isinstance(rejection, Mapping):
+                    raise DatasetFormatError(
+                        "invalid rejection journal record"
+                    )
+                self._rejections.append(
+                    json.loads(_canonical_json(rejection))
+                )
+            else:
+                raise DatasetFormatError(
+                    f"unknown journal record type {record_type!r}"
+                )
+
+        expected_directories = {
+            f"shard_{index:05d}" for index in range(len(self._shards))
+        }
+        shards_path = self.staging / "shards"
+        if not shards_path.is_dir():
+            raise DatasetFormatError("missing staging shards directory")
+        trailing = []
+        for entry in shards_path.iterdir():
+            if entry.name in expected_directories:
+                continue
+            if (
+                not entry.is_dir()
+                or not entry.name.startswith("shard_")
+                or not entry.name[6:].isdigit()
+                or int(entry.name[6:]) < len(self._shards)
+            ):
+                raise DatasetFormatError(
+                    f"unexpected staging shard entry {entry.name!r}"
+                )
+            trailing.append(entry)
+
+        self._restore_statistics()
+        for entry in trailing:
+            shutil.rmtree(entry)
+        for transient in (
+            "dataset.json",
+            "samples.jsonl",
+            "rejections.jsonl",
+        ):
+            path = self.staging / transient
+            if path.exists():
+                path.unlink()
 
     def __enter__(self) -> "SimulationDatasetWriter":
         return self
@@ -563,8 +918,7 @@ class SimulationDatasetWriter:
             },
         }
         self._sample_ids.add(sample_id)
-        if self.quality.require_unique_geometry:
-            self._geometry_digests.add(geometry)
+        self._geometry_digests.add(geometry)
         self._group_splits[group_id] = split
         if split == "train":
             for name, accumulator in self._statistics.items():
@@ -583,19 +937,21 @@ class SimulationDatasetWriter:
     ) -> None:
         if self._finalized:
             raise RuntimeError("cannot reject after finalize")
-        self._rejections.append(
-            {
-                "sample_id": _validate_identifier(
-                    sample_id, "sample_id"
-                ),
-                "stage": _validate_identifier(stage, "stage"),
-                "reason": _validate_identifier(reason, "reason"),
-                "metadata": _detached_json(
-                    {} if metadata is None else metadata,
-                    "rejection metadata",
-                ),
-            }
+        rejection = {
+            "sample_id": _validate_identifier(
+                sample_id, "sample_id"
+            ),
+            "stage": _validate_identifier(stage, "stage"),
+            "reason": _validate_identifier(reason, "reason"),
+            "metadata": _detached_json(
+                {} if metadata is None else metadata,
+                "rejection metadata",
+            ),
+        }
+        self._append_journal(
+            {"type": "rejection", "rejection": rejection}
         )
+        self._rejections.append(rejection)
 
     def _save_array(
         self,
@@ -741,17 +1097,15 @@ class SimulationDatasetWriter:
             "files": files,
             "fields": field_entries,
         }
-        _write_json(shard_path / "shard.json", shard)
+        _atomic_write_json(shard_path / "shard.json", shard)
         self._shards.append(shard)
-        with (self.staging / "journal.jsonl").open(
-            "a", encoding="utf-8", newline="\n"
-        ) as stream:
-            stream.write(
-                _canonical_json(
-                    {"shard": shard, "samples": sample_records}
-                )
-            )
-            stream.write("\n")
+        self._append_journal(
+            {
+                "type": "shard",
+                "shard": shard,
+                "samples": sample_records,
+            }
+        )
         self._buffer.clear()
 
     def finalize(self) -> None:
@@ -819,8 +1173,9 @@ class SimulationDatasetWriter:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
         }
-        _write_json(self.staging / "dataset.json", manifest)
+        _atomic_write_json(self.staging / "dataset.json", manifest)
         os.replace(self.staging, self.target)
+        _fsync_directory(self.target.parent)
         self._finalized = True
 
 
