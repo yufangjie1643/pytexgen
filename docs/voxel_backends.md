@@ -425,3 +425,33 @@ metadata. `compute` compares with TexGen `GetPointInformation`; `practical`
 compares compact GPU persistence with `SaveVoxelMesh` plus `.ori/.eld` parsing.
 The large-run acceptance gate requires all two-model/two-resolution/two-mode
 records to be correct and at least 5x faster.
+
+### Simulation Interoperability Acceptance
+
+`bench_simulation_interop.py` checks the complete in-memory sample boundary:
+
+```bash
+python bench_simulation_interop.py \
+  --resolution 16 --repeat 3 --device cpu --min-speedup 0 --check \
+  --json-out build/simulation_interop_cpu.json
+
+python bench_simulation_interop.py \
+  --resolution 64 --repeat 5 --device cuda --min-speedup 5.0 --check \
+  --json-out build/simulation_interop_cuda.json
+```
+
+Each path has one independent warm-up. Reported `pytexgen_seconds` and
+`texgen_cpu_seconds` are medians of at least three synchronized runs. The CPU
+reference is the original `CRectangularVoxelMesh.SaveVoxelMesh` export plus
+`.eld`/`.ori` parsing; PyTexGen produces the voxel, sparse direction, rotated
+C21, and material fields directly on the requested device.
+
+The JSON records resolution, environment and GPU metadata, resident sparse and
+dense ACDM byte counts, timings, speedup, CPU field agreement, and FP32/FP64
+tolerances. `handoff_host_transfer_bytes` is zero only when every resident
+Torch field is consumed directly with `torch.from_dlpack`, remains on the same
+device, and has the same data pointer. Validation copies used after timing to
+compare phase IDs and dense ACDM values are not solver-handoff traffic.
+`--check` exits nonzero on pointer/device changes, nonzero handoff transfer,
+phase mismatch, stiffness tolerance failure, CPU-reference failure, or
+insufficient speedup.
