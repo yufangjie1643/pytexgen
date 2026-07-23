@@ -660,6 +660,9 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
                     output_bytes=0,
                 )
                 compute_record["yarn_count"] = yarn_count
+                compute_record["gpu_phase_timings_s"] = dict(
+                    gpu_data_torch.timings
+                )
                 records.append(compute_record)
 
                 gpu_persist_dir = case_dir / "gpu_fields"
@@ -707,6 +710,9 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
                     output_bytes=gpu_output_bytes,
                 )
                 practical_record["yarn_count"] = yarn_count
+                practical_record["gpu_phase_timings_s"] = dict(
+                    _gpu_saved[0].timings
+                )
                 records.append(practical_record)
                 print(
                     f"  compute={compute_record['gpu']['median_s']:.3f}s "
