@@ -7,6 +7,7 @@ import numpy as np
 
 from TexGen.training_data import (
     DatasetQualityPolicy,
+    CubicRotation,
     RaggedArray,
     RunningFieldStatistics,
     SimulationBatch,
@@ -18,6 +19,8 @@ from TexGen.training_data import (
     collate_training_examples,
     compute_training_statistics,
     deterministic_group_split,
+    proper_cubic_rotations,
+    rotate_engineering_voigt_c21,
 )
 
 try:
@@ -758,6 +761,518 @@ class StatisticsTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "empty"):
             accumulator.finalize(unit=None)
+
+
+def _pack_c21_reference(matrix):
+    return np.stack(
+        [
+            matrix[..., row, column]
+            for row in range(6)
+            for column in range(row, 6)
+        ],
+        axis=-1,
+    )
+
+
+def _unpack_c21_reference(c21):
+    result = np.zeros(c21.shape[:-1] + (6, 6), dtype=c21.dtype)
+    index = 0
+    for row in range(6):
+        for column in range(row, 6):
+            result[..., row, column] = c21[..., index]
+            result[..., column, row] = c21[..., index]
+            index += 1
+    return result
+
+
+def _rotate_c21_reference(c21, rotation):
+    pairs = (
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (1, 2),
+        (0, 2),
+        (0, 1),
+    )
+    matrix = _unpack_c21_reference(np.asarray(c21))
+    tensor = np.zeros(
+        matrix.shape[:-2] + (3, 3, 3, 3), dtype=matrix.dtype
+    )
+    for row, (i, j) in enumerate(pairs):
+        for column, (k, ell) in enumerate(pairs):
+            value = matrix[..., row, column]
+            tensor[..., i, j, k, ell] = value
+            tensor[..., j, i, k, ell] = value
+            tensor[..., i, j, ell, k] = value
+            tensor[..., j, i, ell, k] = value
+    rotated = np.einsum(
+        "iI,jJ,kK,lL,...IJKL->...ijkl",
+        rotation,
+        rotation,
+        rotation,
+        rotation,
+        tensor,
+    )
+    result = np.empty(matrix.shape, dtype=matrix.dtype)
+    for row, (i, j) in enumerate(pairs):
+        for column, (k, ell) in enumerate(pairs):
+            result[..., row, column] = rotated[..., i, j, k, ell]
+    return _pack_c21_reference(result)
+
+
+def make_rotation_schema():
+    yarn_group = "yarn_voxels"
+    material_group = "materials"
+    return TrainingDatasetSchema(
+        inputs=(
+            TrainingFieldSpec(
+                "voxel.material_id",
+                "input",
+                "fixed",
+                "int32",
+                (2, 2, 2),
+                semantic="material_id_grid",
+            ),
+            TrainingFieldSpec(
+                "orientation.voxel_indices",
+                "input",
+                "ragged",
+                "int64",
+                (),
+                semantic="flat_voxel_index",
+                ragged_group=yarn_group,
+            ),
+            TrainingFieldSpec(
+                "orientation.primary",
+                "input",
+                "ragged",
+                "float64",
+                (3,),
+                semantic="direction_vector",
+                ragged_group=yarn_group,
+            ),
+            TrainingFieldSpec(
+                "stiffness.yarn_c21",
+                "input",
+                "ragged",
+                "float64",
+                (21,),
+                "GPa",
+                "global_engineering_voigt_c21",
+                yarn_group,
+            ),
+            TrainingFieldSpec(
+                "stiffness.matrix_c21",
+                "input",
+                "fixed",
+                "float64",
+                (21,),
+                "GPa",
+                "global_engineering_voigt_c21",
+            ),
+            TrainingFieldSpec(
+                "stiffness.voxel_c21",
+                "input",
+                "fixed",
+                "float64",
+                (2, 2, 2, 21),
+                "GPa",
+                "global_engineering_voigt_c21",
+            ),
+            TrainingFieldSpec(
+                "voxel.direction",
+                "input",
+                "fixed",
+                "float64",
+                (2, 2, 2, 3),
+                semantic="direction_vector_field",
+            ),
+            TrainingFieldSpec(
+                "domain.aabb",
+                "input",
+                "fixed",
+                "float64",
+                (2, 3),
+                semantic="aabb",
+            ),
+            TrainingFieldSpec(
+                "material.ids",
+                "input",
+                "ragged",
+                "int32",
+                (),
+                semantic="material_id",
+                ragged_group=material_group,
+            ),
+            TrainingFieldSpec(
+                "material.c21",
+                "input",
+                "ragged",
+                "float64",
+                (21,),
+                "GPa",
+                "local_engineering_voigt_c21",
+                material_group,
+            ),
+        ),
+        targets=(
+            TrainingFieldSpec(
+                "effective_c21",
+                "target",
+                "fixed",
+                "float64",
+                (21,),
+                "GPa",
+                "engineering_voigt_c21",
+            ),
+        ),
+        grid_shape=(2, 2, 2),
+        voxel_order=VOXEL_ORDER,
+        shard_size=2,
+    )
+
+
+def make_rotation_example():
+    base = np.arange(1.0, 37.0).reshape(6, 6)
+    general = base @ base.T + 10.0 * np.eye(6)
+    c21 = _pack_c21_reference(general)
+    matrix = _pack_c21_reference(
+        np.diag([2.0, 3.0, 5.0, 7.0, 11.0, 13.0])
+    )
+    offsets = np.array([0, 2], dtype=np.int64)
+    material_offsets = np.array([0, 2], dtype=np.int64)
+    return TrainingExample(
+        inputs={
+            "voxel.material_id": np.arange(
+                8, dtype=np.int32
+            ).reshape(2, 2, 2),
+            "orientation.voxel_indices": RaggedArray(
+                np.array([0, 3], dtype=np.int64), offsets
+            ),
+            "orientation.primary": RaggedArray(
+                np.array(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+                ),
+                offsets,
+            ),
+            "stiffness.yarn_c21": RaggedArray(
+                np.stack((c21, matrix)), offsets
+            ),
+            "stiffness.matrix_c21": matrix.copy(),
+            "material.ids": RaggedArray(
+                np.array([0, 7], dtype=np.int32),
+                material_offsets,
+            ),
+            "material.c21": RaggedArray(
+                np.stack((matrix, c21)), material_offsets
+            ),
+        },
+        targets={"effective_c21": c21.copy()},
+        sample_id="rotation-sample",
+        group_id="rotation-group",
+        split="train",
+        metadata={"source": {"seed": 4}},
+    )
+
+
+class CubicRotationTest(unittest.TestCase):
+    @staticmethod
+    def rotation_z_90():
+        return np.array(
+            [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
+            dtype=np.int8,
+        )
+
+    def test_rotation_set_contains_24_unique_proper_matrices(self):
+        rotations = proper_cubic_rotations()
+
+        self.assertEqual(len(rotations), 24)
+        self.assertEqual(
+            len({tuple(rotation.reshape(-1)) for rotation in rotations}),
+            24,
+        )
+        for rotation in rotations:
+            self.assertEqual(rotation.dtype, np.int8)
+            np.testing.assert_array_equal(
+                rotation @ rotation.T, np.eye(3, dtype=np.int8)
+            )
+            self.assertEqual(round(np.linalg.det(rotation)), 1)
+            self.assertTrue(np.isin(rotation, (-1, 0, 1)).all())
+
+    def test_c21_rotation_matches_independent_fourth_order_reference(self):
+        base = np.arange(1.0, 37.0).reshape(6, 6) / 11.0
+        matrix = base @ base.T + 2.0 * np.eye(6)
+        c21 = _pack_c21_reference(matrix)
+
+        for rotation in proper_cubic_rotations():
+            with self.subTest(rotation=rotation.tolist()):
+                actual = rotate_engineering_voigt_c21(c21, rotation)
+                expected = _rotate_c21_reference(c21, rotation)
+                np.testing.assert_allclose(
+                    actual, expected, rtol=1e-12, atol=1e-12
+                )
+
+    def test_explicit_rotation_couples_grid_sparse_direction_and_c21(self):
+        schema = make_rotation_schema()
+        example = make_rotation_example()
+        transform = CubicRotation(seed=3)
+        rotation = self.rotation_z_90()
+        rotation_id = next(
+            index
+            for index, candidate in enumerate(proper_cubic_rotations())
+            if np.array_equal(candidate, rotation)
+        )
+
+        rotated = transform.apply(example, schema, rotation_id)
+
+        expected_grid = np.empty((2, 2, 2), dtype=np.int32)
+        for z in range(2):
+            for y in range(2):
+                for x in range(2):
+                    old = np.array([x, y, z])
+                    new = rotation @ (2 * old - 1)
+                    new = ((new + 1) // 2).astype(int)
+                    expected_grid[new[2], new[1], new[0]] = (
+                        example.inputs["voxel.material_id"][z, y, x]
+                    )
+        np.testing.assert_array_equal(
+            rotated.inputs["voxel.material_id"], expected_grid
+        )
+
+        old_indices = example.inputs[
+            "orientation.voxel_indices"
+        ].values
+        expected_indices = []
+        for index in old_indices:
+            x = int(index) % 2
+            y = (int(index) // 2) % 2
+            z = int(index) // 4
+            new = rotation @ (2 * np.array([x, y, z]) - 1)
+            new = ((new + 1) // 2).astype(int)
+            expected_indices.append(
+                new[0] + 2 * new[1] + 4 * new[2]
+            )
+        order = np.argsort(expected_indices)
+        np.testing.assert_array_equal(
+            rotated.inputs["orientation.voxel_indices"].values,
+            np.asarray(expected_indices)[order],
+        )
+        expected_directions = (
+            example.inputs["orientation.primary"].values @ rotation.T
+        )[order]
+        np.testing.assert_allclose(
+            rotated.inputs["orientation.primary"].values,
+            expected_directions,
+        )
+        expected_yarn_c21 = rotate_engineering_voigt_c21(
+            example.inputs["stiffness.yarn_c21"].values,
+            rotation,
+        )[order]
+        np.testing.assert_allclose(
+            rotated.inputs["stiffness.yarn_c21"].values,
+            expected_yarn_c21,
+        )
+        np.testing.assert_allclose(
+            rotated.inputs["stiffness.matrix_c21"],
+            rotate_engineering_voigt_c21(
+                example.inputs["stiffness.matrix_c21"], rotation
+            ),
+        )
+        np.testing.assert_allclose(
+            rotated.targets["effective_c21"],
+            rotate_engineering_voigt_c21(
+                example.targets["effective_c21"], rotation
+            ),
+        )
+        self.assertIs(
+            rotated.inputs["material.ids"].values,
+            example.inputs["material.ids"].values,
+        )
+        self.assertIs(
+            rotated.inputs["material.c21"].values,
+            example.inputs["material.c21"].values,
+        )
+        self.assertEqual(rotated.metadata["rotation_id"], rotation_id)
+        self.assertEqual(
+            rotated.metadata["rotation_matrix"],
+            tuple(tuple(int(value) for value in row) for row in rotation),
+        )
+
+    def test_rotation_and_inverse_recover_every_field(self):
+        schema = make_rotation_schema()
+        original = make_rotation_example()
+        rotations = proper_cubic_rotations()
+        rotation_id = 7
+        inverse_id = next(
+            index
+            for index, candidate in enumerate(rotations)
+            if np.array_equal(candidate, rotations[rotation_id].T)
+        )
+        transform = CubicRotation(seed=9)
+
+        rotated = transform.apply(original, schema, rotation_id)
+        recovered = transform.apply(rotated, schema, inverse_id)
+
+        for name, original_value in original.inputs.items():
+            recovered_value = recovered.inputs[name]
+            if isinstance(original_value, RaggedArray):
+                if np.issubdtype(original_value.values.dtype, np.integer):
+                    np.testing.assert_array_equal(
+                        recovered_value.values, original_value.values
+                    )
+                else:
+                    np.testing.assert_allclose(
+                        recovered_value.values,
+                        original_value.values,
+                        rtol=1e-12,
+                        atol=1e-12,
+                    )
+            elif np.issubdtype(original_value.dtype, np.integer):
+                np.testing.assert_array_equal(
+                    recovered_value, original_value
+                )
+            else:
+                np.testing.assert_allclose(
+                    recovered_value,
+                    original_value,
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
+        np.testing.assert_allclose(
+            recovered.targets["effective_c21"],
+            original.targets["effective_c21"],
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_rotates_dense_direction_c21_and_domain_extents(self):
+        schema = make_rotation_schema()
+        original = make_rotation_example()
+        rotation = self.rotation_z_90()
+        rotation_id = next(
+            index
+            for index, candidate in enumerate(proper_cubic_rotations())
+            if np.array_equal(candidate, rotation)
+        )
+        dense_direction = np.arange(
+            24, dtype=np.float64
+        ).reshape(2, 2, 2, 3)
+        base_c21 = original.targets["effective_c21"]
+        dense_c21 = np.stack(
+            [base_c21 + index for index in range(8)]
+        ).reshape(2, 2, 2, 21)
+        inputs = dict(original.inputs)
+        inputs.update(
+            {
+                "voxel.direction": dense_direction,
+                "stiffness.voxel_c21": dense_c21,
+                "domain.aabb": np.array(
+                    [[0.0, 0.0, 0.0], [2.0, 4.0, 6.0]]
+                ),
+            }
+        )
+        example = dataclasses.replace(original, inputs=inputs)
+
+        rotated = CubicRotation(seed=1).apply(
+            example, schema, rotation_id
+        )
+
+        expected_direction = np.empty_like(dense_direction)
+        expected_c21 = np.empty_like(dense_c21)
+        for z in range(2):
+            for y in range(2):
+                for x in range(2):
+                    old = np.array([x, y, z])
+                    new = rotation @ (2 * old - 1)
+                    new = ((new + 1) // 2).astype(int)
+                    destination = (new[2], new[1], new[0])
+                    expected_direction[destination] = (
+                        rotation @ dense_direction[z, y, x]
+                    )
+                    expected_c21[destination] = (
+                        _rotate_c21_reference(
+                            dense_c21[z, y, x], rotation
+                        )
+                    )
+        np.testing.assert_allclose(
+            rotated.inputs["voxel.direction"], expected_direction
+        )
+        np.testing.assert_allclose(
+            rotated.inputs["stiffness.voxel_c21"], expected_c21
+        )
+        np.testing.assert_allclose(
+            rotated.inputs["domain.aabb"],
+            [[-1.0, 1.0, 0.0], [3.0, 3.0, 6.0]],
+        )
+
+    def test_preserves_float32_and_rejects_unknown_physical_semantics(self):
+        c21 = make_rotation_example().targets[
+            "effective_c21"
+        ].astype(np.float32)
+        rotated = rotate_engineering_voigt_c21(
+            c21, self.rotation_z_90()
+        )
+        self.assertEqual(rotated.dtype, np.float32)
+
+        unknown = TrainingFieldSpec(
+            "orientation.unknown",
+            "input",
+            "fixed",
+            "float64",
+            (3,),
+            semantic="direction_cosines",
+        )
+        schema = dataclasses.replace(
+            make_rotation_schema(),
+            inputs=make_rotation_schema().inputs + (unknown,),
+        )
+        example = make_rotation_example()
+        inputs = dict(example.inputs)
+        inputs[unknown.name] = np.array([1.0, 0.0, 0.0])
+        example = dataclasses.replace(example, inputs=inputs)
+
+        with self.assertRaisesRegex(ValueError, "semantic"):
+            CubicRotation(seed=1).apply(example, schema, 0)
+
+    def test_hash_choice_is_reproducible_across_order_and_epochs(self):
+        schema = make_rotation_schema()
+        first = make_rotation_example()
+        second = dataclasses.replace(
+            first, sample_id="another-sample"
+        )
+        left = CubicRotation(seed=42)
+        right = CubicRotation(seed=42)
+
+        ids_left = [
+            left(example, schema).metadata["rotation_id"]
+            for example in (first, second)
+        ]
+        ids_right = [
+            right(example, schema).metadata["rotation_id"]
+            for example in (second, first)
+        ]
+        self.assertEqual(ids_left, list(reversed(ids_right)))
+
+        epoch_ids = []
+        for epoch in range(4):
+            left.set_epoch(epoch)
+            epoch_ids.append(
+                left(first, schema).metadata["rotation_id"]
+            )
+        self.assertGreater(len(set(epoch_ids)), 1)
+
+    def test_rejects_non_cubic_schema_and_invalid_rotation_request(self):
+        schema = dataclasses.replace(
+            make_rotation_schema(), grid_shape=(2, 2, 3)
+        )
+        with self.assertRaisesRegex(ValueError, "cubic"):
+            CubicRotation(seed=1)(make_rotation_example(), schema)
+        with self.assertRaisesRegex(ValueError, "rotation_id"):
+            CubicRotation(seed=1).apply(
+                make_rotation_example(),
+                make_rotation_schema(),
+                24,
+            )
 
 
 if __name__ == "__main__":

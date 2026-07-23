@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import itertools
 import math
 import re
 from collections.abc import Mapping
@@ -205,7 +206,10 @@ class TrainingFieldSpec:
             group = None
         object.__setattr__(self, "ragged_group", group)
 
-        if semantic == "engineering_voigt_c21":
+        if (
+            semantic is not None
+            and semantic.endswith("engineering_voigt_c21")
+        ):
             if not self.shape or self.shape[-1] != 21:
                 raise ValueError(
                     "engineering_voigt_c21 fields must end with shape (21,)"
@@ -1210,7 +1214,433 @@ class StandardizeFields:
         )
 
 
+_VOIGT_PAIRS = (
+    (0, 0),
+    (1, 1),
+    (2, 2),
+    (1, 2),
+    (0, 2),
+    (0, 1),
+)
+_C21_INDICES = tuple(
+    (row, column)
+    for row in range(6)
+    for column in range(row, 6)
+)
+
+
+def _build_cubic_rotations() -> Tuple[np.ndarray, ...]:
+    rotations = []
+    for permutation in itertools.permutations(range(3)):
+        permutation_matrix = np.zeros((3, 3), dtype=np.int8)
+        permutation_matrix[np.arange(3), permutation] = 1
+        for signs in itertools.product((-1, 1), repeat=3):
+            rotation = (
+                np.asarray(signs, dtype=np.int8)[:, None]
+                * permutation_matrix
+            )
+            if round(float(np.linalg.det(rotation))) != 1:
+                continue
+            rotation.flags.writeable = False
+            rotations.append(rotation)
+    rotations.sort(key=lambda value: tuple(int(x) for x in value.flat))
+    return tuple(rotations)
+
+
+_CUBIC_ROTATIONS = _build_cubic_rotations()
+
+
+def proper_cubic_rotations() -> Tuple[np.ndarray, ...]:
+    """Return the stable 24-element proper rotation group of a cube."""
+    return _CUBIC_ROTATIONS
+
+
+def _validated_cubic_rotation(rotation: Any) -> np.ndarray:
+    value = np.asarray(rotation)
+    if value.shape != (3, 3) or not bool(
+        np.isin(value, (-1, 0, 1)).all()
+    ):
+        raise ValueError(
+            "rotation must be a 3 x 3 signed permutation matrix"
+        )
+    integer = np.asarray(value, dtype=np.int8)
+    if not np.array_equal(
+        integer @ integer.T, np.eye(3, dtype=np.int8)
+    ) or round(float(np.linalg.det(integer))) != 1:
+        raise ValueError("rotation must be a proper cubic rotation")
+    return integer
+
+
+def _unpack_training_c21(c21: np.ndarray) -> np.ndarray:
+    matrix = np.empty(c21.shape[:-1] + (6, 6), dtype=c21.dtype)
+    for index, (row, column) in enumerate(_C21_INDICES):
+        matrix[..., row, column] = c21[..., index]
+        matrix[..., column, row] = c21[..., index]
+    return matrix
+
+
+def _pack_training_c21(matrix: np.ndarray) -> np.ndarray:
+    return np.stack(
+        [
+            matrix[..., row, column]
+            for row, column in _C21_INDICES
+        ],
+        axis=-1,
+    )
+
+
+def _voigt_pair_rotation(
+    rotation: np.ndarray, dtype: np.dtype
+) -> np.ndarray:
+    result = np.zeros((6, 6), dtype=dtype)
+    for output, (row, column) in enumerate(_VOIGT_PAIRS):
+        for source, (left, right) in enumerate(_VOIGT_PAIRS):
+            value = rotation[row, left] * rotation[column, right]
+            if left != right:
+                value += (
+                    rotation[row, right] * rotation[column, left]
+                )
+            result[output, source] = value
+    return result
+
+
+def rotate_engineering_voigt_c21(
+    c21: Any, rotation: Any
+) -> np.ndarray:
+    """Rotate NumPy C21 coefficients by one proper cubic rotation."""
+    value = np.asarray(c21)
+    if value.ndim == 0 or value.shape[-1] != 21:
+        raise ValueError("c21 must end with shape (21,)")
+    if not np.issubdtype(value.dtype, np.floating):
+        raise ValueError("c21 must use a floating dtype")
+    if not bool(np.isfinite(value).all()):
+        raise ValueError("c21 must contain only finite values")
+    matrix_rotation = _validated_cubic_rotation(rotation)
+    pair_rotation = _voigt_pair_rotation(
+        matrix_rotation, value.dtype
+    )
+    matrix = _unpack_training_c21(value)
+    rotated = np.einsum(
+        "ai,...ij,bj->...ab",
+        pair_rotation,
+        matrix,
+        pair_rotation,
+        optimize=True,
+    )
+    symmetric = 0.5 * (
+        rotated + np.swapaxes(rotated, -1, -2)
+    )
+    return _pack_training_c21(symmetric)
+
+
+def _rotate_spatial_array(
+    value: Any,
+    rotation: np.ndarray,
+    grid_shape: Tuple[int, int, int],
+) -> np.ndarray:
+    array = np.asarray(value)
+    if array.ndim < 3 or tuple(array.shape[:3]) != grid_shape:
+        raise ValueError(
+            f"spatial field shape {array.shape} must begin with "
+            f"grid shape {grid_shape}"
+        )
+    permutation = []
+    flips = []
+    for output_array_axis in range(3):
+        output_physical_axis = 2 - output_array_axis
+        input_physical_axis = int(
+            np.flatnonzero(rotation[output_physical_axis])[0]
+        )
+        permutation.append(2 - input_physical_axis)
+        flips.append(
+            int(
+                rotation[
+                    output_physical_axis, input_physical_axis
+                ]
+            )
+            < 0
+        )
+    transposed = np.transpose(
+        array,
+        tuple(permutation) + tuple(range(3, array.ndim)),
+    )
+    result = transposed
+    for axis, flip in enumerate(flips):
+        if flip:
+            result = np.flip(result, axis=axis)
+    return np.ascontiguousarray(result)
+
+
+def _rotate_flat_indices(
+    value: Any,
+    rotation: np.ndarray,
+    grid_shape: Tuple[int, int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    indices = np.asarray(value)
+    if indices.ndim != 1 or not np.issubdtype(
+        indices.dtype, np.integer
+    ):
+        raise ValueError(
+            "flat_voxel_index values must be a one-dimensional integer array"
+        )
+    nz, ny, nx = grid_shape
+    total = nx * ny * nz
+    if bool(((indices < 0) | (indices >= total)).any()):
+        raise ValueError("flat_voxel_index contains an out-of-range value")
+    x = indices % nx
+    y = (indices // nx) % ny
+    z = indices // (nx * ny)
+    coordinates = np.stack((x, y, z), axis=0).astype(
+        np.int64, copy=False
+    )
+    doubled = 2 * coordinates - (nx - 1)
+    rotated = rotation.astype(np.int64) @ doubled
+    transformed = (rotated + (nx - 1)) // 2
+    new_indices = (
+        transformed[0]
+        + transformed[1] * nx
+        + transformed[2] * nx * ny
+    ).astype(indices.dtype, copy=False)
+    order = np.argsort(new_indices, kind="stable")
+    return np.ascontiguousarray(new_indices[order]), order
+
+
+def _rotate_aabb(value: Any, rotation: np.ndarray) -> np.ndarray:
+    aabb = np.asarray(value)
+    if aabb.shape != (2, 3) or not np.issubdtype(
+        aabb.dtype, np.floating
+    ):
+        raise ValueError("aabb fields must have floating shape (2, 3)")
+    center = 0.5 * (aabb[0] + aabb[1])
+    corners = np.asarray(
+        list(
+            itertools.product(
+                *zip(aabb[0].tolist(), aabb[1].tolist())
+            )
+        ),
+        dtype=aabb.dtype,
+    )
+    rotated = (corners - center) @ rotation.T + center
+    return np.stack(
+        (rotated.min(axis=0), rotated.max(axis=0)), axis=0
+    )
+
+
+def _rotate_field_content(
+    value: np.ndarray,
+    spec: TrainingFieldSpec,
+    rotation: np.ndarray,
+    grid_shape: Tuple[int, int, int],
+) -> np.ndarray:
+    semantic = spec.semantic
+    if semantic in {
+        "material_id_grid",
+        "spatial_scalar",
+        "spatial_integer",
+    }:
+        return _rotate_spatial_array(value, rotation, grid_shape)
+    if semantic == "direction_vector":
+        array = np.asarray(value)
+        if array.shape[-1:] != (3,):
+            raise ValueError(
+                f"direction field {spec.name!r} must end with shape (3,)"
+            )
+        return np.ascontiguousarray(array @ rotation.T)
+    if semantic == "direction_vector_field":
+        spatial = _rotate_spatial_array(value, rotation, grid_shape)
+        if spatial.shape[-1:] != (3,):
+            raise ValueError(
+                f"direction field {spec.name!r} must end with shape (3,)"
+            )
+        return np.ascontiguousarray(spatial @ rotation.T)
+    if semantic == "global_engineering_voigt_c21":
+        array = np.asarray(value)
+        if tuple(array.shape[:3]) == grid_shape and array.ndim >= 4:
+            array = _rotate_spatial_array(
+                array, rotation, grid_shape
+            )
+        return rotate_engineering_voigt_c21(array, rotation)
+    if semantic == "engineering_voigt_c21":
+        return rotate_engineering_voigt_c21(value, rotation)
+    if semantic == "local_engineering_voigt_c21":
+        return value
+    if semantic == "aabb":
+        return _rotate_aabb(value, rotation)
+    if semantic is not None and (
+        "direction" in semantic or "c21" in semantic
+    ):
+        raise ValueError(
+            f"unsupported transform semantic {semantic!r} "
+            f"for field {spec.name!r}"
+        )
+    return value
+
+
+def _apply_cubic_rotation(
+    example: TrainingExample,
+    schema: TrainingDatasetSchema,
+    rotation_id: int,
+) -> TrainingExample:
+    if len(set(schema.grid_shape)) != 1:
+        raise ValueError(
+            "CubicRotation requires a cubic grid with Nz == Ny == Nx"
+        )
+    if (
+        isinstance(rotation_id, bool)
+        or not isinstance(rotation_id, Integral)
+        or not 0 <= int(rotation_id) < len(_CUBIC_ROTATIONS)
+    ):
+        raise ValueError("rotation_id must be an integer from 0 through 23")
+    rotation_id = int(rotation_id)
+    rotation = _CUBIC_ROTATIONS[rotation_id]
+    inputs = dict(example.inputs)
+    targets = dict(example.targets)
+
+    groups = {}
+    for spec in schema.fields:
+        if spec.layout == "ragged":
+            mapping = inputs if spec.role == "input" else targets
+            if spec.name in mapping:
+                groups.setdefault(spec.ragged_group, []).append(spec)
+
+    handled = set()
+    for _, specs in groups.items():
+        index_specs = [
+            spec
+            for spec in specs
+            if spec.semantic == "flat_voxel_index"
+        ]
+        order = None
+        rotated_indices = None
+        original_indices = None
+        if index_specs:
+            first_spec = index_specs[0]
+            first_mapping = (
+                inputs if first_spec.role == "input" else targets
+            )
+            first_value = first_mapping[first_spec.name]
+            if not isinstance(first_value, RaggedArray):
+                raise ValueError(
+                    f"field {first_spec.name!r} must be a RaggedArray"
+                )
+            original_indices = first_value.values
+            rotated_indices, order = _rotate_flat_indices(
+                original_indices, rotation, schema.grid_shape
+            )
+
+        for spec in specs:
+            mapping = inputs if spec.role == "input" else targets
+            ragged = mapping[spec.name]
+            if not isinstance(ragged, RaggedArray):
+                raise ValueError(
+                    f"field {spec.name!r} must be a RaggedArray"
+                )
+            if spec.semantic == "flat_voxel_index":
+                if not np.array_equal(
+                    ragged.values, original_indices
+                ):
+                    raise ValueError(
+                        "flat voxel index aliases in one ragged group "
+                        "must match exactly"
+                    )
+                values = rotated_indices
+            else:
+                values = _rotate_field_content(
+                    ragged.values, spec, rotation, schema.grid_shape
+                )
+                if order is not None:
+                    values = np.ascontiguousarray(values[order])
+            if values is ragged.values and order is None:
+                mapping[spec.name] = ragged
+            else:
+                mapping[spec.name] = RaggedArray(
+                    values, ragged.offsets
+                )
+            handled.add(spec.name)
+
+    for spec in schema.fields:
+        if spec.name in handled:
+            continue
+        mapping = inputs if spec.role == "input" else targets
+        if spec.name not in mapping:
+            continue
+        value = mapping[spec.name]
+        if isinstance(value, RaggedArray):
+            raise ValueError(
+                f"ragged field {spec.name!r} has no declared group"
+            )
+        mapping[spec.name] = _rotate_field_content(
+            value, spec, rotation, schema.grid_shape
+        )
+
+    metadata = _thaw_json(example.metadata)
+    metadata["rotation_id"] = rotation_id
+    metadata["rotation_matrix"] = rotation.astype(int).tolist()
+    return TrainingExample(
+        inputs=inputs,
+        targets=targets,
+        sample_id=example.sample_id,
+        group_id=example.group_id,
+        split=example.split,
+        metadata=metadata,
+    )
+
+
+class CubicRotation:
+    """Deterministic proper-cubic augmentation for coupled physical fields."""
+
+    def __init__(self, seed: int, probability: float = 1.0):
+        if isinstance(seed, bool) or not isinstance(seed, Integral):
+            raise ValueError("seed must be an integer")
+        if (
+            isinstance(probability, bool)
+            or not isinstance(probability, Real)
+            or not math.isfinite(float(probability))
+            or not 0.0 <= float(probability) <= 1.0
+        ):
+            raise ValueError("probability must be finite and between 0 and 1")
+        self.seed = int(seed)
+        self.probability = float(probability)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if isinstance(epoch, bool) or not isinstance(epoch, Integral):
+            raise ValueError("epoch must be an integer")
+        self.epoch = int(epoch)
+
+    def apply(
+        self,
+        example: TrainingExample,
+        schema: TrainingDatasetSchema,
+        rotation_id: int,
+    ) -> TrainingExample:
+        if not isinstance(example, TrainingExample):
+            raise TypeError("example must be a TrainingExample")
+        if not isinstance(schema, TrainingDatasetSchema):
+            raise TypeError("schema must be a TrainingDatasetSchema")
+        return _apply_cubic_rotation(example, schema, rotation_id)
+
+    def __call__(
+        self,
+        example: TrainingExample,
+        schema: TrainingDatasetSchema,
+    ) -> TrainingExample:
+        digest = hashlib.sha256(
+            f"{self.seed}\0{self.epoch}\0{example.sample_id}".encode(
+                "utf-8"
+            )
+        ).digest()
+        draw = int.from_bytes(digest[:8], "big") / 2**64
+        if draw >= self.probability:
+            return example
+        rotation_id = int.from_bytes(digest[8:16], "big") % len(
+            _CUBIC_ROTATIONS
+        )
+        return self.apply(example, schema, rotation_id)
+
+
 __all__ = [
+    "CubicRotation",
     "DatasetQualityPolicy",
     "RaggedArray",
     "RunningFieldStatistics",
@@ -1225,4 +1655,6 @@ __all__ = [
     "collate_training_examples",
     "compute_training_statistics",
     "deterministic_group_split",
+    "proper_cubic_rotations",
+    "rotate_engineering_voigt_c21",
 ]
