@@ -20,16 +20,20 @@ try:
     from .simulation_sample import SimulationSample
     from .training_data import (
         DatasetQualityPolicy,
+        RaggedArray,
         RunningFieldStatistics,
         TrainingDatasetSchema,
+        TrainingExample,
         TrainingFieldSpec,
     )
 except ImportError:  # pragma: no cover - legacy TexGen package name
     from TexGen.simulation_sample import SimulationSample
     from TexGen.training_data import (
         DatasetQualityPolicy,
+        RaggedArray,
         RunningFieldStatistics,
         TrainingDatasetSchema,
+        TrainingExample,
         TrainingFieldSpec,
     )
 
@@ -1179,8 +1183,698 @@ class SimulationDatasetWriter:
         self._finalized = True
 
 
+class SimulationDataset:
+    """Picklable map-style reader with selective lazy mmap access."""
+
+    def __init__(
+        self,
+        path: Any,
+        *,
+        split: Optional[str] = None,
+        inputs: Optional[Tuple[str, ...]] = None,
+        targets: Optional[Tuple[str, ...]] = None,
+        verify: str = "shard",
+        transform: Any = None,
+    ) -> None:
+        self.path = Path(path)
+        if not self.path.is_dir():
+            raise DatasetFormatError(
+                f"dataset directory does not exist: {self.path}"
+            )
+        self._root = self.path.resolve()
+        if verify not in {"manifest", "shard", "sample"}:
+            raise ValueError(
+                'verify must be "manifest", "shard", or "sample"'
+            )
+        if split is not None and split not in {
+            "train",
+            "validation",
+            "test",
+        }:
+            raise ValueError(
+                "split must be train, validation, test, or None"
+            )
+        self.verify = verify
+        self.split = split
+        self.transform = transform
+        self.epoch = 0
+        self._manifest = _read_json(
+            self.path / "dataset.json", "dataset manifest"
+        )
+        if self._manifest.get("schema") != _SCHEMA:
+            raise DatasetFormatError(
+                f"unsupported dataset schema "
+                f"{self._manifest.get('schema')!r}"
+            )
+        if self._manifest.get("version") != _VERSION:
+            raise DatasetFormatError(
+                f"unsupported dataset version "
+                f"{self._manifest.get('version')!r}"
+            )
+        try:
+            self.schema = TrainingDatasetSchema.from_dict(
+                self._manifest.get("dataset_schema")
+            )
+        except (TypeError, ValueError) as exc:
+            raise DatasetFormatError(
+                f"invalid dataset schema: {exc}"
+            ) from exc
+
+        self._shards = self._validate_manifest_shards()
+        self._file_entries = {}
+        for shard in self._shards:
+            for relative, entry in shard["files"].items():
+                if relative in self._file_entries:
+                    raise DatasetFormatError(
+                        f"duplicate file path {relative!r}"
+                    )
+                self._file_entries[relative] = entry
+        self._samples = self._load_samples()
+        self._rejection_count = self._load_rejection_count()
+        self.input_names = self._selected_names(
+            inputs, self.schema.inputs, "input"
+        )
+        self.target_names = self._selected_names(
+            targets, self.schema.targets, "target"
+        )
+        self._indices = tuple(
+            index
+            for index, sample in enumerate(self._samples)
+            if split is None or sample["split"] == split
+        )
+        self._cache_pid = None
+        self._arrays = {}
+        self._verified_files = set()
+        self._validated_offsets = set()
+        self._checked_files = 0
+        self._checked_samples = 0
+        if verify == "sample":
+            self._verify_complete_dataset()
+
+    def _resolve_path(self, relative: Any) -> Path:
+        if not isinstance(relative, str):
+            raise DatasetFormatError(
+                "manifest file paths must be strings"
+            )
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise DatasetFormatError(
+                f"unsafe manifest path {relative!r}"
+            )
+        resolved = (self.path / path).resolve()
+        if (
+            self._root != resolved
+            and self._root not in resolved.parents
+        ):
+            raise DatasetFormatError(
+                f"unsafe manifest path {relative!r}"
+            )
+        return resolved
+
+    def _validate_file_entry(
+        self,
+        relative: Any,
+        entry: Any,
+        shard_number: int,
+    ) -> Mapping[str, Any]:
+        path = self._resolve_path(relative)
+        if not path.is_file():
+            raise DatasetFormatError(
+                f"missing file {relative!r} in shard {shard_number}"
+            )
+        if not isinstance(entry, Mapping):
+            raise DatasetFormatError(
+                f"invalid file metadata for {relative!r}"
+            )
+        digest = entry.get("sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise DatasetFormatError(
+                f"invalid checksum metadata for {relative!r}"
+            )
+        byte_count = entry.get("byte_count")
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count <= 0
+        ):
+            raise DatasetFormatError(
+                f"invalid byte count metadata for {relative!r}"
+            )
+        try:
+            dtype = np.dtype(entry.get("dtype"))
+        except (TypeError, ValueError) as exc:
+            raise DatasetFormatError(
+                f"invalid dtype metadata for {relative!r}"
+            ) from exc
+        if dtype.kind not in {"b", "i", "u", "f"}:
+            raise DatasetFormatError(
+                f"unsafe dtype metadata for {relative!r}"
+            )
+        shape = entry.get("shape")
+        if (
+            not isinstance(shape, list)
+            or any(
+                isinstance(item, bool)
+                or not isinstance(item, int)
+                or item < 0
+                for item in shape
+            )
+        ):
+            raise DatasetFormatError(
+                f"invalid shape metadata for {relative!r}"
+            )
+        return {
+            "sha256": digest,
+            "byte_count": byte_count,
+            "dtype": dtype.str,
+            "shape": shape,
+        }
+
+    def _validate_manifest_shards(self) -> Tuple[Mapping[str, Any], ...]:
+        shards = self._manifest.get("shards")
+        if not isinstance(shards, list):
+            raise DatasetFormatError("manifest shards must be a list")
+        if self._manifest.get("shard_count") != len(shards):
+            raise DatasetFormatError("manifest shard_count mismatch")
+        validated = []
+        all_paths = set()
+        fields_by_name = {
+            spec.name: spec for spec in self.schema.fields
+        }
+        for number, shard in enumerate(shards):
+            if not isinstance(shard, Mapping):
+                raise DatasetFormatError(
+                    f"shard {number} metadata must be a mapping"
+                )
+            expected_path = (
+                Path("shards") / f"shard_{number:05d}"
+            ).as_posix()
+            if (
+                shard.get("number") != number
+                or shard.get("path") != expected_path
+            ):
+                raise DatasetFormatError(
+                    f"shard {number} number/path mismatch"
+                )
+            row_count = shard.get("row_count")
+            if (
+                isinstance(row_count, bool)
+                or not isinstance(row_count, int)
+                or row_count <= 0
+            ):
+                raise DatasetFormatError(
+                    f"shard {number} row_count is invalid"
+                )
+            self._resolve_path(shard["path"])
+            files = shard.get("files")
+            field_entries = shard.get("fields")
+            if not isinstance(files, Mapping) or not isinstance(
+                field_entries, Mapping
+            ):
+                raise DatasetFormatError(
+                    f"shard {number} files/fields are invalid"
+                )
+            validated_files = {}
+            for relative, entry in files.items():
+                if relative in all_paths:
+                    raise DatasetFormatError(
+                        f"duplicate file path {relative!r}"
+                    )
+                all_paths.add(relative)
+                validated_files[relative] = self._validate_file_entry(
+                    relative, entry, number
+                )
+            if set(field_entries) != set(fields_by_name):
+                raise DatasetFormatError(
+                    f"shard {number} field registry does not match schema"
+                )
+            validated_fields = {}
+            for name, entry in field_entries.items():
+                if not isinstance(entry, Mapping):
+                    raise DatasetFormatError(
+                        f"invalid field entry {name!r}"
+                    )
+                spec = fields_by_name[name]
+                if entry.get("layout") != spec.layout:
+                    raise DatasetFormatError(
+                        f"layout mismatch for field {name!r}"
+                    )
+                values_relative = entry.get("values")
+                self._resolve_path(values_relative)
+                if values_relative not in validated_files:
+                    raise DatasetFormatError(
+                        f"field {name!r} references undeclared values"
+                    )
+                values_meta = validated_files[values_relative]
+                if values_meta["dtype"] != np.dtype(spec.dtype).str:
+                    raise DatasetFormatError(
+                        f"dtype mismatch for field {name!r}"
+                    )
+                if spec.layout == "fixed":
+                    expected_shape = [row_count, *spec.shape]
+                    if values_meta["shape"] != expected_shape:
+                        raise DatasetFormatError(
+                            f"shape mismatch for field {name!r}"
+                        )
+                    validated_fields[name] = {
+                        "layout": "fixed",
+                        "values": values_relative,
+                    }
+                    continue
+                if values_meta["shape"][1:] != list(spec.shape):
+                    raise DatasetFormatError(
+                        f"shape mismatch for ragged field {name!r}"
+                    )
+                offsets_relative = entry.get("offsets")
+                self._resolve_path(offsets_relative)
+                if offsets_relative not in validated_files:
+                    raise DatasetFormatError(
+                        f"field {name!r} references undeclared offsets"
+                    )
+                offsets_meta = validated_files[offsets_relative]
+                if (
+                    np.dtype(offsets_meta["dtype"]) != np.dtype(np.int64)
+                    or offsets_meta["shape"] != [row_count + 1]
+                ):
+                    raise DatasetFormatError(
+                        f"offset metadata mismatch for field {name!r}"
+                    )
+                validated_fields[name] = {
+                    "layout": "ragged",
+                    "values": values_relative,
+                    "offsets": offsets_relative,
+                }
+            for alias, canonical in _TOPOLOGY_ALIASES.items():
+                if (
+                    alias in validated_fields
+                    and canonical in validated_fields
+                    and validated_fields[alias]["values"]
+                    != validated_fields[canonical]["values"]
+                ):
+                    raise DatasetFormatError(
+                        f"topology alias fields {canonical!r} and "
+                        f"{alias!r} must reference one values file"
+                    )
+            ragged_offsets = {}
+            for spec in self.schema.fields:
+                if spec.layout != "ragged":
+                    continue
+                relative = validated_fields[spec.name]["offsets"]
+                previous = ragged_offsets.setdefault(
+                    spec.ragged_group, relative
+                )
+                if previous != relative:
+                    raise DatasetFormatError(
+                        f"ragged group {spec.ragged_group!r} must "
+                        "reference one shared offsets file"
+                    )
+            validated.append(
+                {
+                    "number": number,
+                    "path": expected_path,
+                    "row_count": row_count,
+                    "byte_count": shard.get("byte_count"),
+                    "files": validated_files,
+                    "fields": validated_fields,
+                }
+            )
+        return tuple(validated)
+
+    def _load_jsonl(self, name: str) -> list:
+        path = self.path / name
+        if not path.is_file():
+            raise DatasetFormatError(f"missing dataset index {name}")
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise DatasetFormatError(
+                f"cannot read dataset index {name}"
+            ) from exc
+        result = []
+        for line_number, line in enumerate(lines, start=1):
+            if not line:
+                raise DatasetFormatError(
+                    f"empty {name} line {line_number}"
+                )
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise DatasetFormatError(
+                    f"invalid {name} line {line_number}"
+                ) from exc
+            if not isinstance(value, Mapping):
+                raise DatasetFormatError(
+                    f"{name} line {line_number} must be a mapping"
+                )
+            result.append(value)
+        return result
+
+    def _load_samples(self) -> Tuple[Mapping[str, Any], ...]:
+        samples = self._load_jsonl("samples.jsonl")
+        if self._manifest.get("sample_count") != len(samples):
+            raise DatasetFormatError("manifest sample_count mismatch")
+        seen_ids = set()
+        group_splits = {}
+        occupied_rows = set()
+        split_counts = Counter()
+        for sample in samples:
+            sample_id = sample.get("sample_id")
+            group_id = sample.get("group_id")
+            split = sample.get("split")
+            if (
+                not isinstance(sample_id, str)
+                or not sample_id
+                or sample_id in seen_ids
+            ):
+                raise DatasetFormatError(
+                    f"invalid or duplicate sample_id {sample_id!r}"
+                )
+            if not isinstance(group_id, str) or not group_id:
+                raise DatasetFormatError(
+                    f"invalid group_id for sample {sample_id!r}"
+                )
+            if split not in {"train", "validation", "test"}:
+                raise DatasetFormatError(
+                    f"invalid split for sample {sample_id!r}"
+                )
+            previous = group_splits.setdefault(group_id, split)
+            if previous != split:
+                raise DatasetIntegrityError(
+                    f"group {group_id!r} leaks across splits "
+                    f"{previous!r} and {split!r}"
+                )
+            shard_number = sample.get("shard")
+            row = sample.get("row")
+            if (
+                isinstance(shard_number, bool)
+                or not isinstance(shard_number, int)
+                or not 0 <= shard_number < len(self._shards)
+                or isinstance(row, bool)
+                or not isinstance(row, int)
+                or not 0 <= row < self._shards[
+                    shard_number
+                ]["row_count"]
+            ):
+                raise DatasetFormatError(
+                    f"invalid shard row for sample {sample_id!r}"
+                )
+            location = (shard_number, row)
+            if location in occupied_rows:
+                raise DatasetFormatError(
+                    f"duplicate sample row {location}"
+                )
+            digest = sample.get("geometry_digest")
+            if not isinstance(digest, str) or len(digest) != 64:
+                raise DatasetFormatError(
+                    f"invalid geometry digest for sample {sample_id!r}"
+                )
+            seen_ids.add(sample_id)
+            occupied_rows.add(location)
+            split_counts[split] += 1
+        expected_rows = {
+            (shard["number"], row)
+            for shard in self._shards
+            for row in range(shard["row_count"])
+        }
+        if occupied_rows != expected_rows:
+            raise DatasetFormatError(
+                "sample index does not cover every shard row exactly once"
+            )
+        declared_splits = self._manifest.get("split_counts")
+        observed_splits = {
+            split: int(split_counts.get(split, 0))
+            for split in ("train", "validation", "test")
+        }
+        if declared_splits != observed_splits:
+            raise DatasetFormatError("manifest split_counts mismatch")
+        declared_groups = self._manifest.get("group_counts")
+        observed_groups = Counter(group_splits.values())
+        expected_groups = {
+            split: int(observed_groups.get(split, 0))
+            for split in ("train", "validation", "test")
+        }
+        if declared_groups != expected_groups:
+            raise DatasetFormatError("manifest group_counts mismatch")
+        return tuple(
+            json.loads(_canonical_json(sample)) for sample in samples
+        )
+
+    def _load_rejection_count(self) -> int:
+        rejections = self._load_jsonl("rejections.jsonl")
+        if self._manifest.get("rejection_count") != len(rejections):
+            raise DatasetFormatError(
+                "manifest rejection_count mismatch"
+            )
+        return len(rejections)
+
+    @staticmethod
+    def _selected_names(
+        requested: Any,
+        specs: Tuple[TrainingFieldSpec, ...],
+        role: str,
+    ) -> Tuple[str, ...]:
+        available = tuple(spec.name for spec in specs)
+        if requested is None:
+            return available
+        names = tuple(requested)
+        if len(set(names)) != len(names):
+            raise ValueError(f"selected {role} fields must be unique")
+        unknown = set(names) - set(available)
+        if unknown:
+            raise ValueError(
+                f"unknown selected {role} fields: "
+                + ", ".join(sorted(unknown))
+            )
+        return names
+
+    def _ensure_process_cache(self) -> None:
+        process_id = os.getpid()
+        if self._cache_pid == process_id:
+            return
+        self._cache_pid = process_id
+        self._arrays = {}
+        self._verified_files = set()
+        self._validated_offsets = set()
+
+    def _ensure_verified(self, relative: str) -> None:
+        if self.verify == "manifest" or relative in self._verified_files:
+            return
+        entry = self._file_entries[relative]
+        path = self._resolve_path(relative)
+        observed_size = path.stat().st_size
+        if observed_size != entry["byte_count"]:
+            raise DatasetIntegrityError(
+                f"byte count mismatch for {relative!r}: expected "
+                f"{entry['byte_count']}, observed {observed_size}"
+            )
+        observed = _sha256_file(path)
+        if observed != entry["sha256"]:
+            raise DatasetIntegrityError(
+                f"checksum mismatch for {relative!r}: expected "
+                f"{entry['sha256']}, observed {observed}"
+            )
+        self._verified_files.add(relative)
+        self._checked_files += 1
+
+    def _open_array(self, relative: str) -> np.ndarray:
+        self._ensure_process_cache()
+        self._ensure_verified(relative)
+        if relative not in self._arrays:
+            try:
+                value = np.load(
+                    self._resolve_path(relative),
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
+            except (OSError, ValueError) as exc:
+                raise DatasetFormatError(
+                    f"cannot open array {relative!r}"
+                ) from exc
+            entry = self._file_entries[relative]
+            if value.dtype.str != entry["dtype"]:
+                raise DatasetFormatError(
+                    f"dtype mismatch while opening {relative!r}"
+                )
+            if list(value.shape) != entry["shape"]:
+                raise DatasetFormatError(
+                    f"shape mismatch while opening {relative!r}"
+                )
+            self._arrays[relative] = value
+        return self._arrays[relative]
+
+    def _validated_ragged_offsets(
+        self,
+        relative: str,
+        *,
+        values_count: int,
+        row_count: int,
+    ) -> np.ndarray:
+        offsets = self._open_array(relative)
+        key = (relative, values_count, row_count)
+        if key not in self._validated_offsets:
+            if (
+                offsets.dtype != np.dtype(np.int64)
+                or offsets.shape != (row_count + 1,)
+                or int(offsets[0]) != 0
+                or bool((offsets[1:] < offsets[:-1]).any())
+                or int(offsets[-1]) != values_count
+            ):
+                raise DatasetFormatError(
+                    f"invalid ragged offsets in {relative!r}"
+                )
+            self._validated_offsets.add(key)
+        return offsets
+
+    def _read_field(
+        self,
+        shard_number: int,
+        row: int,
+        name: str,
+    ) -> Any:
+        shard = self._shards[shard_number]
+        entry = shard["fields"][name]
+        values = self._open_array(entry["values"])
+        if entry["layout"] == "fixed":
+            return values[row]
+        offsets = self._validated_ragged_offsets(
+            entry["offsets"],
+            values_count=int(values.shape[0]),
+            row_count=shard["row_count"],
+        )
+        start = int(offsets[row])
+        stop = int(offsets[row + 1])
+        return RaggedArray(
+            values[start:stop],
+            np.asarray([0, stop - start], dtype=np.int64),
+        )
+
+    def _verify_complete_dataset(self) -> None:
+        self._ensure_process_cache()
+        for relative in self._file_entries:
+            self._ensure_verified(relative)
+        for shard in self._shards:
+            for spec in self.schema.fields:
+                entry = shard["fields"][spec.name]
+                if entry["layout"] == "ragged":
+                    values = self._open_array(entry["values"])
+                    self._validated_ragged_offsets(
+                        entry["offsets"],
+                        values_count=int(values.shape[0]),
+                        row_count=shard["row_count"],
+                    )
+        digest_field = self.schema.geometry_digest_field
+        for sample in self._samples:
+            value = self._read_field(
+                sample["shard"], sample["row"], digest_field
+            )
+            array = value.values if isinstance(
+                value, RaggedArray
+            ) else value
+            observed = _array_digest(np.asarray(array))
+            if observed != sample["geometry_digest"]:
+                raise DatasetIntegrityError(
+                    f"geometry digest mismatch for sample "
+                    f"{sample['sample_id']!r}: expected "
+                    f"{sample['geometry_digest']}, observed {observed}"
+                )
+            self._checked_samples += 1
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, index: int) -> TrainingExample:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError("dataset index must be an integer")
+        sample = self._samples[self._indices[index]]
+        inputs = {
+            name: self._read_field(
+                sample["shard"], sample["row"], name
+            )
+            for name in self.input_names
+        }
+        targets = {
+            name: self._read_field(
+                sample["shard"], sample["row"], name
+            )
+            for name in self.target_names
+        }
+        metadata = dict(sample.get("metadata", {}))
+        metadata["provenance"] = sample.get("provenance", {})
+        metadata["geometry_digest"] = sample["geometry_digest"]
+        example = TrainingExample(
+            inputs=inputs,
+            targets=targets,
+            sample_id=sample["sample_id"],
+            group_id=sample["group_id"],
+            split=sample["split"],
+            metadata=metadata,
+        )
+        if self.transform is not None:
+            example = self.transform(example, self.schema)
+            if not isinstance(example, TrainingExample):
+                raise TypeError(
+                    "dataset transform must return a TrainingExample"
+                )
+        return example
+
+    def set_epoch(self, epoch: int) -> None:
+        if isinstance(epoch, bool) or not isinstance(epoch, int):
+            raise ValueError("epoch must be an integer")
+        self.epoch = epoch
+        if self.transform is not None and hasattr(
+            self.transform, "set_epoch"
+        ):
+            self.transform.set_epoch(epoch)
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_cache_pid"] = None
+        state["_arrays"] = {}
+        state["_verified_files"] = set()
+        state["_validated_offsets"] = set()
+        state["_checked_files"] = 0
+        return state
+
+    def audit_report(self) -> Mapping[str, Any]:
+        stored_bytes = sum(
+            entry["byte_count"]
+            for entry in self._file_entries.values()
+        )
+        logical_bytes = sum(
+            int(np.prod(entry["shape"], dtype=np.int64))
+            * np.dtype(entry["dtype"]).itemsize
+            for entry in self._file_entries.values()
+        )
+        return {
+            "ok": True,
+            "schema": _SCHEMA,
+            "version": _VERSION,
+            "sample_count": len(self._samples),
+            "rejection_count": self._rejection_count,
+            "shard_count": len(self._shards),
+            "split_counts": dict(self._manifest["split_counts"]),
+            "group_count": sum(
+                self._manifest["group_counts"].values()
+            ),
+            "stored_bytes": stored_bytes,
+            "logical_bytes": logical_bytes,
+            "checked_files": self._checked_files,
+            "checked_samples": self._checked_samples,
+        }
+
+
+def audit_simulation_dataset(
+    path: Any, *, verify: str = "sample"
+) -> Mapping[str, Any]:
+    """Validate a published dataset and return a JSON-safe audit report."""
+    dataset = SimulationDataset(path, verify=verify)
+    return dataset.audit_report()
+
+
 __all__ = [
+    "SimulationDataset",
     "DatasetFormatError",
     "DatasetIntegrityError",
     "SimulationDatasetWriter",
+    "audit_simulation_dataset",
 ]

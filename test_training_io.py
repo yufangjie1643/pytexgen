@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+import pickle
 import sys
 import tempfile
 import unittest
@@ -23,8 +24,11 @@ from TexGen.training_data import (
     VOXEL_ORDER,
 )
 from TexGen.training_io import (
+    DatasetFormatError,
     DatasetIntegrityError,
+    SimulationDataset,
     SimulationDatasetWriter,
+    audit_simulation_dataset,
 )
 
 try:
@@ -804,6 +808,384 @@ class ResumeAndFinalizeTest(unittest.TestCase):
             self.assertTrue(
                 other.with_name("appeared.incomplete").exists()
             )
+
+
+def publish_dataset(path):
+    schema = make_schema(shard_size=2)
+    writer = SimulationDatasetWriter.create(
+        path,
+        schema=schema,
+        quality=DatasetQualityPolicy(require_unique_geometry=False),
+        generation={"fixture": "reader"},
+    )
+    splits = ("train", "validation", "train", "test", "train")
+    for index, split in enumerate(splits):
+        append_sample(
+            writer,
+            sample_id=f"s{index}",
+            group_id=f"g{index}",
+            split=split,
+            scale=index + 1.0,
+        )
+    writer.reject(
+        sample_id="bad",
+        stage="geometry",
+        reason="invalid parameters",
+    )
+    writer.finalize()
+    return schema
+
+
+class RecordingTransform:
+    def __init__(self):
+        self.epoch = -1
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __call__(self, example, schema):
+        metadata = dict(example.metadata)
+        metadata["transform_epoch"] = self.epoch
+        return dataclasses.replace(example, metadata=metadata)
+
+
+class ReaderAndAuditTest(unittest.TestCase):
+    def test_reads_selected_fields_from_multiple_mmap_shards_and_pickles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            publish_dataset(target)
+
+            dataset = SimulationDataset(
+                target,
+                split="train",
+                inputs=(
+                    "voxel.material_id",
+                    "orientation.primary",
+                ),
+                targets=("effective_c21",),
+                verify="shard",
+            )
+
+            self.assertEqual(len(dataset), 3)
+            first = dataset[0]
+            self.assertEqual(
+                set(first.inputs),
+                {"voxel.material_id", "orientation.primary"},
+            )
+            self.assertEqual(set(first.targets), {"effective_c21"})
+            self.assertIsInstance(
+                first.inputs["voxel.material_id"], np.memmap
+            )
+            orientation = first.inputs["orientation.primary"]
+            self.assertIsInstance(orientation.values, np.memmap)
+            np.testing.assert_array_equal(
+                orientation.offsets, [0, 2]
+            )
+            self.assertFalse(
+                first.inputs["voxel.material_id"].flags.writeable
+            )
+            self.assertEqual(first.sample_id, "s0")
+            self.assertEqual(first.metadata["provenance"][
+                "solver_commit"
+            ], "acdm-abc123")
+
+            restored = pickle.loads(pickle.dumps(dataset))
+            self.assertEqual(restored[1].sample_id, "s2")
+            np.testing.assert_array_equal(
+                restored[2].inputs["voxel.material_id"],
+                make_sample().array(
+                    "voxel.material_id", copy=True
+                ),
+            )
+
+    def test_shard_verification_opens_and_hashes_only_selected_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            publish_dataset(target)
+            import TexGen.training_io as training_io
+
+            with mock.patch.object(
+                training_io.np, "load", wraps=np.load
+            ) as load, mock.patch.object(
+                training_io,
+                "_sha256_file",
+                wraps=training_io._sha256_file,
+            ) as checksum:
+                dataset = SimulationDataset(
+                    target,
+                    split="train",
+                    inputs=(
+                        "voxel.material_id",
+                        "orientation.primary",
+                    ),
+                    targets=("effective_c21",),
+                    verify="shard",
+                )
+                self.assertEqual(load.call_count, 0)
+                dataset[0]
+
+            opened = {
+                Path(call.args[0]).name for call in load.call_args_list
+            }
+            hashed = {
+                Path(call.args[0]).name
+                for call in checksum.call_args_list
+            }
+            self.assertIn("voxel_material_id.npy", opened)
+            self.assertIn("orientation_primary.values.npy", opened)
+            self.assertIn("yarn_voxels.offsets.npy", opened)
+            self.assertIn("effective_c21.npy", opened)
+            self.assertNotIn("material_c21.values.npy", opened)
+            self.assertEqual(opened, hashed)
+
+    def test_epoch_propagates_to_transform_and_survives_pickle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            publish_dataset(target)
+            transform = RecordingTransform()
+            dataset = SimulationDataset(
+                target,
+                split="train",
+                inputs=("voxel.material_id",),
+                targets=("effective_c21",),
+                verify="manifest",
+                transform=transform,
+            )
+
+            dataset.set_epoch(7)
+            self.assertEqual(dataset[0].metadata["transform_epoch"], 7)
+            restored = pickle.loads(pickle.dumps(dataset))
+            self.assertEqual(
+                restored[0].metadata["transform_epoch"], 7
+            )
+
+    def test_sample_audit_reports_counts_bytes_and_all_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            publish_dataset(target)
+
+            report = audit_simulation_dataset(
+                target, verify="sample"
+            )
+
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["sample_count"], 5)
+            self.assertEqual(report["rejection_count"], 1)
+            self.assertEqual(report["shard_count"], 3)
+            self.assertEqual(
+                report["split_counts"],
+                {"train": 3, "validation": 1, "test": 1},
+            )
+            self.assertEqual(report["group_count"], 5)
+            self.assertEqual(report["checked_samples"], 5)
+            self.assertGreater(report["checked_files"], 0)
+            self.assertGreater(report["stored_bytes"], 0)
+            self.assertGreater(report["logical_bytes"], 0)
+
+    def test_detects_unsafe_paths_metadata_and_group_leakage_at_manifest(self):
+        mutations = (
+            "unsafe",
+            "dtype",
+            "group",
+            "topology alias",
+            "ragged offsets",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as directory:
+                    target = Path(directory) / "dataset"
+                    publish_dataset(target)
+                    manifest_path = target / "dataset.json"
+                    manifest = json.loads(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                    expected_error = DatasetFormatError
+                    message = mutation
+                    if mutation == "unsafe":
+                        manifest["shards"][0]["fields"][
+                            "voxel.material_id"
+                        ]["values"] = "../outside.npy"
+                        manifest_path.write_text(
+                            json.dumps(manifest), encoding="utf-8"
+                        )
+                    elif mutation == "dtype":
+                        relative = manifest["shards"][0]["fields"][
+                            "voxel.material_id"
+                        ]["values"]
+                        manifest["shards"][0]["files"][relative][
+                            "dtype"
+                        ] = "<f8"
+                        manifest_path.write_text(
+                            json.dumps(manifest), encoding="utf-8"
+                        )
+                    elif mutation == "group":
+                        samples_path = target / "samples.jsonl"
+                        samples = [
+                            json.loads(line)
+                            for line in samples_path.read_text(
+                                encoding="utf-8"
+                            ).splitlines()
+                        ]
+                        samples[1]["group_id"] = samples[0]["group_id"]
+                        samples_path.write_text(
+                            "\n".join(
+                                json.dumps(value) for value in samples
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                        expected_error = DatasetIntegrityError
+                        message = "group"
+                    elif mutation == "topology alias":
+                        shard = manifest["shards"][0]
+                        original = shard["fields"][
+                            "orientation.voxel_indices"
+                        ]["values"]
+                        duplicate = original.replace(
+                            ".values.npy", "_copy.values.npy"
+                        )
+                        (target / duplicate).write_bytes(
+                            (target / original).read_bytes()
+                        )
+                        shard["files"][duplicate] = dict(
+                            shard["files"][original]
+                        )
+                        shard["fields"][
+                            "stiffness.voxel_indices"
+                        ]["values"] = duplicate
+                        manifest_path.write_text(
+                            json.dumps(manifest), encoding="utf-8"
+                        )
+                        message = "alias"
+                    else:
+                        shard = manifest["shards"][0]
+                        original = shard["fields"][
+                            "material.ids"
+                        ]["offsets"]
+                        duplicate = original.replace(
+                            ".offsets.npy", "_copy.offsets.npy"
+                        )
+                        (target / duplicate).write_bytes(
+                            (target / original).read_bytes()
+                        )
+                        shard["files"][duplicate] = dict(
+                            shard["files"][original]
+                        )
+                        shard["fields"]["material.c21"][
+                            "offsets"
+                        ] = duplicate
+                        manifest_path.write_text(
+                            json.dumps(manifest), encoding="utf-8"
+                        )
+                        message = "ragged group"
+                    with self.assertRaisesRegex(
+                        expected_error, message
+                    ):
+                        SimulationDataset(
+                            target, verify="manifest"
+                        )
+
+    def test_checksum_offsets_and_sample_digest_fail_at_promised_levels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "checksum"
+            publish_dataset(target)
+            manifest = json.loads(
+                (target / "dataset.json").read_text(encoding="utf-8")
+            )
+            relative = manifest["shards"][0]["fields"][
+                "voxel.material_id"
+            ]["values"]
+            path = target / relative
+            with path.open("r+b") as stream:
+                stream.seek(-1, 2)
+                byte = stream.read(1)
+                stream.seek(-1, 2)
+                stream.write(bytes([byte[0] ^ 0xFF]))
+            dataset = SimulationDataset(
+                target,
+                inputs=("voxel.material_id",),
+                targets=("effective_c21",),
+                verify="shard",
+            )
+            with self.assertRaisesRegex(
+                DatasetIntegrityError, "checksum"
+            ):
+                dataset[0]
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "offsets"
+            publish_dataset(target)
+            manifest = json.loads(
+                (target / "dataset.json").read_text(encoding="utf-8")
+            )
+            relative = manifest["shards"][0]["fields"][
+                "orientation.primary"
+            ]["offsets"]
+            np.save(
+                target / relative,
+                np.array([0, 2, 1], dtype=np.int64),
+                allow_pickle=False,
+            )
+            dataset = SimulationDataset(
+                target,
+                inputs=("orientation.primary",),
+                targets=("effective_c21",),
+                verify="manifest",
+            )
+            with self.assertRaisesRegex(
+                DatasetFormatError, "offset"
+            ):
+                dataset[0]
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "digest"
+            publish_dataset(target)
+            samples_path = target / "samples.jsonl"
+            samples = [
+                json.loads(line)
+                for line in samples_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            samples[0]["geometry_digest"] = "0" * 64
+            samples_path.write_text(
+                "\n".join(json.dumps(value) for value in samples)
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                DatasetIntegrityError, "geometry digest"
+            ):
+                SimulationDataset(target, verify="sample")
+
+    def test_unselected_corruption_is_lazy_for_shard_but_not_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "dataset"
+            publish_dataset(target)
+            manifest = json.loads(
+                (target / "dataset.json").read_text(encoding="utf-8")
+            )
+            relative = manifest["shards"][0]["fields"][
+                "material.c21"
+            ]["values"]
+            path = target / relative
+            with path.open("r+b") as stream:
+                stream.seek(-1, 2)
+                byte = stream.read(1)
+                stream.seek(-1, 2)
+                stream.write(bytes([byte[0] ^ 0xFF]))
+
+            selected = SimulationDataset(
+                target,
+                inputs=("voxel.material_id",),
+                targets=("effective_c21",),
+                verify="shard",
+            )
+            selected[0]
+            with self.assertRaisesRegex(
+                DatasetIntegrityError, "checksum"
+            ):
+                SimulationDataset(target, verify="sample")
 
 
 if __name__ == "__main__":
