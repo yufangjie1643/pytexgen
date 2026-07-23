@@ -248,6 +248,168 @@ material names, generation metadata, and PyTexGen provenance. Directory arrays
 remain memory-mappable. Saving a CUDA sample is an explicit device-to-host
 boundary.
 
+## Versioned Training Dataset Pipeline
+
+The single-sample format is suitable for exchange; `training_io` is the
+high-throughput format for a labelled collection. Version 1 uses uncompressed
+native `.npy` shards so each DataLoader worker can memory-map selected fields
+without decompressing or loading the whole dataset:
+
+```text
+dataset/
+  dataset.json
+  samples.jsonl
+  rejections.jsonl
+  shards/shard_00000/
+    voxel_material_id.npy
+    orientation_primary.npy
+    yarn_voxels_offsets.npy
+    effective_c21.npy
+    shard.json
+```
+
+`TrainingFieldSpec` fixes the role, layout, exact dtype, trailing shape, unit,
+semantic, and optional ragged group of every field. A fixed field has one row
+per sample. A ragged field stores concatenated values plus `int64` offsets;
+fields in the same group share offsets. This keeps matrix voxels out of sparse
+direction and stiffness arrays. Version 1 deliberately requires one
+`grid_shape` per dataset and never silently casts, resamples, densifies, repairs
+labels, infers units, or moves a CUDA sample to the host.
+
+Create group-safe splits before generation:
+
+```python
+from pytexgen.training_data import deterministic_group_split
+
+assignment = deterministic_group_split(
+    parent_geometry_ids,
+    ratios={"train": 0.8, "validation": 0.1, "test": 0.1},
+    seed=2026,
+    strata=weave_family_by_geometry,  # optional
+)
+```
+
+The assignment is stable across input order. Give every parameter variant and
+augmentation of one parent geometry the same `group_id`; the writer rejects
+group leakage across splits and duplicate geometry digests.
+
+Publish samples through a staging directory:
+
+```python
+from pytexgen.training_io import SimulationDatasetWriter
+
+writer = SimulationDatasetWriter.create(
+    "rve_dataset",
+    schema=schema,
+    quality=quality,
+    generation={"generator_commit": generator_commit, "seed": 2026},
+    resume=False,
+)
+if solver_converged:
+    writer.append(
+        cpu_numpy_sample,
+        targets={"effective_c21": effective_c21},
+        sample_id="rve-000042",
+        group_id="parent-000017",
+        split=assignment["parent-000017"],
+        provenance=solver_provenance,
+        metadata={"weave_family": "plain"},
+    )
+else:
+    writer.reject(
+        sample_id="rve-000042",
+        stage="label",
+        reason="PCG residual exceeds the configured threshold",
+    )
+writer.finalize()
+```
+
+Each completed shard is fsynced, checksummed, and journaled. `resume=True`
+continues only when the serialized schema, quality policy, and generation
+configuration digest match; incomplete trailing shards are discarded. Finalize
+publishes by atomic directory rename. Existing published targets are never
+overwritten.
+
+For effective engineering-Voigt C21 labels, provenance must include solver
+commit, element formulation, arithmetic dtype, tolerance, observed maximum
+residual, iteration count, wall time, and target units. The quality policy can
+require positive-definite targets and enforce a maximum residual. Solver
+arithmetic dtype is independent of storage dtype: an FP32 Voxel-ACDM result may
+be explicitly converted to an FP64 label while retaining `"float32"` in its
+provenance.
+
+Audit before training or archival:
+
+```python
+from pytexgen.training_io import audit_simulation_dataset
+
+report = audit_simulation_dataset("rve_dataset", verify="sample")
+assert report["ok"]
+```
+
+Verification levels are `manifest` (metadata structure), `shard` (checksums
+when selected arrays open), and `sample` (all checksums plus geometry digests).
+All manifest paths are constrained to the dataset root.
+
+### Selective Loading, Augmentation, and CUDA Prefetch
+
+The reader is map-style, picklable, and resets its mmap cache after process
+spawn. Only selected fields are opened:
+
+```python
+from pytexgen.training_data import CubicRotation
+from pytexgen.training_io import SimulationDataset
+
+rotation = CubicRotation(seed=41, probability=0.5)
+train = SimulationDataset(
+    "rve_dataset",
+    split="train",
+    inputs=("voxel.material_id", "orientation.primary"),
+    targets=("effective_c21",),
+    verify="shard",
+    transform=rotation,
+)
+train.set_epoch(3)
+```
+
+`CubicRotation` chooses deterministically from the 24 proper cube rotations and
+transforms coupled spatial grids, sparse indices, directions, global stiffness
+C21, AABBs, and effective C21 labels. Local material-table C21 is invariant.
+No reflections or interpolated arbitrary-angle rotations are applied.
+
+```python
+from pytexgen.torch_training import CudaPrefetcher, make_simulation_dataloader
+
+loader = make_simulation_dataloader(
+    train,
+    batch_size=16,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+    seed=41,
+)
+
+prefetch = CudaPrefetcher(loader, device="cuda")
+for batch in prefetch:
+    # Fixed fields are tensors; ragged fields expose .values and .offsets.
+    ids = batch.inputs["voxel.material_id"]
+    directions = batch.inputs["orientation.primary"]
+    prediction = model((ids != 0).float().unsqueeze(1))
+    loss = criterion(
+        prediction, batch.targets["effective_c21"].float()
+    )
+    loss.backward()
+```
+
+Collation first creates one owned contiguous CPU batch. PyTorch views that
+allocation without a copy, pins the custom batch, and leaves CUDA initialization
+in the main process. `CudaPrefetcher` overlaps non-blocking H2D transfer on a
+dedicated stream, records consumer streams for allocator safety, and reports
+`transferred_bytes`, `wait_seconds`, and `recorded_tensors`. Individual tensors
+can be passed directly through DLPack to JAX, CuPy, or Warp.
+
 When the same textile is voxelized repeatedly, cache the TexGen geometry
 snapshot once:
 

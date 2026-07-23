@@ -161,7 +161,10 @@ IF(BUILD_PYTHON_INTERFACE)
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/simulation_sample.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/simulation_io.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/acdm_solver.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/torch_periodic_mesher.py")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/torch_periodic_mesher.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/training_data.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/training_io.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/torch_training.py")
 
     # ========================================================================
     # Install targets

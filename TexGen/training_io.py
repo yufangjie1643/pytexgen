@@ -59,14 +59,6 @@ _C21_INDICES = tuple(
 )
 
 
-def _simulation_sample_class():
-    try:
-        from .simulation_sample import SimulationSample
-    except ImportError:  # pragma: no cover - legacy TexGen package name
-        from TexGen.simulation_sample import SimulationSample
-    return SimulationSample
-
-
 class DatasetFormatError(ValueError):
     """Dataset metadata or array layout is structurally invalid."""
 
@@ -289,12 +281,9 @@ def _validate_provenance(
             raise ValueError(
                 "provenance arithmetic_dtype is invalid"
             ) from exc
-        target_dtypes = {
-            np.dtype(spec.dtype) for spec in schema.targets
-        }
-        if len(target_dtypes) == 1 and arithmetic_dtype not in target_dtypes:
+        if arithmetic_dtype.kind != "f":
             raise ValueError(
-                "provenance arithmetic_dtype does not match target dtype"
+                "provenance arithmetic_dtype must be floating point"
             )
         data["arithmetic_dtype"] = arithmetic_dtype.name
     if "tolerance" in data:
@@ -366,7 +355,7 @@ def _validate_target_quality(
 
 
 class SimulationDatasetWriter:
-    """Stream validated :class:`SimulationSample` values into native shards."""
+    """Stream SimulationSample-compatible values into native shards."""
 
     @classmethod
     def create(
@@ -877,8 +866,20 @@ class SimulationDatasetWriter:
     ) -> None:
         if self._finalized:
             raise RuntimeError("cannot append after finalize")
-        if not isinstance(sample, _simulation_sample_class()):
-            raise TypeError("sample must be a SimulationSample")
+        required = ("array", "materials", "storage", "device")
+        missing = tuple(
+            name for name in required if not hasattr(sample, name)
+        )
+        if missing or not callable(getattr(sample, "array", None)):
+            details = ", ".join(missing) if missing else "callable array"
+            raise TypeError(
+                "sample must implement the SimulationSample protocol; "
+                f"missing {details}"
+            )
+        if not hasattr(sample.materials, "unit"):
+            raise TypeError(
+                "sample materials must expose an explicit unit"
+            )
         if sample.storage != "numpy" or sample.device != "cpu":
             raise ValueError(
                 "dataset writing requires explicit CPU NumPy samples"
