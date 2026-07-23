@@ -12,7 +12,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -752,6 +752,8 @@ def build_stiffness_field(
     matrix_stiffness: Any,
     default_yarn_stiffness: Any = None,
     yarn_stiffness_by_id: Optional[dict] = None,
+    default_yarn_material_id: Optional[int] = None,
+    yarn_material_id_by_id: Optional[Mapping[int, int]] = None,
     output: str = "sparse",
     chunk_voxels: int = 65536,
     validate_positive_definite: bool = False,
@@ -775,6 +777,67 @@ def build_stiffness_field(
         yarn_id: _coerce_c21_for_field(value, orientation)
         for yarn_id, value in sorted(overrides.items())
     }
+    explicit_ids = (
+        default_yarn_material_id is not None
+        or yarn_material_id_by_id is not None
+    )
+    explicit_override_ids = (
+        {}
+        if yarn_material_id_by_id is None
+        else {
+            int(yarn_id): int(material_id)
+            for yarn_id, material_id in yarn_material_id_by_id.items()
+        }
+    )
+    if explicit_ids:
+        if default_c21 is not None and default_yarn_material_id is None:
+            raise ValueError(
+                "default_yarn_material_id is required with "
+                "default_yarn_stiffness"
+            )
+        if default_c21 is None and default_yarn_material_id is not None:
+            raise ValueError(
+                "default_yarn_stiffness is required with "
+                "default_yarn_material_id"
+            )
+        missing_ids = sorted(set(override_c21) - set(explicit_override_ids))
+        if missing_ids:
+            raise ValueError(
+                f"missing yarn material ID for yarn ID {missing_ids[0]}"
+            )
+        missing_stiffness = sorted(
+            set(explicit_override_ids) - set(override_c21)
+        )
+        if missing_stiffness:
+            raise ValueError(
+                f"missing stiffness for yarn ID {missing_stiffness[0]}"
+            )
+        material_values = list(explicit_override_ids.values())
+        if default_yarn_material_id is not None:
+            material_values.append(int(default_yarn_material_id))
+        max_material_id = np.iinfo(np.int32).max
+        if any(
+            value <= 0 or value > max_material_id
+            for value in material_values
+        ):
+            raise ValueError(
+                "explicit yarn material IDs must be positive int32 values"
+            )
+        resolved_default_id = (
+            None
+            if default_yarn_material_id is None
+            else int(default_yarn_material_id)
+        )
+        resolved_override_ids = explicit_override_ids
+    else:
+        resolved_default_id = 1 if default_c21 is not None else None
+        resolved_override_ids = {
+            yarn_id: material_id
+            for material_id, yarn_id in enumerate(
+                sorted(override_c21),
+                start=2,
+            )
+        }
     if validate_positive_definite:
         _validate_positive_definite(matrix_c21, "matrix")
         if default_c21 is not None:
@@ -792,21 +855,19 @@ def build_stiffness_field(
         )
         if default_c21 is not None:
             local_c21[:] = default_c21
-            material_ids.fill_(1)
+            material_ids.fill_(resolved_default_id)
     else:
         float_dtype = orientation.orientation1.dtype
         local_c21 = np.empty((count, 21), dtype=float_dtype)
         material_ids = np.zeros(count, dtype=np.int32)
         if default_c21 is not None:
             local_c21[:] = default_c21
-            material_ids.fill(1)
+            material_ids.fill(resolved_default_id)
 
-    for material_id, (yarn_id, value) in enumerate(
-        override_c21.items(), start=2
-    ):
+    for yarn_id, value in override_c21.items():
         mask = orientation.yarn_ids == yarn_id
         local_c21[mask] = value
-        material_ids[mask] = material_id
+        material_ids[mask] = resolved_override_ids[yarn_id]
 
     missing = material_ids == 0
     if _any_true(missing):
@@ -828,8 +889,8 @@ def build_stiffness_field(
     )
     result = SparseStiffnessField(
         matrix_c21=matrix_c21,
-        voxel_indices=_copy_array(orientation.voxel_indices),
-        yarn_ids=_copy_array(orientation.yarn_ids),
+        voxel_indices=orientation.voxel_indices,
+        yarn_ids=orientation.yarn_ids,
         material_ids=material_ids,
         yarn_c21=rotated_c21,
         grid_shape=orientation.grid_shape,
@@ -1074,6 +1135,9 @@ def voxelize_textile_material_fields(
     matrix_stiffness: Any,
     default_yarn_stiffness: Any = None,
     yarn_stiffness_by_id: Optional[dict] = None,
+    default_yarn_material_id: Optional[int] = None,
+    yarn_material_id_by_id: Optional[Mapping[int, int]] = None,
+    unit: Optional[str] = None,
     orientation_storage: str = "sparse",
     stiffness_output: str = "sparse",
     **voxel_kwargs,
@@ -1102,6 +1166,9 @@ def voxelize_textile_material_fields(
         "matrix_stiffness": matrix_stiffness,
         "default_yarn_stiffness": default_yarn_stiffness,
         "yarn_stiffness_by_id": yarn_stiffness_by_id,
+        "default_yarn_material_id": default_yarn_material_id,
+        "yarn_material_id_by_id": yarn_material_id_by_id,
+        "unit": unit,
         "output": stiffness_output,
     }
     if "chunk_voxels" in voxel_kwargs:

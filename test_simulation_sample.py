@@ -6,6 +6,7 @@ import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -558,6 +559,74 @@ class SimulationSampleFieldTest(unittest.TestCase):
             copied.voxels.yarn_id.data_ptr(),
             torch_sample.voxels.yarn_id.data_ptr(),
         )
+
+
+class SimulationSampleWorkflowTest(unittest.TestCase):
+    def setUp(self):
+        fixture = SimulationSampleValidationTest(
+            "test_construction_is_zero_copy_and_adopts_voxel_orientation"
+        )
+        fixture.setUp()
+        self.fixture = fixture
+        self.sample_module = fixture.sample_module
+
+    def test_one_call_resolves_explicit_material_rows(self):
+        voxels, orientation, stiffness, materials = (
+            self.fixture.make_components()
+        )
+        textile = object()
+
+        with mock.patch.object(
+            self.sample_module,
+            "voxelize_textile_material_fields",
+            return_value=(voxels, stiffness),
+        ) as voxelize:
+            sample = self.sample_module.voxelize_textile_simulation_sample(
+                textile,
+                materials=materials,
+                default_yarn_material_id=7,
+                yarn_material_id_by_id={2: 9},
+                metadata={"case": "workflow"},
+                nx=2,
+                ny=2,
+                nz=1,
+                backend="numpy",
+            )
+
+        self.assertIsInstance(sample, self.sample_module.SimulationSample)
+        self.assertIs(sample.voxels, voxels)
+        self.assertIs(sample.stiffness, stiffness)
+        self.assertEqual(sample.metadata["case"], "workflow")
+        kwargs = voxelize.call_args.kwargs
+        np.testing.assert_array_equal(
+            kwargs["matrix_stiffness"],
+            materials.c21_for_id(0),
+        )
+        np.testing.assert_array_equal(
+            kwargs["default_yarn_stiffness"],
+            materials.c21_for_id(7),
+        )
+        np.testing.assert_array_equal(
+            kwargs["yarn_stiffness_by_id"][2],
+            materials.c21_for_id(9),
+        )
+        self.assertEqual(kwargs["default_yarn_material_id"], 7)
+        self.assertEqual(kwargs["yarn_material_id_by_id"], {2: 9})
+        self.assertEqual(kwargs["unit"], "GPa")
+        self.assertEqual(kwargs["nx"], 2)
+
+    def test_one_call_rejects_unknown_explicit_material_id(self):
+        _, _, _, materials = self.fixture.make_components()
+
+        with self.assertRaisesRegex(KeyError, "unknown material ID 99"):
+            self.sample_module.voxelize_textile_simulation_sample(
+                object(),
+                materials=materials,
+                default_yarn_material_id=99,
+                nx=2,
+                ny=2,
+                nz=1,
+            )
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")

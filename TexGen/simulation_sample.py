@@ -26,6 +26,7 @@ try:
         SparseOrientationField,
         SparseStiffnessField,
         unpack_c21,
+        voxelize_textile_material_fields,
     )
 except ImportError:  # pragma: no cover - legacy TexGen package name
     from TexGen.gpu_voxelizer import VoxelGridData
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - legacy TexGen package name
         SparseOrientationField,
         SparseStiffnessField,
         unpack_c21,
+        voxelize_textile_material_fields,
     )
 
 
@@ -852,4 +854,76 @@ class SimulationSample:
         return result
 
 
-__all__ = ["MaterialTable", "SimulationSample"]
+def voxelize_textile_simulation_sample(
+    textile: Any,
+    *,
+    materials: MaterialTable,
+    default_yarn_material_id: Optional[int] = None,
+    yarn_material_id_by_id: Optional[Mapping[int, int]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    **voxel_kwargs,
+) -> SimulationSample:
+    """Voxelize a textile and build a validated sparse simulation sample."""
+    if not isinstance(materials, MaterialTable):
+        raise TypeError("materials must be a MaterialTable")
+    yarn_material_ids = (
+        {}
+        if yarn_material_id_by_id is None
+        else {
+            int(yarn_id): int(material_id)
+            for yarn_id, material_id in yarn_material_id_by_id.items()
+        }
+    )
+    default_stiffness = (
+        None
+        if default_yarn_material_id is None
+        else materials.c21_for_id(int(default_yarn_material_id))
+    )
+    yarn_stiffness = {
+        yarn_id: materials.c21_for_id(material_id)
+        for yarn_id, material_id in yarn_material_ids.items()
+    }
+    data, stiffness = voxelize_textile_material_fields(
+        textile,
+        matrix_stiffness=materials.c21_for_id(0),
+        default_yarn_stiffness=default_stiffness,
+        yarn_stiffness_by_id=yarn_stiffness,
+        default_yarn_material_id=default_yarn_material_id,
+        yarn_material_id_by_id=yarn_material_ids,
+        unit=materials.unit,
+        orientation_storage="sparse",
+        stiffness_output="sparse",
+        **voxel_kwargs,
+    )
+
+    float_dtype = stiffness.matrix_c21.dtype
+    if (
+        materials.storage == stiffness.storage
+        and materials.device == stiffness.device
+        and materials.c21.dtype == float_dtype
+    ):
+        resolved_materials = materials
+    else:
+        resolved_materials = materials.to(
+            stiffness.storage,
+            device=(
+                stiffness.device
+                if stiffness.storage == "torch"
+                else None
+            ),
+            dtype=float_dtype,
+        )
+    return SimulationSample(
+        voxels=data,
+        orientation=data.sparse_orientation,
+        stiffness=stiffness,
+        materials=resolved_materials,
+        metadata={} if metadata is None else metadata,
+    )
+
+
+__all__ = [
+    "MaterialTable",
+    "SimulationSample",
+    "voxelize_textile_simulation_sample",
+]

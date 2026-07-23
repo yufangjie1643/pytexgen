@@ -410,6 +410,9 @@ class OrchestrationTest(unittest.TestCase):
                 matrix_stiffness=matrix,
                 default_yarn_stiffness=default_yarn,
                 yarn_stiffness_by_id=overrides,
+                default_yarn_material_id=7,
+                yarn_material_id_by_id={3: 19},
+                unit="GPa",
                 orientation_storage="sparse",
                 stiffness_output="sparse",
                 nx=32,
@@ -436,6 +439,12 @@ class OrchestrationTest(unittest.TestCase):
             calls["build"][1]["default_yarn_stiffness"], default_yarn
         )
         self.assertIs(calls["build"][1]["yarn_stiffness_by_id"], overrides)
+        self.assertEqual(calls["build"][1]["default_yarn_material_id"], 7)
+        self.assertEqual(
+            calls["build"][1]["yarn_material_id_by_id"],
+            {3: 19},
+        )
+        self.assertEqual(calls["build"][1]["unit"], "GPa")
 
     def test_one_call_rejects_disabled_orientations(self):
         with self.assertRaisesRegex(ValueError, "include_orientations"):
@@ -615,6 +624,63 @@ class StiffnessRotationTest(unittest.TestCase):
         np.testing.assert_allclose(result.yarn_c21[0], 2.0)
         np.testing.assert_allclose(result.yarn_c21[1], 3.0)
         self.assertEqual(result.unit, "Pa")
+
+    def test_builder_preserves_explicit_material_ids_and_sparse_topology(self):
+        orientation = self.make_three_voxel_field()
+        data = type(
+            "VoxelData",
+            (),
+            {"sparse_orientation": orientation},
+        )()
+
+        result = self.mf.build_stiffness_field(
+            data,
+            matrix_stiffness=np.ones(21),
+            default_yarn_stiffness=np.full(21, 2.0),
+            yarn_stiffness_by_id={7: np.full(21, 3.0)},
+            default_yarn_material_id=7,
+            yarn_material_id_by_id={7: 19},
+        )
+
+        self.assertEqual(result.material_ids.tolist(), [7, 19, 7])
+        self.assertIs(result.voxel_indices, orientation.voxel_indices)
+        self.assertIs(result.yarn_ids, orientation.yarn_ids)
+
+    def test_builder_validates_explicit_material_assignment_pairs(self):
+        data = type(
+            "VoxelData",
+            (),
+            {"sparse_orientation": self.make_three_voxel_field()},
+        )()
+        common = {
+            "data": data,
+            "matrix_stiffness": np.ones(21),
+            "default_yarn_stiffness": np.full(21, 2.0),
+            "yarn_stiffness_by_id": {7: np.full(21, 3.0)},
+        }
+
+        with self.assertRaisesRegex(ValueError, "default_yarn_material_id"):
+            self.mf.build_stiffness_field(
+                **common,
+                yarn_material_id_by_id={7: 19},
+            )
+        with self.assertRaisesRegex(ValueError, "yarn material ID.*7"):
+            self.mf.build_stiffness_field(
+                **common,
+                default_yarn_material_id=7,
+            )
+        with self.assertRaisesRegex(ValueError, "stiffness.*yarn ID 8"):
+            self.mf.build_stiffness_field(
+                **common,
+                default_yarn_material_id=7,
+                yarn_material_id_by_id={7: 19, 8: 21},
+            )
+        with self.assertRaisesRegex(ValueError, "positive"):
+            self.mf.build_stiffness_field(
+                **common,
+                default_yarn_material_id=0,
+                yarn_material_id_by_id={7: 19},
+            )
 
     def test_builder_requires_material_for_every_yarn(self):
         data = type(
