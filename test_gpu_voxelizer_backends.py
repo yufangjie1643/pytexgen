@@ -7,6 +7,7 @@ numpy, adaptive numpy, and torch when torch is installed.
 
 import importlib.util
 import inspect
+import json
 import sys
 import tempfile
 import types
@@ -512,6 +513,128 @@ class VoxelizerBackendTest(unittest.TestCase):
                 )
             self.assertTrue(self.voxelizer._is_torch_tensor(torch_loaded.yarn_id))
             self.assertTrue(self.voxelizer._is_torch_tensor(torch_loaded.orientation1))
+
+    def test_sparse_orientation_conversion_and_npz_roundtrip(self):
+        self.patch_extract_snapshots()
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_orientations=True,
+            orientation_storage="sparse",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        if self.voxelizer.torch is not None:
+            torch_data = data.to("torch", device="cpu", dtype="float64")
+            self.assertEqual(torch_data.sparse_orientation.storage, "torch")
+            self.assertEqual(
+                torch_data.sparse_orientation.orientation1.dtype,
+                self.voxelizer.torch.float64,
+            )
+            data = torch_data.to("numpy", dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sparse_voxels.npz"
+            data.save_npz(path)
+            with np.load(path, allow_pickle=False) as archive:
+                self.assertTrue(
+                    {
+                        "orientation_voxel_indices",
+                        "orientation_yarn_ids",
+                        "sparse_orientation1",
+                        "sparse_orientation2",
+                    }.issubset(archive.files)
+                )
+            loaded = self.voxelizer.VoxelGridData.load_npz(path)
+
+        actual = loaded.sparse_orientation
+        expected = data.sparse_orientation
+        self.assertIsNotNone(actual)
+        self.assertEqual(actual.grid_shape, (4, 4, 4))
+        self.assertEqual(actual.order, expected.order)
+        for name in (
+            "voxel_indices", "yarn_ids", "orientation1", "orientation2"
+        ):
+            np.testing.assert_array_equal(
+                getattr(actual, name), getattr(expected, name)
+            )
+
+    def test_sparse_orientation_npy_dir_roundtrip_and_mmap(self):
+        self.patch_extract_snapshots()
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_orientations=True,
+            orientation_storage="sparse",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sparse_voxels"
+            data.save_npy_dir(path)
+            metadata = json.loads(
+                (path / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["format_version"], 2)
+            self.assertTrue(
+                {
+                    "orientation_voxel_indices.npy",
+                    "orientation_yarn_ids.npy",
+                    "sparse_orientation1.npy",
+                    "sparse_orientation2.npy",
+                }.issubset({item.name for item in path.iterdir()})
+            )
+            loaded = self.voxelizer.VoxelGridData.load_npy_dir(
+                path, mmap_mode="r"
+            )
+            self.assertIsInstance(
+                loaded.sparse_orientation.orientation1, np.memmap
+            )
+            np.testing.assert_array_equal(
+                loaded.sparse_orientation.voxel_indices,
+                data.sparse_orientation.voxel_indices,
+            )
+
+    def test_load_npy_dir_accepts_version_one_dense_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy"
+            path.mkdir()
+            yarn_id = np.array([-1, 0], dtype=np.int32)
+            aabb = np.array([[0.0, 0.0, 0.0], [2.0, 1.0, 1.0]])
+            orientation1 = np.zeros((1, 1, 2, 3), dtype=np.float32)
+            np.save(path / "yarn_id.npy", yarn_id, allow_pickle=False)
+            np.save(path / "aabb.npy", aabb, allow_pickle=False)
+            np.save(
+                path / "orientation1.npy", orientation1, allow_pickle=False
+            )
+            (path / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format": "pytexgen.voxel_grid_npy_dir",
+                        "format_version": 1,
+                        "resolution": [2, 1, 1],
+                        "arrays": {
+                            "yarn_id": "yarn_id.npy",
+                            "aabb": "aabb.npy",
+                            "orientation1": "orientation1.npy",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = self.voxelizer.VoxelGridData.load_npy_dir(path)
+
+        np.testing.assert_array_equal(loaded.yarn_id, yarn_id)
+        np.testing.assert_array_equal(loaded.orientation1, orientation1)
+        self.assertIsNone(loaded.sparse_orientation)
 
     def test_voxel_grid_data_orientation_conversion(self):
         snap = synthetic_snapshot(self.voxelizer)

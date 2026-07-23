@@ -7,8 +7,10 @@ triangle of the symmetric ``6 x 6`` matrix.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
@@ -835,6 +837,215 @@ def build_stiffness_field(
     raise ValueError('output must be "sparse" or "dense"')
 
 
+_MATERIAL_FIELD_FORMAT = "pytexgen.sparse_material_fields"
+_MATERIAL_FIELD_VERSION = 1
+_MATERIAL_FIELD_FILES = {
+    "voxel_indices": "voxel_indices.npy",
+    "yarn_ids": "yarn_ids.npy",
+    "material_ids": "material_ids.npy",
+    "orientation1": "orientation1.npy",
+    "orientation2": "orientation2.npy",
+    "matrix_c21": "matrix_c21.npy",
+    "yarn_c21": "yarn_c21.npy",
+}
+
+
+def _material_field_numpy_arrays(
+    orientation: SparseOrientationField,
+    stiffness: SparseStiffnessField,
+):
+    if not isinstance(orientation, SparseOrientationField):
+        raise TypeError("orientation must be a SparseOrientationField")
+    if not isinstance(stiffness, SparseStiffnessField):
+        raise TypeError("stiffness must be a SparseStiffnessField")
+    orientation_numpy = orientation.to("numpy", copy=False)
+    stiffness_numpy = stiffness.to("numpy", copy=False)
+    if orientation_numpy.grid_shape != stiffness_numpy.grid_shape:
+        raise ValueError("orientation and stiffness grid_shape must match")
+    if orientation_numpy.order != stiffness_numpy.order:
+        raise ValueError("orientation and stiffness order must match")
+    if not np.array_equal(
+        orientation_numpy.voxel_indices, stiffness_numpy.voxel_indices
+    ):
+        raise ValueError("orientation and stiffness voxel_indices must match")
+    if not np.array_equal(
+        orientation_numpy.yarn_ids, stiffness_numpy.yarn_ids
+    ):
+        raise ValueError("orientation and stiffness yarn_ids must match")
+    arrays = {
+        "voxel_indices": orientation_numpy.voxel_indices,
+        "yarn_ids": orientation_numpy.yarn_ids,
+        "material_ids": stiffness_numpy.material_ids,
+        "orientation1": orientation_numpy.orientation1,
+        "orientation2": orientation_numpy.orientation2,
+        "matrix_c21": stiffness_numpy.matrix_c21,
+        "yarn_c21": stiffness_numpy.yarn_c21,
+    }
+    float_dtypes = {
+        np.dtype(arrays[name].dtype)
+        for name in (
+            "orientation1", "orientation2", "matrix_c21", "yarn_c21"
+        )
+    }
+    if len(float_dtypes) != 1:
+        raise ValueError(
+            "orientation and stiffness floating-point dtypes must match"
+        )
+    return orientation_numpy, stiffness_numpy, arrays
+
+
+def _material_field_metadata(
+    orientation: SparseOrientationField,
+    stiffness: SparseStiffnessField,
+    arrays,
+):
+    return {
+        "format": _MATERIAL_FIELD_FORMAT,
+        "format_version": _MATERIAL_FIELD_VERSION,
+        "grid_shape": list(orientation.grid_shape),
+        "order": orientation.order,
+        "voigt_components": list(VOIGT_COMPONENTS),
+        "c21_indices": [list(pair) for pair in C21_INDICES],
+        "c21_packing": "row-major upper triangle of symmetric 6x6",
+        "dtype": str(arrays["orientation1"].dtype),
+        "original_device": orientation.device,
+        "original_stiffness_device": stiffness.device,
+        "unit": stiffness.unit,
+        "arrays": dict(_MATERIAL_FIELD_FILES),
+    }
+
+
+def save_material_field_bundle(
+    path: Any,
+    orientation: SparseOrientationField,
+    stiffness: SparseStiffnessField,
+    *,
+    compressed: bool = True,
+) -> None:
+    """Persist compact orientation and C21 stiffness fields.
+
+    Saving is an explicit device-to-CPU boundary for Torch/CUDA fields. A path
+    ending in ``.npz`` creates one archive; any other path creates the
+    memory-mappable directory schema.
+    """
+    orientation_numpy, stiffness_numpy, arrays = _material_field_numpy_arrays(
+        orientation, stiffness
+    )
+    metadata = _material_field_metadata(orientation, stiffness, arrays)
+    out_path = Path(path)
+    if out_path.suffix.lower() == ".npz":
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(arrays)
+        payload["metadata_json"] = np.asarray(
+            json.dumps(metadata, sort_keys=True)
+        )
+        saver = np.savez_compressed if compressed else np.savez
+        saver(out_path, **payload)
+        return
+
+    out_path.mkdir(parents=True, exist_ok=True)
+    for name, filename in _MATERIAL_FIELD_FILES.items():
+        np.save(out_path / filename, arrays[name], allow_pickle=False)
+    (out_path / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _validate_material_field_metadata(metadata: Any) -> Tuple[int, int, int]:
+    if not isinstance(metadata, dict):
+        raise ValueError("material field metadata must be a JSON object")
+    if metadata.get("format") != _MATERIAL_FIELD_FORMAT:
+        raise ValueError("unsupported material field format")
+    if int(metadata.get("format_version", -1)) != _MATERIAL_FIELD_VERSION:
+        raise ValueError("unsupported material field format version")
+    if tuple(metadata.get("voigt_components", ())) != VOIGT_COMPONENTS:
+        raise ValueError("material field Voigt component order is invalid")
+    c21_indices = tuple(
+        tuple(int(value) for value in pair)
+        for pair in metadata.get("c21_indices", ())
+    )
+    if c21_indices != C21_INDICES:
+        raise ValueError("material field C21 packing order is invalid")
+    if metadata.get("arrays") != _MATERIAL_FIELD_FILES:
+        raise ValueError("material field array manifest is invalid")
+    return _validate_grid_shape(metadata.get("grid_shape", ()))
+
+
+def _construct_material_fields(metadata: Any, arrays):
+    grid_shape = _validate_material_field_metadata(metadata)
+    order = str(metadata.get("order", ""))
+    if not order:
+        raise ValueError("material field order must not be empty")
+    orientation = SparseOrientationField(
+        voxel_indices=arrays["voxel_indices"],
+        yarn_ids=arrays["yarn_ids"],
+        orientation1=arrays["orientation1"],
+        orientation2=arrays["orientation2"],
+        grid_shape=grid_shape,
+        order=order,
+    )
+    stiffness = SparseStiffnessField(
+        matrix_c21=arrays["matrix_c21"],
+        voxel_indices=arrays["voxel_indices"],
+        yarn_ids=arrays["yarn_ids"],
+        material_ids=arrays["material_ids"],
+        yarn_c21=arrays["yarn_c21"],
+        grid_shape=grid_shape,
+        unit=metadata.get("unit"),
+        order=order,
+    )
+    return orientation, stiffness
+
+
+def load_material_field_bundle(
+    path: Any,
+    *,
+    output: str = "numpy",
+    device: Optional[str] = None,
+    mmap_mode: Optional[str] = None,
+):
+    """Load a compact material-field archive as NumPy or Torch arrays."""
+    output_normalized = str(output).lower()
+    if output_normalized not in {"numpy", "torch"}:
+        raise ValueError('output must be "numpy" or "torch"')
+    if output_normalized == "torch" and mmap_mode is not None:
+        raise ValueError("mmap_mode is incompatible with Torch output")
+
+    in_path = Path(path)
+    if in_path.suffix.lower() == ".npz" or in_path.is_file():
+        with np.load(in_path, allow_pickle=False) as archive:
+            if "metadata_json" not in archive.files:
+                raise ValueError("material field archive is missing metadata_json")
+            metadata = json.loads(str(archive["metadata_json"].item()))
+            missing = sorted(set(_MATERIAL_FIELD_FILES) - set(archive.files))
+            if missing:
+                raise ValueError(
+                    f"material field archive is missing arrays: {missing}"
+                )
+            arrays = {
+                name: archive[name].copy() for name in _MATERIAL_FIELD_FILES
+            }
+    else:
+        metadata_path = in_path / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        _validate_material_field_metadata(metadata)
+        arrays = {
+            name: np.load(
+                in_path / filename,
+                allow_pickle=False,
+                mmap_mode=mmap_mode,
+            )
+            for name, filename in _MATERIAL_FIELD_FILES.items()
+        }
+
+    orientation, stiffness = _construct_material_fields(metadata, arrays)
+    if output_normalized == "torch":
+        orientation = orientation.to("torch", device=device, copy=False)
+        stiffness = stiffness.to("torch", device=device, copy=False)
+    return orientation, stiffness
+
+
 __all__ = [
     "VOIGT_COMPONENTS",
     "C21_INDICES",
@@ -846,4 +1057,6 @@ __all__ = [
     "orthotropic_stiffness_c21",
     "rotate_stiffness_c21",
     "build_stiffness_field",
+    "save_material_field_bundle",
+    "load_material_field_bundle",
 ]

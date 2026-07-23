@@ -571,6 +571,8 @@ class VoxelGridData:
         payload = {
             "yarn_id": _array_to_numpy(self.yarn_id, copy=False),
             "aabb": _array_to_numpy(self.aabb, copy=False),
+            "format": np.asarray("pytexgen.voxel_grid_npz"),
+            "format_version": np.asarray(2, dtype=np.int64),
             "resolution": np.asarray(self.resolution, dtype=np.int64),
             "aabb_pruning": np.asarray(bool(self.aabb_pruning)),
             "backend": np.asarray(self.backend),
@@ -586,6 +588,23 @@ class VoxelGridData:
             payload["orientation1"] = _array_to_numpy(self.orientation1, copy=False)
         if self.orientation2 is not None:
             payload["orientation2"] = _array_to_numpy(self.orientation2, copy=False)
+        if self.sparse_orientation is not None:
+            sparse = self.sparse_orientation
+            payload.update(
+                orientation_voxel_indices=_array_to_numpy(
+                    sparse.voxel_indices, copy=False
+                ),
+                orientation_yarn_ids=_array_to_numpy(
+                    sparse.yarn_ids, copy=False
+                ),
+                sparse_orientation1=_array_to_numpy(
+                    sparse.orientation1, copy=False
+                ),
+                sparse_orientation2=_array_to_numpy(
+                    sparse.orientation2, copy=False
+                ),
+                orientation_order=np.asarray(sparse.order),
+            )
 
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -605,26 +624,42 @@ class VoxelGridData:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         arrays = {
-            "yarn_id": "yarn_id.npy",
-            "aabb": "aabb.npy",
+            "yarn_id": ("yarn_id.npy", self.yarn_id),
+            "aabb": ("aabb.npy", self.aabb),
         }
         if include_centers and self.centers is not None:
-            arrays["centers"] = "centers.npy"
+            arrays["centers"] = ("centers.npy", self.centers)
         if self.orientation1 is not None:
-            arrays["orientation1"] = "orientation1.npy"
+            arrays["orientation1"] = ("orientation1.npy", self.orientation1)
         if self.orientation2 is not None:
-            arrays["orientation2"] = "orientation2.npy"
+            arrays["orientation2"] = ("orientation2.npy", self.orientation2)
+        if self.sparse_orientation is not None:
+            sparse = self.sparse_orientation
+            arrays.update(
+                orientation_voxel_indices=(
+                    "orientation_voxel_indices.npy", sparse.voxel_indices
+                ),
+                orientation_yarn_ids=(
+                    "orientation_yarn_ids.npy", sparse.yarn_ids
+                ),
+                sparse_orientation1=(
+                    "sparse_orientation1.npy", sparse.orientation1
+                ),
+                sparse_orientation2=(
+                    "sparse_orientation2.npy", sparse.orientation2
+                ),
+            )
 
-        for field, filename in arrays.items():
+        for filename, value in arrays.values():
             np.save(
                 out_dir / filename,
-                _array_to_numpy(getattr(self, field), copy=False),
+                _array_to_numpy(value, copy=False),
                 allow_pickle=False,
             )
 
         metadata = {
             "format": "pytexgen.voxel_grid_npy_dir",
-            "format_version": 1,
+            "format_version": 2,
             "resolution": list(self.resolution),
             "aabb_pruning": bool(self.aabb_pruning),
             "backend": self.backend,
@@ -634,8 +669,12 @@ class VoxelGridData:
             "order": self.order,
             "workers": int(self.workers),
             "timings": dict(self.timings),
-            "arrays": arrays,
+            "arrays": {
+                field: filename for field, (filename, _value) in arrays.items()
+            },
         }
+        if self.sparse_orientation is not None:
+            metadata["orientation_order"] = self.sparse_orientation.order
         (out_dir / "metadata.json").write_text(
             json.dumps(metadata, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -668,10 +707,39 @@ class VoxelGridData:
             orientation2 = (
                 data["orientation2"].copy() if "orientation2" in data.files else None
             )
+            sparse_names = {
+                "orientation_voxel_indices",
+                "orientation_yarn_ids",
+                "sparse_orientation1",
+                "sparse_orientation2",
+            }
+            sparse_present = sparse_names.intersection(data.files)
+            if sparse_present and sparse_present != sparse_names:
+                missing = sorted(sparse_names - sparse_present)
+                raise ValueError(
+                    f"sparse orientation archive is missing arrays: {missing}"
+                )
+            resolution = tuple(
+                int(v) for v in data["resolution"].tolist()
+            )
+            sparse_orientation = None
+            if sparse_present:
+                sparse_orientation = SparseOrientationField(
+                    voxel_indices=data["orientation_voxel_indices"].copy(),
+                    yarn_ids=data["orientation_yarn_ids"].copy(),
+                    orientation1=data["sparse_orientation1"].copy(),
+                    orientation2=data["sparse_orientation2"].copy(),
+                    grid_shape=(resolution[2], resolution[1], resolution[0]),
+                    order=(
+                        str(data["orientation_order"].item())
+                        if "orientation_order" in data.files
+                        else str(data["order"].item())
+                    ),
+                )
             obj = cls(
                 yarn_id=data["yarn_id"].copy(),
                 aabb=data["aabb"].copy(),
-                resolution=tuple(int(v) for v in data["resolution"].tolist()),
+                resolution=resolution,
                 backend=str(data["backend"].item()),
                 device="cpu",
                 workers=1,
@@ -680,6 +748,7 @@ class VoxelGridData:
                 centers=centers,
                 orientation1=orientation1,
                 orientation2=orientation2,
+                sparse_orientation=sparse_orientation,
                 aabb_pruning=bool(data["aabb_pruning"].item()),
                 storage="numpy",
                 order=str(data["order"].item()),
@@ -716,6 +785,13 @@ class VoxelGridData:
         in_dir = Path(path)
         metadata_path = in_dir / "metadata.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("format") != "pytexgen.voxel_grid_npy_dir":
+            raise ValueError("unsupported voxel grid directory format")
+        format_version = int(metadata.get("format_version", 1))
+        if format_version not in {1, 2}:
+            raise ValueError(
+                f"unsupported voxel grid directory format version {format_version}"
+            )
         arrays = metadata.get("arrays", {})
 
         def load_array(field: str, *, required: bool = False):
@@ -730,10 +806,39 @@ class VoxelGridData:
                 mmap_mode=array_mmap_mode,
             )
 
+        sparse_names = {
+            "orientation_voxel_indices",
+            "orientation_yarn_ids",
+            "sparse_orientation1",
+            "sparse_orientation2",
+        }
+        sparse_present = sparse_names.intersection(arrays)
+        if sparse_present and sparse_present != sparse_names:
+            missing = sorted(sparse_names - sparse_present)
+            raise ValueError(
+                f"sparse orientation metadata is missing arrays: {missing}"
+            )
+        resolution = tuple(int(v) for v in metadata["resolution"])
+        sparse_orientation = None
+        if sparse_present:
+            sparse_orientation = SparseOrientationField(
+                voxel_indices=load_array(
+                    "orientation_voxel_indices", required=True
+                ),
+                yarn_ids=load_array("orientation_yarn_ids", required=True),
+                orientation1=load_array("sparse_orientation1", required=True),
+                orientation2=load_array("sparse_orientation2", required=True),
+                grid_shape=(resolution[2], resolution[1], resolution[0]),
+                order=str(metadata.get(
+                    "orientation_order",
+                    metadata.get("order", "ix + iy*nx + iz*nx*ny"),
+                )),
+            )
+
         obj = cls(
             yarn_id=load_array("yarn_id", required=True),
             aabb=load_array("aabb", required=True),
-            resolution=tuple(int(v) for v in metadata["resolution"]),
+            resolution=resolution,
             backend=str(metadata.get("backend", "numpy")),
             device="cpu",
             workers=int(metadata.get("workers", 1)),
@@ -742,6 +847,7 @@ class VoxelGridData:
             centers=load_array("centers"),
             orientation1=load_array("orientation1"),
             orientation2=load_array("orientation2"),
+            sparse_orientation=sparse_orientation,
             aabb_pruning=bool(metadata.get("aabb_pruning", True)),
             storage="numpy",
             order=str(metadata.get("order", "ix + iy*nx + iz*nx*ny")),

@@ -2,6 +2,7 @@
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -236,6 +237,123 @@ class SparseFieldContainerTest(unittest.TestCase):
                 yarn_c21=np.ones((2, 21)),
                 grid_shape=(1, 2, 2),
             )
+
+
+class PersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.mf = load_material_fields()
+        self.assertTrue(
+            hasattr(self.mf, "save_material_field_bundle"),
+            "save_material_field_bundle is not implemented",
+        )
+        self.assertTrue(
+            hasattr(self.mf, "load_material_field_bundle"),
+            "load_material_field_bundle is not implemented",
+        )
+
+    def make_fields(self):
+        orientation = self.mf.SparseOrientationField(
+            voxel_indices=np.array([1, 3], dtype=np.int64),
+            yarn_ids=np.array([0, 2], dtype=np.int32),
+            orientation1=np.array(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+            ),
+            orientation2=np.array(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=np.float32
+            ),
+            grid_shape=(1, 2, 2),
+        )
+        stiffness = self.mf.SparseStiffnessField(
+            matrix_c21=np.arange(21, dtype=np.float32),
+            voxel_indices=np.array([1, 3], dtype=np.int64),
+            yarn_ids=np.array([0, 2], dtype=np.int32),
+            material_ids=np.array([1, 2], dtype=np.int32),
+            yarn_c21=np.stack(
+                [
+                    np.arange(21, dtype=np.float32) + 100.0,
+                    np.arange(21, dtype=np.float32) + 200.0,
+                ]
+            ),
+            grid_shape=(1, 2, 2),
+            unit="MPa",
+        )
+        return orientation, stiffness
+
+    def assert_fields_equal(self, actual_orientation, actual_stiffness):
+        expected_orientation, expected_stiffness = self.make_fields()
+        self.assertEqual(actual_orientation.grid_shape, (1, 2, 2))
+        self.assertEqual(actual_orientation.order, expected_orientation.order)
+        self.assertEqual(actual_stiffness.unit, "MPa")
+        for name in (
+            "voxel_indices", "yarn_ids", "orientation1", "orientation2"
+        ):
+            np.testing.assert_array_equal(
+                getattr(actual_orientation, name),
+                getattr(expected_orientation, name),
+            )
+        for name in (
+            "matrix_c21", "voxel_indices", "yarn_ids",
+            "material_ids", "yarn_c21",
+        ):
+            np.testing.assert_array_equal(
+                getattr(actual_stiffness, name),
+                getattr(expected_stiffness, name),
+            )
+
+    def test_directory_bundle_roundtrip_supports_memory_mapping(self):
+        orientation, stiffness = self.make_fields()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fields"
+            self.mf.save_material_field_bundle(path, orientation, stiffness)
+
+            self.assertEqual(
+                {item.name for item in path.iterdir()},
+                {
+                    "metadata.json",
+                    "voxel_indices.npy",
+                    "yarn_ids.npy",
+                    "material_ids.npy",
+                    "orientation1.npy",
+                    "orientation2.npy",
+                    "matrix_c21.npy",
+                    "yarn_c21.npy",
+                },
+            )
+            loaded_orientation, loaded_stiffness = (
+                self.mf.load_material_field_bundle(path, mmap_mode="r")
+            )
+            self.assertIsInstance(loaded_orientation.orientation1, np.memmap)
+            self.assertIsInstance(loaded_stiffness.yarn_c21, np.memmap)
+            self.assert_fields_equal(loaded_orientation, loaded_stiffness)
+
+    def test_npz_bundle_roundtrip_and_torch_output(self):
+        orientation, stiffness = self.make_fields()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fields.npz"
+            self.mf.save_material_field_bundle(path, orientation, stiffness)
+            loaded = self.mf.load_material_field_bundle(path)
+            self.assert_fields_equal(*loaded)
+
+            if torch is not None:
+                torch_orientation, torch_stiffness = (
+                    self.mf.load_material_field_bundle(
+                        path, output="torch", device="cpu"
+                    )
+                )
+                self.assertEqual(torch_orientation.storage, "torch")
+                self.assertEqual(torch_stiffness.storage, "torch")
+                self.assertEqual(torch_orientation.orientation1.device.type, "cpu")
+
+    @unittest.skipIf(torch is None, "torch is optional")
+    def test_torch_output_rejects_memory_mapping(self):
+        orientation, stiffness = self.make_fields()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fields"
+            self.mf.save_material_field_bundle(path, orientation, stiffness)
+            with self.assertRaisesRegex(ValueError, "mmap_mode"):
+                self.mf.load_material_field_bundle(
+                    path, output="torch", mmap_mode="r"
+                )
 
 
 class StiffnessRotationTest(unittest.TestCase):
