@@ -341,3 +341,22 @@ Torch/CUDA benchmark when torch is installed:
 ```bash
 python bench_gpu_voxelizer_backends.py --include-torch --device cuda
 ```
+
+Material direction/stiffness integration and acceptance benchmark:
+
+```bash
+python bench_gpu_material_fields.py \
+  --resolutions 16 --repeat 1 --warmup 1 --device cuda \
+  --json-out build/material_fields_smoke.json
+
+python bench_gpu_material_fields.py \
+  --resolutions 128 256 --repeat 3 --warmup 1 --device cuda \
+  --json-out build/material_fields_acceptance.json
+```
+
+Each case records median/P90 time, GPU memory, RSS, output bytes, occupancy and
+yarn mismatches, direction-axis agreement, stiffness error, and environment
+metadata. `compute` compares with TexGen `GetPointInformation`; `practical`
+compares compact GPU persistence with `SaveVoxelMesh` plus `.ori/.eld` parsing.
+The large-run acceptance gate requires all two-model/two-resolution/two-mode
+records to be correct and at least 5x faster.

@@ -382,6 +382,27 @@ Torch/CUDA benchmark when torch is installed:
 python bench_gpu_voxelizer_backends.py --include-torch --device cuda
 ```
 
+Correctness-gated material direction/stiffness benchmark:
+
+```bash
+# Quick integration smoke test
+python bench_gpu_material_fields.py \
+  --resolutions 16 --repeat 1 --warmup 1 --device cuda \
+  --json-out build/material_fields_smoke.json
+
+# RTX 5090 acceptance run: both textiles, compute and export comparisons
+python bench_gpu_material_fields.py \
+  --resolutions 128 256 --repeat 3 --warmup 1 --device cuda \
+  --json-out build/material_fields_acceptance.json
+```
+
+The benchmark compares the GPU path with TexGen CPU
+`GetPointInformation` and with `CRectangularVoxelMesh.SaveVoxelMesh` plus
+orientation/data parsing. The `128³`/`256³` report passes only when every case
+meets the correctness tolerances and reaches at least 5x median speedup. Use
+`--keep-output` only when the generated CPU meshes and compact GPU fields are
+needed for inspection.
+
 ## SiC/SiC RVE Scripts
 
 The `script/` directory contains ready-to-run examples for shallow-cross
