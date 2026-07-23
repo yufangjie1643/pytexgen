@@ -86,6 +86,11 @@ try:
 except ImportError:
     from TexGen.Core import CTextile, CYarn  # type: ignore
 
+try:
+    from .material_fields import SparseOrientationField
+except ImportError:
+    from TexGen.material_fields import SparseOrientationField
+
 # BUILD_TYPE bitmask constants from CYarn. SWIG exposes them as CYarn.SURFACE etc.
 # Fallback to raw values if the enum binding differs.
 try:
@@ -356,6 +361,7 @@ class VoxelGridData:
     centers: Optional[Any] = None
     orientation1: Optional[Any] = None
     orientation2: Optional[Any] = None
+    sparse_orientation: Optional[SparseOrientationField] = None
     aabb_pruning: bool = True
     storage: str = "numpy"
     order: str = "ix + iy*nx + iz*nx*ny"
@@ -451,6 +457,13 @@ class VoxelGridData:
             None if self.orientation2 is None
             else _array_to_numpy(self.orientation2, copy=copy)
         )
+        sparse_orientation = (
+            None
+            if self.sparse_orientation is None
+            else self.sparse_orientation.to(
+                "numpy", dtype=np_dtype, copy=copy
+            )
+        )
         if np_dtype is not None:
             aabb = aabb.astype(np_dtype, copy=copy or aabb.dtype != np_dtype)
             if centers is not None:
@@ -475,6 +488,7 @@ class VoxelGridData:
             centers=centers,
             orientation1=orientation1,
             orientation2=orientation2,
+            sparse_orientation=sparse_orientation,
             aabb_pruning=self.aabb_pruning,
             storage="numpy",
             order=self.order,
@@ -516,6 +530,16 @@ class VoxelGridData:
             )
             if torch_dtype is not None:
                 orientation2 = orientation2.to(dtype=torch_dtype, copy=copy)
+        sparse_orientation = (
+            None
+            if self.sparse_orientation is None
+            else self.sparse_orientation.to(
+                "torch",
+                device=str(yarn_id.device),
+                dtype=torch_dtype,
+                copy=copy,
+            )
+        )
         return VoxelGridData(
             yarn_id=yarn_id,
             aabb=aabb,
@@ -528,6 +552,7 @@ class VoxelGridData:
             centers=centers,
             orientation1=orientation1,
             orientation2=orientation2,
+            sparse_orientation=sparse_orientation,
             aabb_pruning=self.aabb_pruning,
             storage="torch",
             order=self.order,
@@ -1308,7 +1333,9 @@ def _classify_voxels_torch(centers: torch.Tensor,
                            packed: dict,
                            chunk: int = 65536,
                            aabb_pruning: bool = True,
-                           progress: Any = False) -> torch.Tensor:
+                           progress: Any = False,
+                           include_orientations: bool = False,
+                           orientation_storage: str = "dense") -> Any:
     """Classify voxel centers with the torch backend.
 
     Parameters
@@ -1325,17 +1352,35 @@ def _classify_voxels_torch(centers: torch.Tensor,
         cannot contain the current chunk.
     progress : bool or callable, default=False
         Show a tqdm progress bar over voxel chunks when true.
+    include_orientations : bool, default=False
+        Capture the winning yarn tangent and up vector for every yarn voxel.
+    orientation_storage : {"dense", "sparse"}, default="dense"
+        Return full per-voxel direction arrays or compact arrays containing
+        only yarn voxels.
 
     Returns
     -------
-    torch.Tensor
-        ``int32`` yarn index for each voxel center, shape ``(V,)``. ``-1`` is
-        matrix/background.
+    torch.Tensor or tuple
+        ``int32`` yarn indices, optionally followed by dense direction arrays
+        or a compact sparse orientation payload.
     """
     torch_mod = _require_torch()
     device = centers.device
     V = centers.shape[0]
     yarn_id = torch_mod.full((V,), -1, device=device, dtype=torch_mod.int32)
+    dense_orientation1 = None
+    dense_orientation2 = None
+    sparse_indices = []
+    sparse_yarn_ids = []
+    sparse_orientation1 = []
+    sparse_orientation2 = []
+    if include_orientations and orientation_storage == "dense":
+        dense_orientation1 = torch_mod.zeros(
+            (V, 3), device=device, dtype=centers.dtype
+        )
+        dense_orientation2 = torch_mod.zeros(
+            (V, 3), device=device, dtype=centers.dtype
+        )
 
     P, T, U, S = packed["P"], packed["T"], packed["U"], packed["S"]
     M_len = packed["M"]
@@ -1358,6 +1403,13 @@ def _classify_voxels_torch(centers: torch.Tensor,
         chunk_hi = pts.amax(dim=0)
         best_dist = torch_mod.full((C,), float("inf"), device=device)
         best_yarn = torch_mod.full((C,), -1, device=device, dtype=torch_mod.int32)
+        if include_orientations:
+            best_orientation1 = torch_mod.zeros(
+                (C, 3), device=device, dtype=centers.dtype
+            )
+            best_orientation2 = torch_mod.zeros(
+                (C, 3), device=device, dtype=centers.dtype
+            )
 
         for y_idx in range(num_yarns):
             m = int(M_len[y_idx].item())
@@ -1421,16 +1473,59 @@ def _classify_voxels_torch(centers: torch.Tensor,
                     upd = inside & (dist < best_dist)
                     best_dist = torch_mod.where(upd, dist, best_dist)
                     best_yarn = torch_mod.where(upd, torch_mod.full_like(best_yarn, y_idx), best_yarn)
+                    if include_orientations:
+                        best_orientation1 = torch_mod.where(
+                            upd[:, None], tan, best_orientation1
+                        )
+                        best_orientation2 = torch_mod.where(
+                            upd[:, None], up, best_orientation2
+                        )
                 else:
                     upd = inside & (dist < best_dist[active_idx])
                     if bool(upd.any().item()):
                         target = active_idx[upd]
                         best_dist[target] = dist[upd]
                         best_yarn[target] = y_idx
+                        if include_orientations:
+                            best_orientation1[target] = tan[upd]
+                            best_orientation2[target] = up[upd]
 
         yarn_id[v0:v1] = best_yarn
+        if include_orientations and orientation_storage == "dense":
+            dense_orientation1[v0:v1] = best_orientation1
+            dense_orientation2[v0:v1] = best_orientation2
+        elif include_orientations:
+            yarn_mask = best_yarn >= 0
+            if bool(yarn_mask.any().item()):
+                sparse_indices.append(
+                    torch_mod.arange(
+                        v0, v1, device=device, dtype=torch_mod.int64
+                    )[yarn_mask]
+                )
+                sparse_yarn_ids.append(best_yarn[yarn_mask])
+                sparse_orientation1.append(best_orientation1[yarn_mask])
+                sparse_orientation2.append(best_orientation2[yarn_mask])
 
-    return yarn_id
+    if not include_orientations:
+        return yarn_id
+    if orientation_storage == "dense":
+        return yarn_id, dense_orientation1, dense_orientation2
+
+    if sparse_indices:
+        payload = (
+            torch_mod.cat(sparse_indices),
+            torch_mod.cat(sparse_yarn_ids),
+            torch_mod.cat(sparse_orientation1),
+            torch_mod.cat(sparse_orientation2),
+        )
+    else:
+        payload = (
+            torch_mod.empty((0,), device=device, dtype=torch_mod.int64),
+            torch_mod.empty((0,), device=device, dtype=torch_mod.int32),
+            torch_mod.empty((0, 3), device=device, dtype=centers.dtype),
+            torch_mod.empty((0, 3), device=device, dtype=centers.dtype),
+        )
+    return yarn_id, payload
 
 
 def _snapshots_as_dtype(snapshots: List[YarnSnapshot], dtype) -> List[YarnSnapshot]:
@@ -2488,6 +2583,35 @@ def _validate_voxelizer_args(nx: int, ny: int, nz: int,
     return base_cell_count
 
 
+def _validate_orientation_storage(orientation_storage: str) -> str:
+    """Normalize and validate the requested orientation field layout."""
+    value = str(orientation_storage).lower()
+    if value not in {"dense", "sparse"}:
+        raise ValueError('orientation_storage must be "dense" or "sparse"')
+    return value
+
+
+def _sparse_orientation_from_dense(yarn_id: Any,
+                                   orientation1: Any,
+                                   orientation2: Any,
+                                   grid_shape: Tuple[int, int, int]
+                                   ) -> SparseOrientationField:
+    """Compact dense flat orientations to yarn voxels without changing backend."""
+    if _is_torch_tensor(yarn_id):
+        indices = (yarn_id >= 0).nonzero(as_tuple=False).flatten()
+    else:
+        indices = np.flatnonzero(np.asarray(yarn_id) >= 0).astype(
+            np.int64, copy=False
+        )
+    return SparseOrientationField(
+        voxel_indices=indices,
+        yarn_ids=yarn_id[indices],
+        orientation1=orientation1[indices],
+        orientation2=orientation2[indices],
+        grid_shape=grid_shape,
+    )
+
+
 def _resolve_backend(backend: str,
                      device: Optional[str],
                      dtype: str,
@@ -2632,6 +2756,7 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
                             verbose: bool = True,
                             include_centers: bool = False,
                             include_orientations: bool = False,
+                            orientation_storage: str = "dense",
                             output: str = "backend",
                             aabb_pruning: bool = True,
                             progress: Any = False) -> VoxelGridData:
@@ -2643,6 +2768,7 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
     """
     backend = backend.lower()
     output = output.lower()
+    orientation_storage = _validate_orientation_storage(orientation_storage)
     if output not in {"backend", "numpy", "torch"}:
         raise ValueError('output must be one of "backend", "numpy", or "torch"')
 
@@ -2654,11 +2780,6 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
         raise RuntimeError("No yarn snapshots provided")
 
     backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
-    if include_orientations and backend_cfg.backend == "torch":
-        raise ValueError(
-            "include_orientations currently supports numpy classification; "
-            'use backend="numpy", output="torch" for tensor output.'
-        )
 
     def log(msg):
         """Print one timing/status line when verbose output is enabled."""
@@ -2675,6 +2796,7 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
     centers_out = None
     orientation1 = None
     orientation2 = None
+    sparse_orientation = None
 
     t0 = time.perf_counter()
     if backend_cfg.backend == "torch":
@@ -2688,10 +2810,27 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
         t_pack = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        yarn_id = _classify_voxels_torch(
+        classified = _classify_voxels_torch(
             centers, packed, chunk=chunk_voxels, aabb_pruning=aabb_pruning,
-            progress=progress
+            progress=progress,
+            include_orientations=include_orientations,
+            orientation_storage=orientation_storage,
         )
+        if not include_orientations:
+            yarn_id = classified
+        elif orientation_storage == "dense":
+            yarn_id, orientation1_flat, orientation2_flat = classified
+            orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+            orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+        else:
+            yarn_id, sparse_payload = classified
+            sparse_orientation = SparseOrientationField(
+                voxel_indices=sparse_payload[0],
+                yarn_ids=sparse_payload[1],
+                orientation1=sparse_payload[2],
+                orientation2=sparse_payload[3],
+                grid_shape=(nz, ny, nx),
+            )
         _sync_torch_backend(torch_mod, backend_cfg.device)
         t_classify = time.perf_counter() - t0
         log(
@@ -2720,8 +2859,16 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
         )
         if include_orientations:
             yarn_id, orientation1_flat, orientation2_flat = classified
-            orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
-            orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+            if orientation_storage == "dense":
+                orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+                orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+            else:
+                sparse_orientation = _sparse_orientation_from_dense(
+                    yarn_id,
+                    orientation1_flat,
+                    orientation2_flat,
+                    (nz, ny, nx),
+                )
         else:
             yarn_id = classified
         t_classify = time.perf_counter() - t0
@@ -2745,6 +2892,7 @@ def voxelize_snapshots_data(snapshots: List[YarnSnapshot],
         centers=centers_out,
         orientation1=orientation1,
         orientation2=orientation2,
+        sparse_orientation=sparse_orientation,
         aabb_pruning=aabb_pruning,
         storage="torch" if backend_cfg.backend == "torch" else "numpy",
     )
@@ -2761,6 +2909,7 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
                                   verbose: bool = True,
                                   include_centers: bool = False,
                                   include_orientations: bool = False,
+                                  orientation_storage: str = "dense",
                                   output: str = "backend",
                                   aabb_pruning: bool = True,
                                   progress: Any = False) -> VoxelGridData:
@@ -2773,6 +2922,7 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
     bundle = _coerce_snapshot_bundle(bundle)
     backend = backend.lower()
     output = output.lower()
+    orientation_storage = _validate_orientation_storage(orientation_storage)
     if output not in {"backend", "numpy", "torch"}:
         raise ValueError('output must be one of "backend", "numpy", or "torch"')
 
@@ -2784,11 +2934,6 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
         raise RuntimeError("No yarn snapshots provided")
 
     backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
-    if include_orientations and backend_cfg.backend == "torch":
-        raise ValueError(
-            "include_orientations currently supports numpy classification; "
-            'use backend="numpy", output="torch" for tensor output.'
-        )
 
     if backend_cfg.backend == "torch":
         t0 = time.perf_counter()
@@ -2808,6 +2953,7 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
             verbose=verbose,
             include_centers=include_centers,
             include_orientations=include_orientations,
+            orientation_storage=orientation_storage,
             output=output,
             aabb_pruning=aabb_pruning,
             progress=progress,
@@ -2830,6 +2976,7 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
     centers_out = None
     orientation1 = None
     orientation2 = None
+    sparse_orientation = None
 
     t0 = time.perf_counter()
     bundle_np = _bundle_as_dtype(bundle, backend_cfg.np_dtype)
@@ -2851,8 +2998,16 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
     )
     if include_orientations:
         yarn_id, orientation1_flat, orientation2_flat = classified
-        orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
-        orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+        if orientation_storage == "dense":
+            orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+            orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+        else:
+            sparse_orientation = _sparse_orientation_from_dense(
+                yarn_id,
+                orientation1_flat,
+                orientation2_flat,
+                (nz, ny, nx),
+            )
     else:
         yarn_id = classified
     t_classify = time.perf_counter() - t0
@@ -2875,6 +3030,7 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
         centers=centers_out,
         orientation1=orientation1,
         orientation2=orientation2,
+        sparse_orientation=sparse_orientation,
         aabb_pruning=aabb_pruning,
         storage="numpy",
     )
@@ -2891,6 +3047,7 @@ def voxelize_textile_data(textile: CTextile,
                           verbose: bool = True,
                           include_centers: bool = False,
                           include_orientations: bool = False,
+                          orientation_storage: str = "dense",
                           output: str = "backend",
                           aabb_pruning: bool = True,
                           progress: Any = False) -> VoxelGridData:
@@ -2927,9 +3084,11 @@ def voxelize_textile_data(textile: CTextile,
         Include ``orientation1`` and ``orientation2`` grids with shape
         ``(nz, ny, nx, 3)``. ``orientation1`` is the yarn tangent and
         ``orientation2`` is the yarn up vector at the nearest yarn node.
-        Matrix voxels are filled with zero vectors. The orientation field is
-        currently computed by the numpy classifier; use ``backend="numpy",
-        output="torch"`` for tensor output.
+        Matrix voxels are filled with zero vectors in dense storage.
+    orientation_storage : {"dense", "sparse"}
+        ``dense`` returns full direction grids. ``sparse`` stores directions
+        only for yarn voxels in ``data.sparse_orientation``; matrix voxels have
+        no direction entries.
     output : {"backend", "numpy", "torch"}
         Storage backend for returned arrays. ``backend`` preserves the
         classification result storage; ``numpy`` forces CPU numpy arrays;
@@ -2950,6 +3109,7 @@ def voxelize_textile_data(textile: CTextile,
     """
     backend = backend.lower()
     output = output.lower()
+    orientation_storage = _validate_orientation_storage(orientation_storage)
     if output not in {"backend", "numpy", "torch"}:
         raise ValueError('output must be one of "backend", "numpy", or "torch"')
 
@@ -2958,11 +3118,6 @@ def voxelize_textile_data(textile: CTextile,
         adaptive_levels=0, max_adaptive_cells=nx * ny * nz
     )
     backend_cfg = _resolve_backend(backend, device, dtype, workers, adaptive=False)
-    if include_orientations and backend_cfg.backend == "torch":
-        raise ValueError(
-            "include_orientations currently supports numpy classification; "
-            'use backend="numpy", output="torch" for tensor output.'
-        )
 
     def log(msg):
         """Print one timing/status line when verbose output is enabled."""
@@ -2995,6 +3150,7 @@ def voxelize_textile_data(textile: CTextile,
             verbose=verbose,
             include_centers=include_centers,
             include_orientations=include_orientations,
+            orientation_storage=orientation_storage,
             output=output,
             aabb_pruning=aabb_pruning,
             progress=progress,
@@ -3010,6 +3166,7 @@ def voxelize_textile_data(textile: CTextile,
     centers_out = None
     orientation1 = None
     orientation2 = None
+    sparse_orientation = None
 
     t0 = time.perf_counter()
     if backend_cfg.backend == "torch":
@@ -3023,10 +3180,27 @@ def voxelize_textile_data(textile: CTextile,
         t_pack = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        yarn_id = _classify_voxels_torch(
+        classified = _classify_voxels_torch(
             centers, packed, chunk=chunk_voxels, aabb_pruning=aabb_pruning,
-            progress=progress
+            progress=progress,
+            include_orientations=include_orientations,
+            orientation_storage=orientation_storage,
         )
+        if not include_orientations:
+            yarn_id = classified
+        elif orientation_storage == "dense":
+            yarn_id, orientation1_flat, orientation2_flat = classified
+            orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+            orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+        else:
+            yarn_id, sparse_payload = classified
+            sparse_orientation = SparseOrientationField(
+                voxel_indices=sparse_payload[0],
+                yarn_ids=sparse_payload[1],
+                orientation1=sparse_payload[2],
+                orientation2=sparse_payload[3],
+                grid_shape=(nz, ny, nx),
+            )
         _sync_torch_backend(torch_mod, backend_cfg.device)
         t_classify = time.perf_counter() - t0
         log(
@@ -3052,8 +3226,16 @@ def voxelize_textile_data(textile: CTextile,
         )
         if include_orientations:
             yarn_id, orientation1_flat, orientation2_flat = classified
-            orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
-            orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+            if orientation_storage == "dense":
+                orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+                orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+            else:
+                sparse_orientation = _sparse_orientation_from_dense(
+                    yarn_id,
+                    orientation1_flat,
+                    orientation2_flat,
+                    (nz, ny, nx),
+                )
         else:
             yarn_id = classified
         t_classify = time.perf_counter() - t0
@@ -3078,6 +3260,7 @@ def voxelize_textile_data(textile: CTextile,
         centers=centers_out,
         orientation1=orientation1,
         orientation2=orientation2,
+        sparse_orientation=sparse_orientation,
         aabb_pruning=aabb_pruning,
         storage="torch" if backend_cfg.backend == "torch" else "numpy",
     )

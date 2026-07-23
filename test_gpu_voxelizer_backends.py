@@ -91,6 +91,13 @@ class VoxelizerBackendTest(unittest.TestCase):
         self.voxelizer.extract_snapshots = fake_extract
         self.addCleanup(lambda: setattr(self.voxelizer, "extract_snapshots", old_extract))
 
+    def assert_orientation_storage_api(self):
+        self.assertIn(
+            "orientation_storage",
+            inspect.signature(self.voxelizer.voxelize_textile_data).parameters,
+            "voxelize_textile_data does not expose orientation_storage",
+        )
+
     def test_numpy_structured_public_path(self):
         self.patch_extract_snapshots()
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,6 +241,154 @@ class VoxelizerBackendTest(unittest.TestCase):
             verbose=False,
         )
         self.assertEqual(clamped.workers, 1)
+
+    def test_numpy_sparse_orientation_matches_dense_yarn_entries(self):
+        self.assert_orientation_storage_api()
+        self.patch_extract_snapshots()
+        dense = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_orientations=True,
+            orientation_storage="dense",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+        sparse = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="numpy",
+            output="numpy",
+            include_orientations=True,
+            orientation_storage="sparse",
+            workers=1,
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        indices = np.flatnonzero(dense.yarn_id >= 0)
+        self.assertIsNone(sparse.orientation1)
+        self.assertIsNone(sparse.orientation2)
+        self.assertIsNotNone(sparse.sparse_orientation)
+        np.testing.assert_array_equal(
+            sparse.sparse_orientation.voxel_indices, indices
+        )
+        np.testing.assert_array_equal(
+            sparse.sparse_orientation.yarn_ids, dense.yarn_id[indices]
+        )
+        np.testing.assert_allclose(
+            sparse.sparse_orientation.orientation1,
+            dense.orientation1.reshape(-1, 3)[indices],
+        )
+        np.testing.assert_allclose(
+            sparse.sparse_orientation.orientation2,
+            dense.orientation2.reshape(-1, 3)[indices],
+        )
+
+    def test_orientation_storage_rejects_unknown_value(self):
+        self.assert_orientation_storage_api()
+        self.patch_extract_snapshots()
+        with self.assertRaisesRegex(ValueError, "orientation_storage"):
+            self.voxelizer.voxelize_textile_data(
+                FakeTextile(),
+                nx=2, ny=2, nz=2,
+                orientation_storage="coo",
+                verbose=False,
+            )
+
+    def test_torch_dense_orientation_is_computed_without_numpy_fallback(self):
+        self.assert_orientation_storage_api()
+        if self.voxelizer.torch is None:
+            self.skipTest("torch is optional")
+        self.patch_extract_snapshots()
+
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="torch",
+            device="cpu",
+            output="backend",
+            include_orientations=True,
+            orientation_storage="dense",
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        self.assertTrue(self.voxelizer._is_torch_tensor(data.orientation1))
+        self.assertTrue(self.voxelizer._is_torch_tensor(data.orientation2))
+        self.assertEqual(tuple(data.orientation1.shape), (4, 4, 4, 3))
+        yarn_mask = data.occupancy()
+        expected1 = self.voxelizer.torch.tensor(
+            [1.0, 0.0, 0.0], dtype=data.orientation1.dtype
+        )
+        expected2 = self.voxelizer.torch.tensor(
+            [0.0, 0.0, 1.0], dtype=data.orientation2.dtype
+        )
+        self.voxelizer.torch.testing.assert_close(
+            data.orientation1[yarn_mask],
+            expected1.expand(int(yarn_mask.sum().item()), 3),
+        )
+        self.voxelizer.torch.testing.assert_close(
+            data.orientation2[yarn_mask],
+            expected2.expand(int(yarn_mask.sum().item()), 3),
+        )
+
+    def test_torch_sparse_orientation_stays_on_selected_device(self):
+        self.assert_orientation_storage_api()
+        if self.voxelizer.torch is None:
+            self.skipTest("torch is optional")
+        self.patch_extract_snapshots()
+
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="torch",
+            device="cpu",
+            output="backend",
+            include_orientations=True,
+            orientation_storage="sparse",
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        field = data.sparse_orientation
+        self.assertIsNone(data.orientation1)
+        self.assertIsNone(data.orientation2)
+        self.assertEqual(field.storage, "torch")
+        self.assertEqual(field.device, "cpu")
+        self.assertEqual(field.num_yarn_voxels, 16)
+        self.assertEqual(field.orientation1.device.type, "cpu")
+        self.assertEqual(field.orientation2.device.type, "cpu")
+        self.voxelizer.torch.testing.assert_close(
+            field.yarn_ids, data.yarn_id[field.voxel_indices]
+        )
+
+    def test_cuda_sparse_orientation_remains_on_gpu(self):
+        self.assert_orientation_storage_api()
+        if (
+            self.voxelizer.torch is None
+            or not self.voxelizer.torch.cuda.is_available()
+        ):
+            self.skipTest("CUDA is optional")
+        self.patch_extract_snapshots()
+
+        data = self.voxelizer.voxelize_textile_data(
+            FakeTextile(),
+            nx=4, ny=4, nz=4,
+            backend="torch",
+            device="cuda",
+            output="backend",
+            include_orientations=True,
+            orientation_storage="sparse",
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        self.assertEqual(data.yarn_id.device.type, "cuda")
+        self.assertEqual(data.sparse_orientation.orientation1.device.type, "cuda")
+        self.assertEqual(data.sparse_orientation.voxel_indices.device.type, "cuda")
 
     def test_voxel_grid_data_to_matches_torch_style_conversion(self):
         self.patch_extract_snapshots()
