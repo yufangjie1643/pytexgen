@@ -366,6 +366,60 @@ class VoxelizerBackendTest(unittest.TestCase):
             field.yarn_ids, data.yarn_id[field.voxel_indices]
         )
 
+    def test_torch_classifier_rejects_end_caps_and_uses_surface_depth(self):
+        if self.voxelizer.torch is None:
+            self.skipTest("torch is optional")
+        section = np.array(
+            [
+                [-0.4, -0.05],
+                [0.4, -0.05],
+                [0.4, 0.05],
+                [-0.4, 0.05],
+                [-0.4, -0.05],
+            ],
+            dtype=np.float32,
+        )
+
+        def snapshot(y, z):
+            return self.voxelizer.YarnSnapshot(
+                positions=np.array(
+                    [[0.25, y, z], [0.75, y, z]], dtype=np.float32
+                ),
+                tangents=np.array(
+                    [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                    dtype=np.float32,
+                ),
+                ups=np.array(
+                    [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+                    dtype=np.float32,
+                ),
+                sides=np.array(
+                    [[0.0, -1.0, 0.0], [0.0, -1.0, 0.0]],
+                    dtype=np.float32,
+                ),
+                section=section,
+                translations=np.zeros((1, 3), dtype=np.float32),
+            )
+
+        torch_mod = self.voxelizer.torch
+        snapshots = [snapshot(0.2, 0.5), snapshot(0.5, 0.54)]
+        packed = self.voxelizer._pack_yarns(
+            snapshots, device="cpu", dtype=torch_mod.float32
+        )
+        centers = torch_mod.tensor(
+            [
+                [0.10, 0.20, 0.50],
+                [0.50, 0.50, 0.50],
+            ],
+            dtype=torch_mod.float32,
+        )
+
+        yarn_id = self.voxelizer._classify_voxels_torch(
+            centers, packed, chunk=2, aabb_pruning=False
+        )
+
+        self.assertEqual(yarn_id.tolist(), [-1, 0])
+
     def test_cuda_sparse_orientation_remains_on_gpu(self):
         self.assert_orientation_storage_api()
         if (

@@ -1435,6 +1435,38 @@ def _point_in_polygon_batch(points_uv: torch.Tensor,
     return (hits % 2) == 1
 
 
+def _distance_to_polygon_edges(points_uv: torch.Tensor,
+                               polygon: torch.Tensor,
+                               poly_len: int) -> torch.Tensor:
+    """Return the shortest local-plane distance to a polygon boundary."""
+    torch_mod = _require_torch()
+    vertices = polygon[:poly_len]
+    edge_start = vertices[:-1]
+    edge_delta = vertices[1:] - edge_start
+    edge_length2 = edge_delta.square().sum(dim=1).clamp_min(
+        torch_mod.finfo(points_uv.dtype).eps
+    )
+    point_dot_delta = points_uv @ edge_delta.transpose(0, 1)
+    start_dot_delta = (edge_start * edge_delta).sum(dim=1)
+    alpha = (
+        point_dot_delta - start_dot_delta.unsqueeze(0)
+    ) / edge_length2.unsqueeze(0)
+    alpha = alpha.clamp(0.0, 1.0)
+    point_dot_start = points_uv @ edge_start.transpose(0, 1)
+    closest_length2 = (
+        edge_start.square().sum(dim=1).unsqueeze(0)
+        + 2.0 * alpha * start_dot_delta.unsqueeze(0)
+        + alpha.square() * edge_length2.unsqueeze(0)
+    )
+    point_dot_closest = point_dot_start + alpha * point_dot_delta
+    distance2 = (
+        points_uv.square().sum(dim=1, keepdim=True)
+        + closest_length2
+        - 2.0 * point_dot_closest
+    ).clamp_min_(0.0)
+    return torch_mod.sqrt(distance2.amin(dim=1))
+
+
 def _classify_voxels_torch(centers: torch.Tensor,
                            packed: dict,
                            chunk: int = 65536,
@@ -1544,20 +1576,70 @@ def _classify_voxels_torch(centers: torch.Tensor,
                     active_idx = candidate.nonzero(as_tuple=False).flatten()
                     active_pts = pts[active_idx]
 
-                # Find closest slave node per point without materialising a
-                # (C, M, 3) tensor.
+                # Project onto the closest slave-node segment. Interpolating
+                # the centerline and frame avoids the finite slabs produced by
+                # a nearest-node approximation, especially around crossovers.
+                segment_start = Pt[:-1]                 # (M-1, 3)
+                segment_delta = Pt[1:] - segment_start
+                segment_length2 = segment_delta.square().sum(dim=1).clamp_min_(
+                    torch_mod.finfo(centers.dtype).eps
+                )
+                point_dot_delta = (
+                    active_pts @ segment_delta.transpose(0, 1)
+                )
+                start_dot_delta = (
+                    segment_start * segment_delta
+                ).sum(dim=1)
+                raw_alpha = (
+                    point_dot_delta - start_dot_delta.unsqueeze(0)
+                ) / segment_length2.unsqueeze(0)
+                alpha = raw_alpha.clamp(0.0, 1.0)
+                point_dot_start = (
+                    active_pts @ segment_start.transpose(0, 1)
+                )
+                start_length2 = segment_start.square().sum(dim=1)
+                closest_length2 = (
+                    start_length2.unsqueeze(0)
+                    + 2.0 * alpha * start_dot_delta.unsqueeze(0)
+                    + alpha.square() * segment_length2.unsqueeze(0)
+                )
+                point_dot_closest = (
+                    point_dot_start + alpha * point_dot_delta
+                )
                 d2 = (
                     active_pts.square().sum(dim=1, keepdim=True)
-                    + Pt.square().sum(dim=1).unsqueeze(0)
-                    - 2.0 * (active_pts @ Pt.transpose(0, 1))
-                ).clamp_min_(0.0)                       # (C, M)
-                nn = d2.argmin(dim=1)                   # (C,)
+                    + closest_length2
+                    - 2.0 * point_dot_closest
+                ).clamp_min_(0.0)
+                nn = d2.argmin(dim=1)
+                selected_alpha = alpha.gather(
+                    1, nn[:, None]
+                ).squeeze(1)
+                selected_raw_alpha = raw_alpha.gather(
+                    1, nn[:, None]
+                ).squeeze(1)
+                centerline = (
+                    segment_start[nn]
+                    + selected_alpha[:, None] * segment_delta[nn]
+                )
 
-                # Project point into local frame of nearest slave node.
-                rel = active_pts - Pt[nn]               # (C, 3)
-                tan = Ty[nn]
-                up  = Uy[nn]
-                sid = Sy[nn]
+                rel = active_pts - centerline
+                tan = (
+                    (1.0 - selected_alpha)[:, None] * Ty[nn]
+                    + selected_alpha[:, None] * Ty[nn + 1]
+                )
+                tan = tan / tan.norm(dim=1, keepdim=True).clamp_min(
+                    torch_mod.finfo(centers.dtype).eps
+                )
+                up = (
+                    (1.0 - selected_alpha)[:, None] * Uy[nn]
+                    + selected_alpha[:, None] * Uy[nn + 1]
+                )
+                up = up - (up * tan).sum(dim=1, keepdim=True) * tan
+                up = up / up.norm(dim=1, keepdim=True).clamp_min(
+                    torch_mod.finfo(centers.dtype).eps
+                )
+                sid = torch_mod.linalg.cross(tan, up, dim=1)
                 u_coord = (rel * sid).sum(-1)           # (C,)
                 v_coord = (rel * up ).sum(-1)
                 t_coord = (rel * tan).sum(-1)
@@ -1565,15 +1647,19 @@ def _classify_voxels_torch(centers: torch.Tensor,
                 # Point-in-polygon in (u, v) plane.
                 uv = torch_mod.stack([u_coord, v_coord], dim=-1)  # (C, 2)
                 inside = _point_in_polygon_batch(uv, poly, n)
+                inside = inside & ~(
+                    ((nn == 0) & (selected_raw_alpha < 0.0))
+                    | (
+                        (nn == m - 2)
+                        & (selected_raw_alpha > 1.0)
+                    )
+                )
 
-                # Rough "depth" proxy for overlap resolution: use d2 (Euclidean
-                # to closest slave node). Real surface distance would require
-                # signed distance to polygon edge; this proxy is sufficient for
-                # consistent overlap assignment and matches TexGen's behaviour
-                # where the yarn with the closest section wins.
-                dist = torch_mod.sqrt(d2.gather(1, nn[:, None]).squeeze(-1))
-                # Also penalise large longitudinal offset (out-of-section slab).
-                dist = dist + t_coord.abs() * 0.1
+                # TexGen resolves overlapping yarns with the most negative
+                # surface distance. For interior points, the negative shortest
+                # distance to the section polygon is the equivalent local
+                # quantity and avoids centerline-distance bias for flat yarns.
+                dist = -_distance_to_polygon_edges(uv, poly, n)
 
                 if active_idx is None:
                     upd = inside & (dist < best_dist)

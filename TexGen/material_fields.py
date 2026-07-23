@@ -664,6 +664,12 @@ def _rotate_stiffness_chunk(
         * inverse_weights[None, :, None]
         * inverse_weights[None, None, :]
     )
+    global_voigt_transpose = (
+        global_voigt.transpose(-1, -2)
+        if _is_torch_tensor(global_voigt)
+        else np.swapaxes(global_voigt, -1, -2)
+    )
+    global_voigt = 0.5 * (global_voigt + global_voigt_transpose)
     return pack_voigt_c21(global_voigt)
 
 
@@ -1083,7 +1089,10 @@ def voxelize_textile_material_fields(
             'orientation_storage must be "sparse" for material field building'
         )
 
-    from TexGen.gpu_voxelizer import voxelize_textile_data
+    try:
+        from .gpu_voxelizer import voxelize_textile_data
+    except ImportError:
+        from TexGen.gpu_voxelizer import voxelize_textile_data
 
     voxel_kwargs["include_orientations"] = True
     voxel_kwargs["orientation_storage"] = "sparse"

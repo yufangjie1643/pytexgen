@@ -566,6 +566,25 @@ class StiffnessRotationTest(unittest.TestCase):
 
         np.testing.assert_allclose(chunked, single, rtol=0.0, atol=0.0)
 
+    def test_float32_rotation_preserves_symmetric_c21_output(self):
+        local = self.mf.pack_voigt_c21(
+            self.symmetric_positive_definite_matrix().astype(np.float32)
+        )
+        orientation1 = np.array(
+            [[0.8164966, 0.4082483, 0.4082483]], dtype=np.float32
+        )
+        orientation2 = np.array(
+            [[-0.4472136, 0.8944272, 0.0]], dtype=np.float32
+        )
+
+        rotated = self.mf.rotate_stiffness_c21(
+            local[None, :], orientation1, orientation2
+        )
+
+        self.assertEqual(rotated.shape, (1, 21))
+        self.assertEqual(rotated.dtype, np.float32)
+        self.assertTrue(np.isfinite(rotated).all())
+
     def test_rotation_rejects_collinear_frame(self):
         local = self.mf.isotropic_stiffness_c21(70.0, 0.25)
         with self.assertRaisesRegex(ValueError, "zero or collinear"):
