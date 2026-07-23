@@ -1,6 +1,7 @@
 """Tests for sparse orientation and stiffness field utilities."""
 
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,7 @@ def load_material_fields():
         "material_fields_under_test", MODULE_PATH
     )
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -100,6 +102,134 @@ class C21UtilitiesTest(unittest.TestCase):
                 150.0, 10.0, 12.0,
                 0.25, 0.20, 0.30,
                 0.0, 6.0, 4.0,
+            )
+
+
+class SparseFieldContainerTest(unittest.TestCase):
+    def setUp(self):
+        self.mf = load_material_fields()
+        self.assertTrue(
+            hasattr(self.mf, "SparseOrientationField"),
+            "SparseOrientationField is not implemented",
+        )
+        self.assertTrue(
+            hasattr(self.mf, "SparseStiffnessField"),
+            "SparseStiffnessField is not implemented",
+        )
+
+    def make_orientation(self):
+        return self.mf.SparseOrientationField(
+            voxel_indices=np.array([1, 3], dtype=np.int64),
+            yarn_ids=np.array([0, 2], dtype=np.int32),
+            orientation1=np.array(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            ),
+            orientation2=np.array(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            ),
+            grid_shape=(1, 2, 2),
+        )
+
+    def test_orientation_stores_valid_compact_arrays(self):
+        field = self.make_orientation()
+
+        self.assertEqual(field.grid_shape, (1, 2, 2))
+        self.assertEqual(field.num_yarn_voxels, 2)
+        self.assertEqual(field.storage, "numpy")
+        np.testing.assert_array_equal(field.voxel_indices, [1, 3])
+
+    def test_orientation_rejects_unsorted_or_duplicate_indices(self):
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            self.mf.SparseOrientationField(
+                voxel_indices=np.array([3, 3], dtype=np.int64),
+                yarn_ids=np.array([0, 2], dtype=np.int32),
+                orientation1=np.ones((2, 3)),
+                orientation2=np.ones((2, 3)),
+                grid_shape=(1, 2, 2),
+            )
+
+    def test_orientation_rejects_inconsistent_shapes_and_range(self):
+        with self.assertRaisesRegex(ValueError, "same leading length"):
+            self.mf.SparseOrientationField(
+                voxel_indices=np.array([1, 3], dtype=np.int64),
+                yarn_ids=np.array([0], dtype=np.int32),
+                orientation1=np.ones((2, 3)),
+                orientation2=np.ones((2, 3)),
+                grid_shape=(1, 2, 2),
+            )
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            self.mf.SparseOrientationField(
+                voxel_indices=np.array([1, 4], dtype=np.int64),
+                yarn_ids=np.array([0, 2], dtype=np.int32),
+                orientation1=np.ones((2, 3)),
+                orientation2=np.ones((2, 3)),
+                grid_shape=(1, 2, 2),
+            )
+
+    def test_orientation_to_numpy_changes_float_dtype_not_integer_dtype(self):
+        converted = self.make_orientation().to("numpy", dtype=np.float32)
+
+        self.assertEqual(converted.orientation1.dtype, np.float32)
+        self.assertEqual(converted.orientation2.dtype, np.float32)
+        self.assertEqual(converted.voxel_indices.dtype, np.int64)
+        self.assertEqual(converted.yarn_ids.dtype, np.int32)
+
+    def make_stiffness(self):
+        yarn = np.stack(
+            [
+                np.arange(21, dtype=np.float64),
+                np.arange(21, dtype=np.float64) + 100.0,
+            ]
+        )
+        return self.mf.SparseStiffnessField(
+            matrix_c21=np.full(21, -1.0),
+            voxel_indices=np.array([1, 3], dtype=np.int64),
+            yarn_ids=np.array([0, 2], dtype=np.int32),
+            material_ids=np.array([1, 2], dtype=np.int32),
+            yarn_c21=yarn,
+            grid_shape=(1, 2, 2),
+            unit="Pa",
+        )
+
+    def test_sparse_stiffness_materializes_matrix_and_yarns(self):
+        field = self.make_stiffness()
+
+        dense = field.to_dense_c21()
+
+        self.assertEqual(dense.shape, (1, 2, 2, 21))
+        np.testing.assert_array_equal(
+            dense.reshape(-1, 21)[0], -np.ones(21)
+        )
+        np.testing.assert_array_equal(
+            dense.reshape(-1, 21)[1], field.yarn_c21[0]
+        )
+        np.testing.assert_array_equal(
+            dense.reshape(-1, 21)[3], field.yarn_c21[1]
+        )
+
+    def test_sparse_stiffness_materializes_voigt_and_acdm_layouts(self):
+        field = self.make_stiffness()
+
+        dense_voigt = field.to_dense_voigt()
+        acdm = field.to_acdm(batch=True)
+        no_batch = field.to_acdm(batch=False)
+
+        self.assertEqual(dense_voigt.shape, (6, 6, 1, 2, 2))
+        self.assertEqual(acdm.shape, (1, 6, 6, 1, 2, 2))
+        self.assertEqual(no_batch.shape, (6, 6, 1, 2, 2))
+        np.testing.assert_array_equal(acdm[0], dense_voigt)
+
+    def test_sparse_stiffness_rejects_mismatched_arrays(self):
+        with self.assertRaisesRegex(ValueError, "same leading length"):
+            self.mf.SparseStiffnessField(
+                matrix_c21=np.ones(21),
+                voxel_indices=np.array([1, 3]),
+                yarn_ids=np.array([0, 2]),
+                material_ids=np.array([1]),
+                yarn_c21=np.ones((2, 21)),
+                grid_shape=(1, 2, 2),
             )
 
 
