@@ -7,7 +7,10 @@ triangle coefficients.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -18,9 +21,19 @@ except ImportError:  # pragma: no cover - torch is an optional dependency
     torch = None
 
 try:
-    from .material_fields import unpack_c21
+    from .gpu_voxelizer import VoxelGridData
+    from .material_fields import (
+        SparseOrientationField,
+        SparseStiffnessField,
+        unpack_c21,
+    )
 except ImportError:  # pragma: no cover - legacy TexGen package name
-    from TexGen.material_fields import unpack_c21
+    from TexGen.gpu_voxelizer import VoxelGridData
+    from TexGen.material_fields import (
+        SparseOrientationField,
+        SparseStiffnessField,
+        unpack_c21,
+    )
 
 
 def _is_torch_tensor(value: Any) -> bool:
@@ -186,6 +199,78 @@ def _validate_positive_definite(c21: Any) -> None:
         raise ValueError("material stiffness must be positive definite")
 
 
+def _copy_array(value: Any):
+    if _is_torch_tensor(value):
+        return value.clone()
+    return np.array(value, copy=True)
+
+
+def _array_backend(value: Any) -> str:
+    return "torch" if _is_torch_tensor(value) else "numpy"
+
+
+def _array_device(value: Any) -> str:
+    return str(value.device) if _is_torch_tensor(value) else "cpu"
+
+
+def _array_equal(left: Any, right: Any) -> bool:
+    if _is_torch_tensor(left):
+        return _is_torch_tensor(right) and bool(torch.equal(left, right))
+    return not _is_torch_tensor(right) and bool(
+        np.array_equal(np.asarray(left), np.asarray(right))
+    )
+
+
+def _array_allclose(left: Any, right: Any, *, rtol: float, atol: float) -> bool:
+    if _is_torch_tensor(left):
+        return _is_torch_tensor(right) and bool(
+            torch.allclose(left, right, rtol=rtol, atol=atol)
+        )
+    return not _is_torch_tensor(right) and bool(
+        np.allclose(left, right, rtol=rtol, atol=atol)
+    )
+
+
+def _freeze_json(value: Any):
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _freeze_metadata(metadata: Mapping[str, Any]):
+    if not isinstance(metadata, Mapping):
+        raise ValueError("metadata must be a JSON-compatible mapping")
+    try:
+        detached = json.loads(
+            json.dumps(dict(metadata), allow_nan=False)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("metadata must be JSON-compatible") from exc
+    return _freeze_json(detached)
+
+
+FIELD_ORDER = (
+    "voxel.yarn_id",
+    "voxel.material_id",
+    "voxel.occupancy",
+    "orientation.voxel_indices",
+    "orientation.yarn_ids",
+    "orientation.primary",
+    "orientation.secondary",
+    "stiffness.matrix_c21",
+    "stiffness.voxel_indices",
+    "stiffness.yarn_ids",
+    "stiffness.material_ids",
+    "stiffness.yarn_c21",
+    "material.ids",
+    "material.c21",
+)
+
+
 @dataclass(frozen=True)
 class MaterialTable:
     """Local material stiffness rows addressed by explicit material IDs."""
@@ -304,4 +389,231 @@ class MaterialTable:
         )
 
 
-__all__ = ["MaterialTable"]
+@dataclass(frozen=True)
+class SimulationSample:
+    """Validated composition of voxel, direction, stiffness, and material data."""
+
+    voxels: VoxelGridData
+    materials: MaterialTable
+    orientation: Optional[SparseOrientationField] = None
+    stiffness: Optional[SparseStiffnessField] = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not isinstance(self.voxels, VoxelGridData):
+            raise TypeError("voxels must be a VoxelGridData")
+        if not isinstance(self.materials, MaterialTable):
+            raise TypeError("materials must be a MaterialTable")
+        if self.orientation is not None and not isinstance(
+            self.orientation, SparseOrientationField
+        ):
+            raise TypeError("orientation must be a SparseOrientationField or None")
+        if self.stiffness is not None and not isinstance(
+            self.stiffness, SparseStiffnessField
+        ):
+            raise TypeError("stiffness must be a SparseStiffnessField or None")
+
+        embedded_orientation = self.voxels.sparse_orientation
+        if self.orientation is None and embedded_orientation is not None:
+            object.__setattr__(self, "orientation", embedded_orientation)
+        elif (
+            embedded_orientation is not None
+            and self.orientation is not embedded_orientation
+        ):
+            raise ValueError(
+                "orientation and voxels.sparse_orientation must be the same object"
+            )
+
+        self._validate_voxel_arrays()
+        self._validate_components()
+        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
+
+    @property
+    def storage(self) -> str:
+        return self.voxels.storage
+
+    @property
+    def device(self) -> str:
+        return self.voxels.device
+
+    @property
+    def field_names(self) -> Tuple[str, ...]:
+        return tuple(name for name in FIELD_ORDER if self._field_available(name))
+
+    def _validate_voxel_arrays(self) -> None:
+        arrays = (
+            self.voxels.yarn_id,
+            self.voxels.aabb,
+            self.voxels.centers,
+            self.voxels.orientation1,
+            self.voxels.orientation2,
+        )
+        arrays = tuple(value for value in arrays if value is not None)
+        expected_storage = _array_backend(self.voxels.yarn_id)
+        expected_device = _array_device(self.voxels.yarn_id)
+        if self.voxels.storage != expected_storage:
+            raise ValueError(
+                "VoxelGridData storage metadata does not match its arrays"
+            )
+        if str(self.voxels.device) != expected_device:
+            raise ValueError(
+                "VoxelGridData device metadata does not match its arrays"
+            )
+        if any(_array_backend(value) != expected_storage for value in arrays):
+            raise ValueError(
+                "all resident voxel arrays must use the same storage backend"
+            )
+        if any(_array_device(value) != expected_device for value in arrays):
+            raise ValueError(
+                "all resident voxel arrays must use the same device"
+            )
+
+    def _validate_components(self) -> None:
+        expected_shape = tuple(self.voxels.shape)
+        expected_order = str(self.voxels.order)
+        expected_storage = self.storage
+        expected_device = self.device
+
+        if self.materials.storage != expected_storage:
+            raise ValueError(
+                "all sample arrays must use the same storage backend"
+            )
+        if self.materials.device != expected_device:
+            raise ValueError("all sample arrays must use the same device")
+
+        if self.orientation is not None:
+            if tuple(self.orientation.grid_shape) != expected_shape:
+                raise ValueError("orientation grid shape does not match voxels")
+            if self.orientation.order != expected_order:
+                raise ValueError("orientation voxel order does not match voxels")
+            if self.orientation.storage != expected_storage:
+                raise ValueError(
+                    "all sample arrays must use the same storage backend"
+                )
+            if self.orientation.device != expected_device:
+                raise ValueError("all sample arrays must use the same device")
+
+        if self.stiffness is None:
+            return
+        if tuple(self.stiffness.grid_shape) != expected_shape:
+            raise ValueError("stiffness grid shape does not match voxels")
+        if self.stiffness.order != expected_order:
+            raise ValueError("stiffness voxel order does not match voxels")
+        if self.stiffness.storage != expected_storage:
+            raise ValueError("all sample arrays must use the same storage backend")
+        if self.stiffness.device != expected_device:
+            raise ValueError("all sample arrays must use the same device")
+        if self.stiffness.unit != self.materials.unit:
+            raise ValueError(
+                "stiffness unit must match the material table unit"
+            )
+
+        if self.orientation is not None:
+            if not _array_equal(
+                self.orientation.voxel_indices,
+                self.stiffness.voxel_indices,
+            ):
+                raise ValueError(
+                    "orientation and stiffness voxel indices must match exactly"
+                )
+            if not _array_equal(
+                self.orientation.yarn_ids,
+                self.stiffness.yarn_ids,
+            ):
+                raise ValueError(
+                    "orientation and stiffness yarn IDs must match exactly"
+                )
+
+        self._validate_stiffness_material_ids()
+        matrix = self.materials.c21_for_id(0)
+        itemsize = (
+            self.stiffness.matrix_c21.element_size()
+            if _is_torch_tensor(self.stiffness.matrix_c21)
+            else self.stiffness.matrix_c21.dtype.itemsize
+        )
+        rtol, atol = (
+            (1e-5, 1e-6) if int(itemsize) <= 4 else (1e-10, 1e-12)
+        )
+        if not _array_allclose(
+            self.stiffness.matrix_c21,
+            matrix,
+            rtol=rtol,
+            atol=atol,
+        ):
+            raise ValueError(
+                "stiffness matrix stiffness must match material ID 0"
+            )
+
+    def _validate_stiffness_material_ids(self) -> None:
+        if _is_torch_tensor(self.stiffness.material_ids):
+            for material_id in torch.unique(self.stiffness.material_ids):
+                value = int(material_id.item())
+                if not bool((self.materials.material_ids == value).any().item()):
+                    raise ValueError(f"unknown material ID {value} in stiffness")
+            return
+        used_ids = np.unique(self.stiffness.material_ids)
+        known_ids = self.materials.material_ids
+        missing = used_ids[~np.isin(used_ids, known_ids)]
+        if missing.size:
+            raise ValueError(
+                f"unknown material ID {int(missing[0])} in stiffness"
+            )
+
+    def _field_available(self, name: str) -> bool:
+        if name in {"voxel.yarn_id", "voxel.occupancy"}:
+            return True
+        if name == "voxel.material_id":
+            return self.stiffness is not None
+        if name.startswith("orientation."):
+            return self.orientation is not None
+        if name.startswith("stiffness."):
+            return self.stiffness is not None
+        if name.startswith("material."):
+            return True
+        return False
+
+    def _resident_field(self, name: str):
+        fields = {
+            "voxel.yarn_id": lambda: self.voxels.grid,
+            "orientation.voxel_indices": (
+                lambda: self.orientation.voxel_indices
+            ),
+            "orientation.yarn_ids": lambda: self.orientation.yarn_ids,
+            "orientation.primary": lambda: self.orientation.orientation1,
+            "orientation.secondary": lambda: self.orientation.orientation2,
+            "stiffness.matrix_c21": lambda: self.stiffness.matrix_c21,
+            "stiffness.voxel_indices": (
+                lambda: self.stiffness.voxel_indices
+            ),
+            "stiffness.yarn_ids": lambda: self.stiffness.yarn_ids,
+            "stiffness.material_ids": lambda: self.stiffness.material_ids,
+            "stiffness.yarn_c21": lambda: self.stiffness.yarn_c21,
+            "material.ids": lambda: self.materials.material_ids,
+            "material.c21": lambda: self.materials.c21,
+        }
+        getter = fields.get(name)
+        return None if getter is None else getter()
+
+    def array(
+        self,
+        name: str,
+        *,
+        layout: str = "native",
+        copy: bool = False,
+    ):
+        """Return one named resident field without implicit conversion."""
+        if name not in self.field_names:
+            available = ", ".join(self.field_names)
+            raise KeyError(
+                f"unknown or unavailable field {name!r}; "
+                f"available fields: {available}"
+            )
+        if layout != "native":
+            raise ValueError(f"layout {layout!r} is not supported for {name!r}")
+        resident = self._resident_field(name)
+        if resident is None:
+            raise ValueError(f"{name!r} is derived; pass copy=True")
+        return _copy_array(resident) if copy else resident
+
+
+__all__ = ["MaterialTable", "SimulationSample"]

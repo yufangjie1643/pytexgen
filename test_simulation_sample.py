@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -169,6 +170,244 @@ class MaterialTableTest(unittest.TestCase):
         table, _, _ = self.make_table()
         with self.assertRaisesRegex(ValueError, "NumPy.*CPU"):
             table.to("numpy", device="cuda")
+
+
+class SimulationSampleValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.sample_module, self.material_fields = load_simulation_sample()
+        self.voxelizer = sys.modules["TexGen.gpu_voxelizer"]
+
+    def make_components(self):
+        indices = np.array([1, 2], dtype=np.int64)
+        yarn_ids = np.array([0, 2], dtype=np.int32)
+        orientation = self.material_fields.SparseOrientationField(
+            voxel_indices=indices,
+            yarn_ids=yarn_ids,
+            orientation1=np.array(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            ),
+            orientation2=np.array(
+                [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            ),
+            grid_shape=(1, 2, 2),
+        )
+        matrix = self.material_fields.isotropic_stiffness_c21(3.0, 0.30)
+        material_7 = self.material_fields.isotropic_stiffness_c21(70.0, 0.20)
+        material_9 = self.material_fields.isotropic_stiffness_c21(120.0, 0.25)
+        materials = self.sample_module.MaterialTable(
+            c21=np.stack((matrix, material_7, material_9)),
+            material_ids=np.array([0, 7, 9], dtype=np.int32),
+            unit="GPa",
+            names=("matrix", "yarn-a", "yarn-b"),
+        )
+        stiffness = self.material_fields.SparseStiffnessField(
+            matrix_c21=materials.c21[0],
+            voxel_indices=indices,
+            yarn_ids=yarn_ids,
+            material_ids=np.array([7, 9], dtype=np.int32),
+            yarn_c21=np.stack((material_7, material_9)),
+            grid_shape=(1, 2, 2),
+            unit="GPa",
+        )
+        voxels = self.voxelizer.VoxelGridData(
+            yarn_id=np.array([-1, 0, 2, -1], dtype=np.int32),
+            aabb=np.array(
+                [[0.0, 0.0, 0.0], [2.0, 2.0, 1.0]],
+                dtype=np.float64,
+            ),
+            resolution=(2, 2, 1),
+            backend="numpy",
+            device="cpu",
+            workers=1,
+            dtype="float64",
+            timings={"classify": 0.01},
+            sparse_orientation=orientation,
+            storage="numpy",
+        )
+        return voxels, orientation, stiffness, materials
+
+    def make_sample(self, metadata=None):
+        voxels, orientation, stiffness, materials = self.make_components()
+        return self.sample_module.SimulationSample(
+            voxels=voxels,
+            orientation=orientation,
+            stiffness=stiffness,
+            materials=materials,
+            metadata=(
+                {
+                    "source": "unit-test",
+                    "generation": {"seed": 3},
+                    "tags": ["gpu", "training"],
+                }
+                if metadata is None
+                else metadata
+            ),
+        )
+
+    def test_construction_is_zero_copy_and_adopts_voxel_orientation(self):
+        voxels, orientation, stiffness, materials = self.make_components()
+
+        sample = self.sample_module.SimulationSample(
+            voxels=voxels,
+            stiffness=stiffness,
+            materials=materials,
+            metadata={"source": "unit-test"},
+        )
+
+        self.assertIs(sample.voxels, voxels)
+        self.assertIs(sample.orientation, orientation)
+        self.assertIs(sample.stiffness, stiffness)
+        self.assertIs(sample.materials, materials)
+        self.assertEqual(sample.storage, "numpy")
+        self.assertEqual(sample.device, "cpu")
+
+    def test_metadata_is_detached_json_compatible_and_recursively_immutable(self):
+        metadata = {
+            "source": "unit-test",
+            "generation": {"seed": 3},
+            "tags": ["gpu", "training"],
+        }
+        sample = self.make_sample(metadata)
+        metadata["generation"]["seed"] = 99
+        metadata["tags"].append("mutated")
+
+        self.assertEqual(sample.metadata["generation"]["seed"], 3)
+        self.assertEqual(sample.metadata["tags"], ("gpu", "training"))
+        with self.assertRaises(TypeError):
+            sample.metadata["generation"]["seed"] = 4
+        with self.assertRaisesRegex(ValueError, "JSON-compatible"):
+            self.make_sample({"bad": np.array([1, 2])})
+
+    def test_resident_field_registry_returns_original_arrays(self):
+        sample = self.make_sample()
+
+        self.assertTrue(
+            np.shares_memory(
+                sample.array("voxel.yarn_id"),
+                sample.voxels.yarn_id,
+            )
+        )
+        self.assertIs(
+            sample.array("orientation.primary"),
+            sample.orientation.orientation1,
+        )
+        self.assertIs(
+            sample.array("orientation.secondary"),
+            sample.orientation.orientation2,
+        )
+        self.assertIs(
+            sample.array("stiffness.yarn_c21"),
+            sample.stiffness.yarn_c21,
+        )
+        self.assertIs(
+            sample.array("stiffness.material_ids"),
+            sample.stiffness.material_ids,
+        )
+        self.assertIs(sample.array("material.c21"), sample.materials.c21)
+        self.assertIs(
+            sample.array("material.ids"),
+            sample.materials.material_ids,
+        )
+        self.assertIn("voxel.occupancy", sample.field_names)
+        self.assertIn("voxel.material_id", sample.field_names)
+
+    def test_rejects_conflicting_voxel_orientation_owner(self):
+        voxels, orientation, stiffness, materials = self.make_components()
+        duplicate = replace(
+            orientation,
+            voxel_indices=orientation.voxel_indices.copy(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "same object"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=duplicate,
+                stiffness=stiffness,
+                materials=materials,
+            )
+
+    def test_rejects_shape_order_and_sparse_identity_mismatches(self):
+        voxels, orientation, stiffness, materials = self.make_components()
+
+        with self.assertRaisesRegex(ValueError, "grid shape"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=orientation,
+                stiffness=replace(stiffness, grid_shape=(1, 1, 4)),
+                materials=materials,
+            )
+        with self.assertRaisesRegex(ValueError, "voxel order"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=orientation,
+                stiffness=replace(stiffness, order="different"),
+                materials=materials,
+            )
+        with self.assertRaisesRegex(ValueError, "voxel indices"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=orientation,
+                stiffness=replace(
+                    stiffness,
+                    voxel_indices=np.array([1, 3], dtype=np.int64),
+                ),
+                materials=materials,
+            )
+        with self.assertRaisesRegex(ValueError, "yarn IDs"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=orientation,
+                stiffness=replace(
+                    stiffness,
+                    yarn_ids=np.array([0, 3], dtype=np.int32),
+                ),
+                materials=materials,
+            )
+
+    def test_rejects_material_identity_matrix_and_unit_mismatches(self):
+        voxels, orientation, stiffness, materials = self.make_components()
+
+        with self.assertRaisesRegex(ValueError, "unknown material ID 11"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=orientation,
+                stiffness=replace(
+                    stiffness,
+                    material_ids=np.array([7, 11], dtype=np.int32),
+                ),
+                materials=materials,
+            )
+        with self.assertRaisesRegex(ValueError, "matrix stiffness"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=orientation,
+                stiffness=replace(
+                    stiffness,
+                    matrix_c21=2.0 * stiffness.matrix_c21,
+                ),
+                materials=materials,
+            )
+        with self.assertRaisesRegex(ValueError, "unit"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=orientation,
+                stiffness=replace(stiffness, unit="Pa"),
+                materials=materials,
+            )
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_rejects_storage_backend_mismatch(self):
+        voxels, orientation, stiffness, materials = self.make_components()
+
+        with self.assertRaisesRegex(ValueError, "storage backend"):
+            self.sample_module.SimulationSample(
+                voxels=voxels,
+                orientation=orientation,
+                stiffness=stiffness,
+                materials=materials.to("torch"),
+            )
 
 
 if __name__ == "__main__":
