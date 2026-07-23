@@ -668,7 +668,7 @@ class SimulationSampleDLPackTest(unittest.TestCase):
         torch is not None and torch.cuda.is_available(),
         "CUDA is not available",
     )
-    def test_nondefault_cuda_stream_observes_producer_write(self):
+    def test_nondefault_cuda_stream_observes_synchronized_producer_write(self):
         cuda_sample = self.sample.to("torch", device="cuda")
         field = cuda_sample.array("stiffness.yarn_c21")
         expected = torch.full_like(field, 37.0)
@@ -677,7 +677,9 @@ class SimulationSampleDLPackTest(unittest.TestCase):
 
         with torch.cuda.stream(producer):
             field.copy_(expected)
+            ready = producer.record_event()
         with torch.cuda.stream(consumer):
+            consumer.wait_event(ready)
             shared = torch.from_dlpack(field)
             observed = shared.clone()
         consumer.synchronize()
