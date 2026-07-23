@@ -547,10 +547,14 @@ class TrainingExample:
 
 def _validate_example_fields(
     example: TrainingExample,
-    schema: TrainingDatasetSchema,
+    specs: Tuple[TrainingFieldSpec, ...],
 ) -> None:
-    expected_inputs = {item.name for item in schema.inputs}
-    expected_targets = {item.name for item in schema.targets}
+    expected_inputs = {
+        item.name for item in specs if item.role == "input"
+    }
+    expected_targets = {
+        item.name for item in specs if item.role == "target"
+    }
     for label, observed, expected in (
         ("inputs", set(example.inputs), expected_inputs),
         ("targets", set(example.targets), expected_targets),
@@ -567,7 +571,7 @@ def _validate_example_fields(
             )
 
     group_lengths = {}
-    for spec in schema.fields:
+    for spec in specs:
         mapping = example.inputs if spec.role == "input" else example.targets
         value = mapping[spec.name]
         expected_dtype = np.dtype(spec.dtype)
@@ -639,10 +643,10 @@ def _collate_fixed_field(
 
 def _collate_ragged_fields(
     examples: Tuple[TrainingExample, ...],
-    schema: TrainingDatasetSchema,
+    specs: Tuple[TrainingFieldSpec, ...],
 ) -> Mapping[str, RaggedArray]:
     groups = {}
-    for spec in schema.fields:
+    for spec in specs:
         if spec.layout == "ragged":
             groups.setdefault(spec.ragged_group, []).append(spec)
 
@@ -766,6 +770,18 @@ class SimulationBatch:
             }
         )
 
+    def __reduce__(self):
+        return (
+            SimulationBatch,
+            (
+                dict(self.inputs),
+                dict(self.targets),
+                self.sample_ids,
+                self.group_ids,
+                tuple(_thaw_json(item) for item in self.metadata),
+            ),
+        )
+
     @property
     def nbytes(self) -> int:
         seen = set()
@@ -787,6 +803,9 @@ class SimulationBatch:
 def collate_training_examples(
     examples: Any,
     schema: TrainingDatasetSchema,
+    *,
+    input_names: Optional[Tuple[str, ...]] = None,
+    target_names: Optional[Tuple[str, ...]] = None,
 ) -> SimulationBatch:
     """Copy selected examples into one owned contiguous NumPy batch."""
     if not isinstance(schema, TrainingDatasetSchema):
@@ -799,13 +818,37 @@ def collate_training_examples(
         for example in examples_tuple
     ):
         raise TypeError("examples must contain TrainingExample values")
+    selected_inputs = (
+        tuple(spec.name for spec in schema.inputs)
+        if input_names is None
+        else tuple(input_names)
+    )
+    selected_targets = (
+        tuple(spec.name for spec in schema.targets)
+        if target_names is None
+        else tuple(target_names)
+    )
+    if len(set(selected_inputs)) != len(selected_inputs) or len(
+        set(selected_targets)
+    ) != len(selected_targets):
+        raise ValueError("selected field names must be unique")
+    available_inputs = {spec.name for spec in schema.inputs}
+    available_targets = {spec.name for spec in schema.targets}
+    if set(selected_inputs) - available_inputs:
+        raise ValueError("selected input field is not declared in schema")
+    if set(selected_targets) - available_targets:
+        raise ValueError("selected target field is not declared in schema")
+    selected = tuple(
+        schema.field(name)
+        for name in selected_inputs + selected_targets
+    )
     for example in examples_tuple:
-        _validate_example_fields(example, schema)
+        _validate_example_fields(example, selected)
 
-    ragged = _collate_ragged_fields(examples_tuple, schema)
+    ragged = _collate_ragged_fields(examples_tuple, selected)
     inputs = {}
     targets = {}
-    for spec in schema.fields:
+    for spec in selected:
         value = (
             _collate_fixed_field(examples_tuple, spec)
             if spec.layout == "fixed"
@@ -1093,7 +1136,7 @@ def compute_training_statistics(
             raise TypeError("examples must contain TrainingExample values")
         if example.split != "train":
             continue
-        _validate_example_fields(example, schema)
+        _validate_example_fields(example, schema.fields)
         for name, accumulator in accumulators.items():
             spec = schema.field(name)
             mapping = (

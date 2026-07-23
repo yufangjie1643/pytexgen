@@ -17,7 +17,6 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 try:
-    from .simulation_sample import SimulationSample
     from .training_data import (
         DatasetQualityPolicy,
         RaggedArray,
@@ -27,7 +26,6 @@ try:
         TrainingFieldSpec,
     )
 except ImportError:  # pragma: no cover - legacy TexGen package name
-    from TexGen.simulation_sample import SimulationSample
     from TexGen.training_data import (
         DatasetQualityPolicy,
         RaggedArray,
@@ -59,6 +57,14 @@ _C21_INDICES = tuple(
     for row in range(6)
     for column in range(row, 6)
 )
+
+
+def _simulation_sample_class():
+    try:
+        from .simulation_sample import SimulationSample
+    except ImportError:  # pragma: no cover - legacy TexGen package name
+        from TexGen.simulation_sample import SimulationSample
+    return SimulationSample
 
 
 class DatasetFormatError(ValueError):
@@ -780,7 +786,7 @@ class SimulationDatasetWriter:
 
     def _extract_fields(
         self,
-        sample: SimulationSample,
+        sample: Any,
         targets: Mapping[str, Any],
     ) -> Mapping[str, np.ndarray]:
         if tuple(sample.voxels.shape) != self.schema.grid_shape:
@@ -860,7 +866,7 @@ class SimulationDatasetWriter:
 
     def append(
         self,
-        sample: SimulationSample,
+        sample: Any,
         *,
         targets: Mapping[str, Any],
         sample_id: str,
@@ -871,7 +877,7 @@ class SimulationDatasetWriter:
     ) -> None:
         if self._finalized:
             raise RuntimeError("cannot append after finalize")
-        if not isinstance(sample, SimulationSample):
+        if not isinstance(sample, _simulation_sample_class()):
             raise TypeError("sample must be a SimulationSample")
         if sample.storage != "numpy" or sample.device != "cpu":
             raise ValueError(
