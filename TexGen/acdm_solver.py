@@ -16,9 +16,10 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -133,12 +134,43 @@ def acdm_domain_size(data: VoxelGridData) -> Tuple[float, float, float]:
     return tuple(float(v) for v in domain.tolist())
 
 
+def _phase_id(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer phase ID in 0..15")
+    result = int(value)
+    if result < 0 or result > 15:
+        raise ValueError("Voxel-ACDM isotropic phase ids must be in 0..15")
+    return result
+
+
+def _phase_overrides(
+    yarn_phase_by_id: Optional[Mapping[int, int]],
+) -> Dict[int, int]:
+    if yarn_phase_by_id is None:
+        return {}
+    if not isinstance(yarn_phase_by_id, Mapping):
+        raise ValueError("yarn_phase_by_id must be a mapping")
+    result = {}
+    for yarn_id, phase in yarn_phase_by_id.items():
+        if (
+            isinstance(yarn_id, bool)
+            or not isinstance(yarn_id, Integral)
+            or int(yarn_id) < 0
+        ):
+            raise ValueError("yarn phase mapping keys must be non-negative integers")
+        result[int(yarn_id)] = _phase_id(
+            f"phase for yarn {int(yarn_id)}",
+            phase,
+        )
+    return result
+
+
 def to_acdm_phase_ids(data: VoxelGridData,
                       *,
                       matrix_phase: int = 0,
                       yarn_phase: int = 1,
                       yarn_phase_by_id: Optional[Mapping[int, int]] = None,
-                      batch: bool = True) -> np.ndarray:
+                      batch: bool = True):
     """Convert pytexgen yarn ids to Voxel-ACDM int4 phase ids.
 
     Voxel-ACDM's isotropic phase-LUT path expects phase ids in ``0..15`` with
@@ -146,17 +178,66 @@ def to_acdm_phase_ids(data: VoxelGridData,
     ``yarn_id == -1`` and are mapped to ``matrix_phase``. Yarn voxels map to
     ``yarn_phase`` unless ``yarn_phase_by_id`` overrides individual yarn ids.
     """
-    grid = _to_numpy(data.grid)
-    phase = np.full(grid.shape, int(matrix_phase), dtype=np.uint8)
-    if yarn_phase_by_id:
-        for yarn_id, phase_id in yarn_phase_by_id.items():
-            phase[grid == int(yarn_id)] = int(phase_id)
-    else:
-        phase[grid >= 0] = int(yarn_phase)
+    matrix_phase_value = _phase_id("matrix_phase", matrix_phase)
+    yarn_phase_value = _phase_id("yarn_phase", yarn_phase)
+    overrides = _phase_overrides(yarn_phase_by_id)
+    grid = data.grid
+    if _is_torch_tensor(grid):
+        import torch
 
-    if phase.min(initial=0) < 0 or phase.max(initial=0) > 15:
-        raise ValueError("Voxel-ACDM isotropic phase ids must be in 0..15")
+        phase = torch.full(
+            grid.shape,
+            matrix_phase_value,
+            dtype=torch.uint8,
+            device=grid.device,
+        )
+    else:
+        phase = np.full(
+            grid.shape,
+            matrix_phase_value,
+            dtype=np.uint8,
+        )
+    phase[grid >= 0] = yarn_phase_value
+    for yarn_id, phase_id in sorted(overrides.items()):
+        phase[grid == yarn_id] = phase_id
     return phase[None, ...] if batch else phase
+
+
+def _any_backend(value) -> bool:
+    if _is_torch_tensor(value):
+        return bool(value.any().item())
+    return bool(np.asarray(value).any())
+
+
+def _used_phase_ids(
+    data: VoxelGridData,
+    *,
+    matrix_phase: int,
+    yarn_phase: int,
+    yarn_phase_by_id: Optional[Mapping[int, int]],
+):
+    matrix_phase_value = _phase_id("matrix_phase", matrix_phase)
+    yarn_phase_value = _phase_id("yarn_phase", yarn_phase)
+    overrides = _phase_overrides(yarn_phase_by_id)
+    grid = data.grid
+    if _is_torch_tensor(grid):
+        import torch
+
+        overridden = torch.zeros_like(grid, dtype=torch.bool)
+    else:
+        overridden = np.zeros(grid.shape, dtype=bool)
+
+    used = set()
+    if _any_backend(grid < 0):
+        used.add(matrix_phase_value)
+    for yarn_id, phase_id in sorted(overrides.items()):
+        mask = grid == yarn_id
+        if _any_backend(mask):
+            used.add(phase_id)
+        overridden |= mask
+    if _any_backend((grid >= 0) & ~overridden):
+        used.add(yarn_phase_value)
+    return used
 
 
 def _torch_dtype(dtype: str):
@@ -177,10 +258,95 @@ def _extract_eng_constants(femlib, C_eff: np.ndarray) -> Dict[str, float]:
     return {key: float(value) for key, value in eng.items()}
 
 
-def _validate_isotropic_material(name: str, material: Mapping[str, float]) -> None:
+def _validate_isotropic_material(
+    name: str,
+    material: Mapping[str, float],
+) -> Dict[str, float]:
     """Validate an isotropic material mapping."""
-    if "E" not in material or "Nu" not in material:
+    if (
+        not isinstance(material, Mapping)
+        or "E" not in material
+        or "Nu" not in material
+    ):
         raise ValueError(f"{name} must contain isotropic 'E' and 'Nu' entries")
+    try:
+        E_value = float(material["E"])
+        nu_value = float(material["Nu"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} E and Nu must be finite numbers") from exc
+    if not np.isfinite((E_value, nu_value)).all():
+        raise ValueError(f"{name} E and Nu must be finite numbers")
+    if E_value <= 0.0:
+        raise ValueError(f"{name} E must be positive")
+    if not -1.0 < nu_value < 0.5:
+        raise ValueError(f"{name} Nu must satisfy -1 < Nu < 0.5")
+    return {"E": E_value, "Nu": nu_value}
+
+
+def _normalize_phase_materials(
+    *,
+    phase_materials: Optional[Mapping[int, Mapping[str, float]]],
+    matrix_material: Optional[Mapping[str, float]],
+    yarn_material: Optional[Mapping[str, float]],
+    matrix_phase: int,
+    yarn_phase: int,
+) -> Dict[int, Dict[str, float]]:
+    matrix_phase_value = _phase_id("matrix_phase", matrix_phase)
+    yarn_phase_value = _phase_id("yarn_phase", yarn_phase)
+    if phase_materials is not None:
+        if matrix_material is not None or yarn_material is not None:
+            raise ValueError(
+                "phase_materials cannot be combined with legacy "
+                "matrix_material or yarn_material"
+            )
+        if not isinstance(phase_materials, Mapping) or not phase_materials:
+            raise ValueError("phase_materials must be a non-empty mapping")
+        result = {}
+        for phase, material in phase_materials.items():
+            phase_value = _phase_id("phase_materials key", phase)
+            result[phase_value] = _validate_isotropic_material(
+                f"phase_materials[{phase_value}]",
+                material,
+            )
+        return result
+
+    if matrix_material is None or yarn_material is None:
+        raise ValueError(
+            "provide phase_materials or both matrix_material and yarn_material"
+        )
+    matrix_value = _validate_isotropic_material(
+        "matrix_material",
+        matrix_material,
+    )
+    yarn_value = _validate_isotropic_material(
+        "yarn_material",
+        yarn_material,
+    )
+    if matrix_phase_value == yarn_phase_value and matrix_value != yarn_value:
+        raise ValueError(
+            "matrix_phase and yarn_phase share one ID but materials differ"
+        )
+    return {
+        matrix_phase_value: matrix_value,
+        yarn_phase_value: yarn_value,
+    }
+
+
+def _build_phase_luts(
+    phase_materials: Mapping[int, Mapping[str, float]],
+    used_phase_ids,
+):
+    for phase in sorted(used_phase_ids):
+        if phase not in phase_materials:
+            raise ValueError(f"missing material for used phase {phase}")
+    first_phase = min(phase_materials)
+    first = phase_materials[first_phase]
+    E_lut = np.full(16, float(first["E"]), dtype=np.float64)
+    nu_lut = np.full(16, float(first["Nu"]), dtype=np.float64)
+    for phase, material in sorted(phase_materials.items()):
+        E_lut[phase] = float(material["E"])
+        nu_lut[phase] = float(material["Nu"])
+    return E_lut, nu_lut
 
 
 def _make_fft_mesh_proxy(data: VoxelGridData):
@@ -275,8 +441,11 @@ def solve_acdm_fft_numpy_from_voxel_data(
 def solve_acdm_isotropic_from_voxel_data(
     data: VoxelGridData,
     *,
-    matrix_material: Mapping[str, float],
-    yarn_material: Mapping[str, float],
+    matrix_material: Optional[Mapping[str, float]] = None,
+    yarn_material: Optional[Mapping[str, float]] = None,
+    phase_materials: Optional[
+        Mapping[int, Mapping[str, float]]
+    ] = None,
     acdm_root: Optional[str] = None,
     device: str = "cuda",
     dtype: str = "fp32",
@@ -307,17 +476,7 @@ def solve_acdm_isotropic_from_voxel_data(
         Preconditioner selection. ``fft`` and ``fe-green`` both call
         Voxel-ACDM's FE Green FFT preconditioner.
     """
-    for material_name, material in (("matrix_material", matrix_material),
-                                    ("yarn_material", yarn_material)):
-        if "E" not in material or "Nu" not in material:
-            raise ValueError(f"{material_name} must contain isotropic 'E' and 'Nu' entries")
-
     timings: Dict[str, float] = {}
-    t0 = time.perf_counter()
-    femlib = import_voxel_acdm(acdm_root)
-    from femlib.fem_batched import FEMHomogenizerBatchedIsotropicPhases
-    timings["import_s"] = time.perf_counter() - t0
-
     t0 = time.perf_counter()
     phase_ids = to_acdm_phase_ids(
         data,
@@ -327,15 +486,28 @@ def solve_acdm_isotropic_from_voxel_data(
         batch=True,
     )
     timings["phase_ids_s"] = time.perf_counter() - t0
+    normalized_materials = _normalize_phase_materials(
+        phase_materials=phase_materials,
+        matrix_material=matrix_material,
+        yarn_material=yarn_material,
+        matrix_phase=matrix_phase,
+        yarn_phase=yarn_phase,
+    )
+    used_phases = _used_phase_ids(
+        data,
+        matrix_phase=matrix_phase,
+        yarn_phase=yarn_phase,
+        yarn_phase_by_id=yarn_phase_by_id,
+    )
+    E_lut, nu_lut = _build_phase_luts(
+        normalized_materials,
+        used_phases,
+    )
 
-    E_lut = np.asarray(
-        [float(matrix_material["E"]), float(yarn_material["E"])],
-        dtype=np.float64,
-    )
-    nu_lut = np.asarray(
-        [float(matrix_material["Nu"]), float(yarn_material["Nu"])],
-        dtype=np.float64,
-    )
+    t0 = time.perf_counter()
+    femlib = import_voxel_acdm(acdm_root)
+    from femlib.fem_batched import FEMHomogenizerBatchedIsotropicPhases
+    timings["import_s"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     solver = FEMHomogenizerBatchedIsotropicPhases.from_E_nu(
