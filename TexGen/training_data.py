@@ -117,6 +117,31 @@ def _freeze_field_mapping(
     return MappingProxyType(result)
 
 
+def _is_torch_tensor(value: Any) -> bool:
+    value_type = type(value)
+    return (
+        value_type.__module__.split(".", 1)[0] == "torch"
+        and value_type.__name__ == "Tensor"
+    )
+
+
+def _array_nbytes(value: Any) -> int:
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if _is_torch_tensor(value):
+        return int(value.numel() * value.element_size())
+    raise TypeError(
+        "batch fields must contain NumPy arrays or Torch tensors"
+    )
+
+
+def _trusted_ragged(values: Any, offsets: Any) -> "RaggedArray":
+    result = object.__new__(RaggedArray)
+    object.__setattr__(result, "values", values)
+    object.__setattr__(result, "offsets", offsets)
+    return result
+
+
 @dataclass(frozen=True)
 class TrainingFieldSpec:
     """Immutable declaration of one stored input or target field."""
@@ -410,23 +435,54 @@ class RaggedArray:
     offsets: Any
 
     def __post_init__(self) -> None:
-        if not isinstance(self.values, np.ndarray) or self.values.ndim < 1:
+        values_supported = isinstance(
+            self.values, np.ndarray
+        ) or _is_torch_tensor(self.values)
+        offsets_supported = isinstance(
+            self.offsets, np.ndarray
+        ) or _is_torch_tensor(self.offsets)
+        if not values_supported or self.values.ndim < 1:
             raise ValueError(
-                "ragged values must be a NumPy array with a row dimension"
+                "ragged values must be an array with a row dimension"
             )
-        if (
-            not isinstance(self.offsets, np.ndarray)
-            or self.offsets.ndim != 1
-            or not np.issubdtype(self.offsets.dtype, np.integer)
-        ):
+        if isinstance(self.offsets, np.ndarray):
+            integer_offsets = np.issubdtype(
+                self.offsets.dtype, np.integer
+            )
+        else:
+            integer_offsets = str(
+                getattr(self.offsets, "dtype", "")
+            ) in {
+                "torch.int8",
+                "torch.int16",
+                "torch.int32",
+                "torch.int64",
+                "torch.uint8",
+            }
+        if not offsets_supported or self.offsets.ndim != 1 or not integer_offsets:
             raise ValueError(
                 "ragged offsets must be a one-dimensional integer array"
             )
-        if self.offsets.size == 0 or int(self.offsets[0]) != 0:
+        offsets_count = (
+            int(self.offsets.size)
+            if isinstance(self.offsets, np.ndarray)
+            else int(self.offsets.numel())
+        )
+        if offsets_count == 0 or int(self.offsets[0].item()) != 0:
             raise ValueError("ragged offsets must start at zero")
-        if bool(np.any(self.offsets[1:] < self.offsets[:-1])):
+        if isinstance(self.offsets, np.ndarray):
+            decreasing = bool(
+                np.any(self.offsets[1:] < self.offsets[:-1])
+            )
+            final_offset = int(self.offsets[-1])
+        else:
+            decreasing = bool(
+                (self.offsets[1:] < self.offsets[:-1]).any().item()
+            )
+            final_offset = int(self.offsets[-1].item())
+        if decreasing:
             raise ValueError("ragged offsets must be monotonically increasing")
-        if int(self.offsets[-1]) != int(self.values.shape[0]):
+        if final_offset != int(self.values.shape[0]):
             raise ValueError(
                 "ragged offsets must end at the number of value rows"
             )
@@ -470,12 +526,319 @@ class TrainingExample:
         )
 
 
+def _validate_example_fields(
+    example: TrainingExample,
+    schema: TrainingDatasetSchema,
+) -> None:
+    expected_inputs = {item.name for item in schema.inputs}
+    expected_targets = {item.name for item in schema.targets}
+    for label, observed, expected in (
+        ("inputs", set(example.inputs), expected_inputs),
+        ("targets", set(example.targets), expected_targets),
+    ):
+        missing = expected - observed
+        extra = observed - expected
+        if missing:
+            raise ValueError(
+                f"{label} missing fields: {', '.join(sorted(missing))}"
+            )
+        if extra:
+            raise ValueError(
+                f"{label} extra fields: {', '.join(sorted(extra))}"
+            )
+
+    group_lengths = {}
+    for spec in schema.fields:
+        mapping = example.inputs if spec.role == "input" else example.targets
+        value = mapping[spec.name]
+        expected_dtype = np.dtype(spec.dtype)
+        if spec.layout == "fixed":
+            if not isinstance(value, np.ndarray):
+                raise TypeError(
+                    f"field {spec.name!r} must be a NumPy array"
+                )
+            if tuple(value.shape) != spec.shape:
+                raise ValueError(
+                    f"field {spec.name!r} shape is {tuple(value.shape)}, "
+                    f"expected {spec.shape}"
+                )
+            if value.dtype != expected_dtype:
+                raise ValueError(
+                    f"field {spec.name!r} dtype is {value.dtype.str}, "
+                    f"expected {expected_dtype.str}"
+                )
+            continue
+
+        if not isinstance(value, RaggedArray):
+            raise TypeError(f"field {spec.name!r} must be a RaggedArray")
+        if not isinstance(value.values, np.ndarray):
+            raise TypeError(
+                f"field {spec.name!r} values must be a NumPy array"
+            )
+        expected_shape = (int(value.values.shape[0]),) + spec.shape
+        if tuple(value.values.shape) != expected_shape:
+            raise ValueError(
+                f"field {spec.name!r} shape is "
+                f"{tuple(value.values.shape)}, expected {expected_shape}"
+            )
+        if value.values.dtype != expected_dtype:
+            raise ValueError(
+                f"field {spec.name!r} dtype is {value.values.dtype.str}, "
+                f"expected {expected_dtype.str}"
+            )
+        if int(value.offsets.size) != 2:
+            raise ValueError(
+                f"field {spec.name!r} sample offsets must have length 2"
+            )
+        length = int(value.values.shape[0])
+        previous = group_lengths.setdefault(spec.ragged_group, length)
+        if previous != length:
+            raise ValueError(
+                f"ragged group {spec.ragged_group!r} has inconsistent "
+                "sample lengths"
+            )
+
+
+def _collate_fixed_field(
+    examples: Tuple[TrainingExample, ...],
+    spec: TrainingFieldSpec,
+) -> np.ndarray:
+    result = np.empty(
+        (len(examples),) + spec.shape,
+        dtype=np.dtype(spec.dtype),
+        order="C",
+    )
+    for row, example in enumerate(examples):
+        source = (
+            example.inputs[spec.name]
+            if spec.role == "input"
+            else example.targets[spec.name]
+        )
+        np.copyto(result[row], source, casting="no")
+    return result
+
+
+def _collate_ragged_fields(
+    examples: Tuple[TrainingExample, ...],
+    schema: TrainingDatasetSchema,
+) -> Mapping[str, RaggedArray]:
+    groups = {}
+    for spec in schema.fields:
+        if spec.layout == "ragged":
+            groups.setdefault(spec.ragged_group, []).append(spec)
+
+    result = {}
+    for group_name, specs in groups.items():
+        lengths = []
+        for example in examples:
+            mapping = (
+                example.inputs
+                if specs[0].role == "input"
+                else example.targets
+            )
+            lengths.append(
+                int(mapping[specs[0].name].values.shape[0])
+            )
+        offsets = np.empty(len(examples) + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(np.asarray(lengths, dtype=np.int64), out=offsets[1:])
+        total = int(offsets[-1])
+        for spec in specs:
+            values = np.empty(
+                (total,) + spec.shape,
+                dtype=np.dtype(spec.dtype),
+                order="C",
+            )
+            for row, example in enumerate(examples):
+                mapping = (
+                    example.inputs
+                    if spec.role == "input"
+                    else example.targets
+                )
+                source = mapping[spec.name].values
+                np.copyto(
+                    values[offsets[row]:offsets[row + 1]],
+                    source,
+                    casting="no",
+                )
+            result[spec.name] = RaggedArray(values, offsets)
+    return result
+
+
+@dataclass
+class SimulationBatch:
+    """Owned fixed/ragged arrays plus CPU-only sample metadata."""
+
+    inputs: Mapping[str, Any]
+    targets: Mapping[str, Any]
+    sample_ids: Tuple[str, ...]
+    group_ids: Tuple[str, ...]
+    metadata: Tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        self.inputs = MappingProxyType(dict(self.inputs))
+        self.targets = MappingProxyType(dict(self.targets))
+        self.sample_ids = tuple(self.sample_ids)
+        self.group_ids = tuple(self.group_ids)
+        self.metadata = tuple(self.metadata)
+        count = len(self.sample_ids)
+        if len(self.group_ids) != count or len(self.metadata) != count:
+            raise ValueError(
+                "sample_ids, group_ids, and metadata must have equal length"
+            )
+
+    def _map_arrays(self, operation) -> "SimulationBatch":
+        cache = {}
+
+        def convert(value):
+            if isinstance(value, RaggedArray):
+                return _trusted_ragged(
+                    convert(value.values), convert(value.offsets)
+                )
+            key = id(value)
+            if key not in cache:
+                cache[key] = operation(value)
+            return cache[key]
+
+        return SimulationBatch(
+            inputs={
+                name: convert(value)
+                for name, value in self.inputs.items()
+            },
+            targets={
+                name: convert(value)
+                for name, value in self.targets.items()
+            },
+            sample_ids=self.sample_ids,
+            group_ids=self.group_ids,
+            metadata=self.metadata,
+        )
+
+    def pin_memory(self) -> "SimulationBatch":
+        def pin(value):
+            method = getattr(value, "pin_memory", None)
+            if method is None:
+                raise TypeError(
+                    "pin_memory requires a batch of Torch tensors"
+                )
+            return method()
+
+        return self._map_arrays(pin)
+
+    def to(
+        self, device: Any, *, non_blocking: bool = False
+    ) -> "SimulationBatch":
+        def move(value):
+            method = getattr(value, "to", None)
+            if method is None:
+                raise TypeError("to() requires a batch of Torch tensors")
+            return method(device, non_blocking=non_blocking)
+
+        return self._map_arrays(move)
+
+    def as_dict(self) -> Mapping[str, Any]:
+        return MappingProxyType(
+            {
+                "inputs": self.inputs,
+                "targets": self.targets,
+                "sample_ids": self.sample_ids,
+                "group_ids": self.group_ids,
+                "metadata": self.metadata,
+            }
+        )
+
+    @property
+    def nbytes(self) -> int:
+        seen = set()
+
+        def count(value):
+            if isinstance(value, RaggedArray):
+                return count(value.values) + count(value.offsets)
+            identity = id(value)
+            if identity in seen:
+                return 0
+            seen.add(identity)
+            return _array_nbytes(value)
+
+        return sum(count(value) for value in self.inputs.values()) + sum(
+            count(value) for value in self.targets.values()
+        )
+
+
+def collate_training_examples(
+    examples: Any,
+    schema: TrainingDatasetSchema,
+) -> SimulationBatch:
+    """Copy selected examples into one owned contiguous NumPy batch."""
+    if not isinstance(schema, TrainingDatasetSchema):
+        raise TypeError("schema must be a TrainingDatasetSchema")
+    examples_tuple = tuple(examples)
+    if not examples_tuple:
+        raise ValueError("examples must not be empty")
+    if any(
+        not isinstance(example, TrainingExample)
+        for example in examples_tuple
+    ):
+        raise TypeError("examples must contain TrainingExample values")
+    for example in examples_tuple:
+        _validate_example_fields(example, schema)
+
+    ragged = _collate_ragged_fields(examples_tuple, schema)
+    inputs = {}
+    targets = {}
+    for spec in schema.fields:
+        value = (
+            _collate_fixed_field(examples_tuple, spec)
+            if spec.layout == "fixed"
+            else ragged[spec.name]
+        )
+        destination = inputs if spec.role == "input" else targets
+        destination[spec.name] = value
+    return SimulationBatch(
+        inputs=inputs,
+        targets=targets,
+        sample_ids=tuple(item.sample_id for item in examples_tuple),
+        group_ids=tuple(item.group_id for item in examples_tuple),
+        metadata=tuple(item.metadata for item in examples_tuple),
+    )
+
+
+def as_torch_batch(batch: SimulationBatch) -> SimulationBatch:
+    """Create zero-copy Torch CPU tensor views of an owned NumPy batch."""
+    if not isinstance(batch, SimulationBatch):
+        raise TypeError("batch must be a SimulationBatch")
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            'PyTorch is required; install with `pip install "pytexgen[gpu]"`.'
+        ) from exc
+
+    def convert(value):
+        if _is_torch_tensor(value):
+            return value
+        if not isinstance(value, np.ndarray):
+            raise TypeError(
+                "Torch conversion requires NumPy arrays or Torch tensors"
+            )
+        if not value.flags.c_contiguous or not value.flags.writeable:
+            raise ValueError(
+                "Torch conversion requires owned writable contiguous arrays"
+            )
+        return torch.from_numpy(value)
+
+    return batch._map_arrays(convert)
+
+
 __all__ = [
     "DatasetQualityPolicy",
     "RaggedArray",
     "SPLITS",
+    "SimulationBatch",
     "TrainingDatasetSchema",
     "TrainingExample",
     "TrainingFieldSpec",
     "VOXEL_ORDER",
+    "as_torch_batch",
+    "collate_training_examples",
 ]
