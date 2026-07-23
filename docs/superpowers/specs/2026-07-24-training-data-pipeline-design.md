@@ -268,10 +268,11 @@ Verification levels are:
 
 - `manifest`: schema, paths, dtypes, shapes, sample index, split/group
   isolation, and declared shard metadata;
-- `shard`: manifest checks plus lazy SHA-256 verification once per opened shard
-  in each worker; this is the default;
-- `sample`: shard checks plus recomputation of every configured geometry
-  digest; intended for dataset publication audits.
+- `shard`: manifest checks plus lazy SHA-256 verification of each requested
+  field/offset file once per worker; this is the default and does not open
+  unselected field arrays;
+- `sample`: all shard files are verified and every configured geometry digest
+  is recomputed; intended for dataset publication audits.
 
 The reader is map-style and picklable. It stores paths and index metadata, not
 open file handles, so each DataLoader worker opens its own mmap handles lazily.
@@ -387,7 +388,9 @@ Callers must explicitly correct or reject invalid solver output.
 
 `CubicRotation(seed, probability=1.0)` samples only the 24 orientation-
 preserving signed permutation matrices of a cube. Reflections and arbitrary
-interpolation are excluded.
+interpolation are excluded. Version 1 requires `Nz == Ny == Nx`; applying this
+transform to a non-cubic grid raises `ValueError` rather than changing the
+declared field shape or silently restricting the rotation set.
 
 The random choice is derived from a stable hash of
 `(global_seed, epoch, sample_id)` and is therefore independent of item order,
@@ -401,6 +404,7 @@ For each selected rotation:
 - direction vectors are multiplied by the same rotation matrix;
 - global per-voxel C21 fields are unpacked, rotated as fourth-order elasticity
   tensors, and repacked;
+- a global anisotropic matrix C21 value is rotated by the same rule;
 - `effective_c21` targets are rotated by the same tensor rule;
 - local material-table C21 values are unchanged because sparse material
   directions define their placement in the global frame;
