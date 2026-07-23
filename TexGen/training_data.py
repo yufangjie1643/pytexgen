@@ -7,6 +7,7 @@ live in :mod:`TexGen.torch_training`.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 from collections.abc import Mapping
@@ -92,12 +93,26 @@ def _freeze_json(value: Any) -> Any:
     return value
 
 
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _thaw_json(item) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
 def _validated_metadata(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError("metadata must be a JSON-compatible mapping")
     try:
         detached = json.loads(
-            json.dumps(dict(value), allow_nan=False, sort_keys=True)
+            json.dumps(
+                _thaw_json(value),
+                allow_nan=False,
+                sort_keys=True,
+            )
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("metadata must be JSON-compatible") from exc
@@ -830,15 +845,384 @@ def as_torch_batch(batch: SimulationBatch) -> SimulationBatch:
     return batch._map_arrays(convert)
 
 
+def _normalized_split_ratios(
+    ratios: Mapping[str, Any],
+) -> Mapping[str, float]:
+    if not isinstance(ratios, Mapping) or not ratios:
+        raise ValueError("ratios must be a non-empty split mapping")
+    unknown = set(ratios) - set(SPLITS)
+    if unknown:
+        raise ValueError(
+            "unknown split names: " + ", ".join(sorted(unknown))
+        )
+    result = {}
+    for split in SPLITS:
+        value = ratios.get(split, 0.0)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ValueError("every split ratio must be finite and non-negative")
+        result[split] = float(value)
+    if not math.isclose(
+        sum(result.values()), 1.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError("split ratios must sum to 1")
+    return MappingProxyType(result)
+
+
+def _split_counts(
+    group_count: int,
+    ratios: Mapping[str, float],
+) -> Mapping[str, int]:
+    ideal = {split: ratios[split] * group_count for split in SPLITS}
+    counts = {
+        split: int(math.floor(ideal[split])) for split in SPLITS
+    }
+    remaining = group_count - sum(counts.values())
+    by_remainder = sorted(
+        SPLITS,
+        key=lambda split: (
+            -(ideal[split] - counts[split]),
+            SPLITS.index(split),
+        ),
+    )
+    for split in by_remainder[:remaining]:
+        counts[split] += 1
+
+    active = [split for split in SPLITS if ratios[split] > 0.0]
+    if group_count >= len(active):
+        for split in active:
+            if counts[split] != 0:
+                continue
+            donors = [
+                candidate
+                for candidate in active
+                if counts[candidate] > 1
+            ]
+            donor = max(
+                donors,
+                key=lambda candidate: (
+                    counts[candidate] - ideal[candidate],
+                    -SPLITS.index(candidate),
+                ),
+            )
+            counts[donor] -= 1
+            counts[split] = 1
+    return MappingProxyType(counts)
+
+
+def deterministic_group_split(
+    group_ids: Any,
+    *,
+    ratios: Mapping[str, Any],
+    seed: int,
+    strata: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, str]:
+    """Assign complete groups using stable hashes, independent of input order."""
+    try:
+        observed_groups = tuple(group_ids)
+    except TypeError as exc:
+        raise ValueError("group_ids must be an iterable of strings") from exc
+    if not observed_groups:
+        raise ValueError("group_ids must not be empty")
+    if any(
+        not isinstance(group, str) or not group.strip()
+        for group in observed_groups
+    ):
+        raise ValueError("every group ID must be a non-empty string")
+    groups = tuple(sorted(set(observed_groups)))
+    normalized_ratios = _normalized_split_ratios(ratios)
+    if isinstance(seed, bool) or not isinstance(seed, Integral):
+        raise ValueError("seed must be an integer")
+
+    if strata is None:
+        stratum_for_group = {group: "__all__" for group in groups}
+    else:
+        if not isinstance(strata, Mapping) or set(strata) != set(groups):
+            raise ValueError(
+                "strata must contain exactly one value for every group"
+            )
+        stratum_for_group = {}
+        for group in groups:
+            value = strata[group]
+            try:
+                hash(value)
+            except TypeError as exc:
+                raise ValueError("strata values must be hashable") from exc
+            stratum_for_group[group] = value
+
+    grouped = {}
+    for group in groups:
+        grouped.setdefault(stratum_for_group[group], []).append(group)
+
+    assignment = {}
+    for stratum in sorted(grouped, key=lambda value: repr(value)):
+        members = sorted(
+            grouped[stratum],
+            key=lambda group: hashlib.sha256(
+                f"{int(seed)}\0{group}".encode("utf-8")
+            ).digest(),
+        )
+        counts = _split_counts(len(members), normalized_ratios)
+        offset = 0
+        for split in SPLITS:
+            end = offset + counts[split]
+            for group in members[offset:end]:
+                assignment[group] = split
+            offset = end
+    return MappingProxyType(assignment)
+
+
+class RunningFieldStatistics:
+    """Streaming float64 per-component Welford accumulator."""
+
+    def __init__(self, component_shape: Any):
+        try:
+            shape = tuple(component_shape)
+        except TypeError as exc:
+            raise ValueError(
+                "component_shape must be a tuple of positive integers"
+            ) from exc
+        if any(
+            isinstance(item, bool)
+            or not isinstance(item, Integral)
+            or int(item) <= 0
+            for item in shape
+        ):
+            raise ValueError(
+                "component_shape dimensions must be positive integers"
+            )
+        self.component_shape = tuple(int(item) for item in shape)
+        self.count = 0
+        self._mean = np.zeros(self.component_shape, dtype=np.float64)
+        self._m2 = np.zeros(self.component_shape, dtype=np.float64)
+        self._minimum = np.full(
+            self.component_shape, np.inf, dtype=np.float64
+        )
+        self._maximum = np.full(
+            self.component_shape, -np.inf, dtype=np.float64
+        )
+
+    def update(self, value: Any) -> None:
+        array = np.asarray(value)
+        if not np.issubdtype(array.dtype, np.floating):
+            raise ValueError("statistics values must use a floating dtype")
+        trailing = (
+            tuple(array.shape[-len(self.component_shape):])
+            if self.component_shape
+            else ()
+        )
+        if trailing != self.component_shape:
+            raise ValueError(
+                f"statistics value shape {array.shape} does not end with "
+                f"component shape {self.component_shape}"
+            )
+        if not bool(np.isfinite(array).all()):
+            raise ValueError("statistics values must be finite")
+        reshaped = np.asarray(array, dtype=np.float64).reshape(
+            (-1,) + self.component_shape
+        )
+        batch_count = int(reshaped.shape[0])
+        if batch_count == 0:
+            raise ValueError("statistics update must not be empty")
+        batch_mean = reshaped.mean(axis=0)
+        delta_values = reshaped - batch_mean
+        batch_m2 = np.sum(delta_values * delta_values, axis=0)
+
+        total = self.count + batch_count
+        delta = batch_mean - self._mean
+        self._mean += delta * (batch_count / total)
+        self._m2 += (
+            batch_m2
+            + delta * delta * self.count * batch_count / total
+        )
+        self._minimum = np.minimum(
+            self._minimum, reshaped.min(axis=0)
+        )
+        self._maximum = np.maximum(
+            self._maximum, reshaped.max(axis=0)
+        )
+        self.count = total
+
+    def finalize(self, *, unit: Optional[str]) -> Mapping[str, Any]:
+        if self.count == 0:
+            raise ValueError("cannot finalize empty statistics")
+        if unit is not None and (
+            not isinstance(unit, str) or not unit.strip()
+        ):
+            raise ValueError("statistics unit must be non-empty or None")
+        variance = self._m2 / self.count
+        raw_standard_deviation = np.sqrt(variance)
+        constant = raw_standard_deviation == 0.0
+        standard_deviation = np.where(
+            constant, 1.0, raw_standard_deviation
+        )
+        return {
+            "mean": self._mean.tolist(),
+            "variance": variance.tolist(),
+            "standard_deviation": standard_deviation.tolist(),
+            "minimum": self._minimum.tolist(),
+            "maximum": self._maximum.tolist(),
+            "constant_mask": constant.tolist(),
+            "count": self.count,
+            "source_split": "train",
+            "unit": None if unit is None else unit.strip(),
+        }
+
+
+def compute_training_statistics(
+    examples: Any,
+    schema: TrainingDatasetSchema,
+) -> Mapping[str, Mapping[str, Any]]:
+    """Compute declared field statistics from train examples only."""
+    if not isinstance(schema, TrainingDatasetSchema):
+        raise TypeError("schema must be a TrainingDatasetSchema")
+    accumulators = {
+        name: RunningFieldStatistics(schema.field(name).shape)
+        for name in schema.statistics_fields
+    }
+    for example in examples:
+        if not isinstance(example, TrainingExample):
+            raise TypeError("examples must contain TrainingExample values")
+        if example.split != "train":
+            continue
+        _validate_example_fields(example, schema)
+        for name, accumulator in accumulators.items():
+            spec = schema.field(name)
+            mapping = (
+                example.inputs if spec.role == "input" else example.targets
+            )
+            value = mapping[name]
+            accumulator.update(
+                value.values if isinstance(value, RaggedArray) else value
+            )
+    result = {}
+    for name, accumulator in accumulators.items():
+        result[name] = accumulator.finalize(
+            unit=schema.field(name).unit
+        )
+    return MappingProxyType(result)
+
+
+@dataclass(frozen=True)
+class StandardizeFields:
+    """Explicitly standardize selected floating fields with train statistics."""
+
+    statistics: Mapping[str, Mapping[str, Any]]
+    fields: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.statistics, Mapping):
+            raise TypeError("statistics must be a mapping")
+        fields = tuple(self.fields)
+        if (
+            not fields
+            or any(not isinstance(name, str) or not name for name in fields)
+            or len(set(fields)) != len(fields)
+        ):
+            raise ValueError(
+                "fields must contain unique non-empty field names"
+            )
+        object.__setattr__(self, "fields", fields)
+        object.__setattr__(
+            self, "statistics", _validated_metadata(self.statistics)
+        )
+
+    def __call__(
+        self,
+        example: TrainingExample,
+        schema: TrainingDatasetSchema,
+    ) -> TrainingExample:
+        if not isinstance(example, TrainingExample):
+            raise TypeError("example must be a TrainingExample")
+        if not isinstance(schema, TrainingDatasetSchema):
+            raise TypeError("schema must be a TrainingDatasetSchema")
+        inputs = dict(example.inputs)
+        targets = dict(example.targets)
+        for name in self.fields:
+            spec = schema.field(name)
+            if np.dtype(spec.dtype).kind != "f":
+                raise ValueError(
+                    f"field {name!r} must use a floating dtype to standardize"
+                )
+            if name not in self.statistics:
+                raise ValueError(
+                    f"statistics are missing field {name!r}"
+                )
+            statistics = self.statistics[name]
+            if statistics.get("source_split") != "train":
+                raise ValueError(
+                    f"field {name!r} statistics must come from train"
+                )
+            if statistics.get("unit") != spec.unit:
+                raise ValueError(
+                    f"field {name!r} statistics unit does not match schema"
+                )
+            mean = np.asarray(
+                statistics.get("mean"), dtype=np.dtype(spec.dtype)
+            )
+            scale = np.asarray(
+                statistics.get("standard_deviation"),
+                dtype=np.dtype(spec.dtype),
+            )
+            if mean.shape != spec.shape or scale.shape != spec.shape:
+                raise ValueError(
+                    f"field {name!r} statistics shape does not match schema"
+                )
+            if (
+                not bool(np.isfinite(mean).all())
+                or not bool(np.isfinite(scale).all())
+                or bool((scale <= 0.0).any())
+            ):
+                raise ValueError(
+                    f"field {name!r} statistics must be finite with "
+                    "positive standard deviation"
+                )
+            destination = inputs if spec.role == "input" else targets
+            if name not in destination:
+                raise ValueError(
+                    f"example is missing selected field {name!r}"
+                )
+            value = destination[name]
+            if isinstance(value, RaggedArray):
+                normalized = (
+                    np.asarray(value.values) - mean
+                ) / scale
+                destination[name] = RaggedArray(
+                    np.asarray(normalized, dtype=np.dtype(spec.dtype)),
+                    value.offsets,
+                )
+            else:
+                normalized = (np.asarray(value) - mean) / scale
+                destination[name] = np.asarray(
+                    normalized, dtype=np.dtype(spec.dtype)
+                )
+        return TrainingExample(
+            inputs=inputs,
+            targets=targets,
+            sample_id=example.sample_id,
+            group_id=example.group_id,
+            split=example.split,
+            metadata=example.metadata,
+        )
+
+
 __all__ = [
     "DatasetQualityPolicy",
     "RaggedArray",
+    "RunningFieldStatistics",
     "SPLITS",
     "SimulationBatch",
+    "StandardizeFields",
     "TrainingDatasetSchema",
     "TrainingExample",
     "TrainingFieldSpec",
     "VOXEL_ORDER",
     "as_torch_batch",
     "collate_training_examples",
+    "compute_training_statistics",
+    "deterministic_group_split",
 ]

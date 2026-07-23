@@ -8,12 +8,16 @@ import numpy as np
 from TexGen.training_data import (
     DatasetQualityPolicy,
     RaggedArray,
+    RunningFieldStatistics,
     SimulationBatch,
+    StandardizeFields,
     TrainingDatasetSchema,
     TrainingExample,
     TrainingFieldSpec,
     as_torch_batch,
     collate_training_examples,
+    compute_training_statistics,
+    deterministic_group_split,
 )
 
 try:
@@ -280,6 +284,29 @@ class TrainingContainerTest(unittest.TestCase):
                 with self.assertRaisesRegex((TypeError, ValueError), message):
                     TrainingExample(**values)
 
+    def test_example_accepts_already_frozen_nested_metadata(self):
+        first = TrainingExample(
+            inputs={},
+            targets={},
+            sample_id="s0",
+            group_id="g0",
+            split="train",
+            metadata={"nested": {"values": [1, 2]}},
+        )
+
+        second = TrainingExample(
+            inputs={},
+            targets={},
+            sample_id="s1",
+            group_id="g0",
+            split="train",
+            metadata=first.metadata,
+        )
+
+        self.assertEqual(
+            second.metadata["nested"]["values"], (1, 2)
+        )
+
 
 def make_examples():
     first = TrainingExample(
@@ -490,6 +517,247 @@ class TrainingCollationTest(unittest.TestCase):
             pinned.inputs["orientation.primary"].offsets.is_pinned()
         )
         self.assertEqual(pinned.metadata, batch.metadata)
+
+
+class GroupSplitTest(unittest.TestCase):
+    def test_split_is_deterministic_and_input_order_independent(self):
+        ratios = {"train": 0.5, "validation": 0.25, "test": 0.25}
+
+        first = deterministic_group_split(
+            ["g3", "g1", "g2", "g1"],
+            ratios=ratios,
+            seed=42,
+        )
+        second = deterministic_group_split(
+            ["g2", "g1", "g3"],
+            ratios={
+                "test": 0.25,
+                "train": 0.5,
+                "validation": 0.25,
+            },
+            seed=42,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), {"g1", "g2", "g3"})
+        self.assertEqual(
+            sorted(first.values()),
+            ["test", "train", "validation"],
+        )
+        self.assertEqual(
+            first,
+            deterministic_group_split(
+                ["g1", "g2", "g3"],
+                ratios=ratios,
+                seed=42,
+            ),
+        )
+
+    def test_strata_allocate_whole_groups_to_every_split(self):
+        groups = [f"g{index}" for index in range(6)]
+        strata = {
+            group: ("plain" if index < 3 else "twill")
+            for index, group in enumerate(groups)
+        }
+
+        result = deterministic_group_split(
+            groups,
+            ratios={
+                "train": 1 / 3,
+                "validation": 1 / 3,
+                "test": 1 / 3,
+            },
+            seed=7,
+            strata=strata,
+        )
+
+        for stratum in ("plain", "twill"):
+            assigned = {
+                result[group]
+                for group in groups
+                if strata[group] == stratum
+            }
+            self.assertEqual(
+                assigned, {"train", "validation", "test"}
+            )
+
+    def test_split_rejects_invalid_ratios_groups_and_strata(self):
+        cases = (
+            (
+                {"group_ids": [], "ratios": {"train": 1.0}},
+                "group",
+            ),
+            (
+                {
+                    "group_ids": ["g"],
+                    "ratios": {"train": 0.8, "test": 0.1},
+                },
+                "sum",
+            ),
+            (
+                {
+                    "group_ids": ["g"],
+                    "ratios": {"train": 1.0, "holdout": 0.0},
+                },
+                "split",
+            ),
+            (
+                {
+                    "group_ids": ["g"],
+                    "ratios": {"train": -1.0, "test": 2.0},
+                },
+                "ratio",
+            ),
+            (
+                {
+                    "group_ids": ["g", ""],
+                    "ratios": {"train": 1.0},
+                },
+                "group",
+            ),
+            (
+                {
+                    "group_ids": ["g1", "g2"],
+                    "ratios": {"train": 1.0},
+                    "strata": {"g1": "plain"},
+                },
+                "strata",
+            ),
+        )
+        for kwargs, message in cases:
+            with self.subTest(kwargs=kwargs):
+                kwargs.setdefault("seed", 1)
+                with self.assertRaisesRegex(ValueError, message):
+                    deterministic_group_split(**kwargs)
+
+
+class StatisticsTest(unittest.TestCase):
+    def test_welford_statistics_are_componentwise_and_constant_safe(self):
+        accumulator = RunningFieldStatistics(component_shape=(3,))
+        accumulator.update(
+            np.array([[1.0, 5.0, -1.0], [3.0, 5.0, 1.0]])
+        )
+        accumulator.update(np.array([[5.0, 5.0, 3.0]]))
+
+        result = accumulator.finalize(unit="GPa")
+
+        np.testing.assert_allclose(result["mean"], [3.0, 5.0, 1.0])
+        np.testing.assert_allclose(
+            result["variance"], [8 / 3, 0.0, 8 / 3]
+        )
+        np.testing.assert_allclose(
+            result["standard_deviation"],
+            [np.sqrt(8 / 3), 1.0, np.sqrt(8 / 3)],
+        )
+        self.assertEqual(result["constant_mask"], [False, True, False])
+        self.assertEqual(result["minimum"], [1.0, 5.0, -1.0])
+        self.assertEqual(result["maximum"], [5.0, 5.0, 3.0])
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(result["source_split"], "train")
+        self.assertEqual(result["unit"], "GPa")
+
+    def test_dataset_statistics_exclude_validation_and_test(self):
+        schema = make_schema()
+        first, second = make_examples()
+        train_two = dataclasses.replace(
+            first,
+            sample_id="s2",
+            targets={
+                "effective_c21": np.full(
+                    21, 2.0, dtype=np.float64
+                )
+            },
+        )
+        validation = dataclasses.replace(
+            second,
+            targets={
+                "effective_c21": np.full(
+                    21, 1000.0, dtype=np.float64
+                )
+            },
+        )
+        test = dataclasses.replace(
+            validation,
+            sample_id="s3",
+            split="test",
+            targets={
+                "effective_c21": np.full(
+                    21, -1000.0, dtype=np.float64
+                )
+            },
+        )
+
+        statistics = compute_training_statistics(
+            (first, train_two, validation, test), schema
+        )
+
+        expected_mean = (
+            np.arange(21, dtype=np.float64) + 2.0
+        ) / 2.0
+        np.testing.assert_allclose(
+            statistics["effective_c21"]["mean"], expected_mean
+        )
+        self.assertEqual(
+            statistics["effective_c21"]["count"], 2
+        )
+
+    def test_standardization_uses_declared_units_and_leaves_metadata(self):
+        schema = make_schema()
+        example = make_examples()[0]
+        statistics = {
+            "effective_c21": {
+                "mean": np.arange(21, dtype=np.float64).tolist(),
+                "variance": np.ones(21).tolist(),
+                "standard_deviation": np.full(21, 2.0).tolist(),
+                "minimum": np.zeros(21).tolist(),
+                "maximum": np.ones(21).tolist(),
+                "constant_mask": [False] * 21,
+                "count": 2,
+                "source_split": "train",
+                "unit": "GPa",
+            }
+        }
+        transform = StandardizeFields(
+            statistics=statistics,
+            fields=("effective_c21",),
+        )
+
+        transformed = transform(example, schema)
+
+        np.testing.assert_allclose(
+            transformed.targets["effective_c21"], np.zeros(21)
+        )
+        self.assertIs(
+            transformed.inputs["voxel.material_id"],
+            example.inputs["voxel.material_id"],
+        )
+        self.assertEqual(transformed.metadata, example.metadata)
+
+        bad_unit = {
+            "effective_c21": dict(
+                statistics["effective_c21"], unit="Pa"
+            )
+        }
+        with self.assertRaisesRegex(ValueError, "unit"):
+            StandardizeFields(
+                bad_unit, ("effective_c21",)
+            )(example, schema)
+        with self.assertRaisesRegex(ValueError, "floating"):
+            StandardizeFields(
+                statistics={"voxel.material_id": {}},
+                fields=("voxel.material_id",),
+            )(example, schema)
+
+    def test_statistics_reject_nonfinite_or_wrong_component_shape(self):
+        accumulator = RunningFieldStatistics(component_shape=(2,))
+        with self.assertRaisesRegex(ValueError, "shape"):
+            accumulator.update(np.ones((3,), dtype=np.float64))
+        with self.assertRaisesRegex(ValueError, "finite"):
+            accumulator.update(
+                np.array([[1.0, np.nan]], dtype=np.float64)
+            )
+        with self.assertRaisesRegex(ValueError, "empty"):
+            accumulator.finalize(unit=None)
 
 
 if __name__ == "__main__":
