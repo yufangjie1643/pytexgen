@@ -118,6 +118,8 @@ def _convert_float_array(
             )
         return result
 
+    if torch is None:
+        _torch_float_dtype(dtype, None)
     fallback = value.dtype if _is_torch_tensor(value) else torch.float64
     target_dtype = _torch_float_dtype(dtype, fallback)
     if _is_torch_tensor(value):
@@ -556,6 +558,283 @@ class SparseStiffnessField:
         return np.expand_dims(field, axis=0)
 
 
+def _norm(value: Any, *, axis: int, keepdims: bool):
+    if _is_torch_tensor(value):
+        return torch.linalg.vector_norm(value, dim=axis, keepdim=keepdims)
+    return np.linalg.norm(value, axis=axis, keepdims=keepdims)
+
+
+def _sum(value: Any, *, axis: int, keepdims: bool):
+    if _is_torch_tensor(value):
+        return value.sum(dim=axis, keepdim=keepdims)
+    return np.sum(value, axis=axis, keepdims=keepdims)
+
+
+def _cross(left: Any, right: Any):
+    if _is_torch_tensor(left):
+        return torch.cross(left, right, dim=-1)
+    return np.cross(left, right)
+
+
+def _einsum(expression: str, *values: Any):
+    if values and _is_torch_tensor(values[0]):
+        return torch.einsum(expression, *values)
+    return np.einsum(expression, *values)
+
+
+def _concatenate(values: Sequence[Any], *, axis: int):
+    if values and _is_torch_tensor(values[0]):
+        return torch.cat(tuple(values), dim=axis)
+    return np.concatenate(tuple(values), axis=axis)
+
+
+def _mandel_basis(*, like: Any):
+    inverse_sqrt_two = 1.0 / math.sqrt(2.0)
+    basis = _zeros((6, 3, 3), like=like)
+    basis[0, 0, 0] = 1.0
+    basis[1, 1, 1] = 1.0
+    basis[2, 2, 2] = 1.0
+    basis[3, 1, 2] = basis[3, 2, 1] = inverse_sqrt_two
+    basis[4, 0, 2] = basis[4, 2, 0] = inverse_sqrt_two
+    basis[5, 0, 1] = basis[5, 1, 0] = inverse_sqrt_two
+    return basis
+
+
+def _mandel_weights(*, like: Any):
+    values = (1.0, 1.0, 1.0, math.sqrt(2.0), math.sqrt(2.0), math.sqrt(2.0))
+    if _is_torch_tensor(like):
+        return torch.as_tensor(values, dtype=like.dtype, device=like.device)
+    return np.asarray(values, dtype=np.asarray(like).dtype)
+
+
+def _orthonormal_frames(
+    orientation1: Any,
+    orientation2: Any,
+    *,
+    eps: float,
+):
+    norm1 = _norm(orientation1, axis=-1, keepdims=True)
+    if _any_true(norm1 <= eps):
+        raise ValueError("orientation vectors are zero or collinear")
+    e1 = orientation1 / norm1
+    projected = orientation2 - (
+        _sum(orientation2 * e1, axis=-1, keepdims=True) * e1
+    )
+    norm2 = _norm(projected, axis=-1, keepdims=True)
+    if _any_true(norm2 <= eps):
+        raise ValueError("orientation vectors are zero or collinear")
+    e2 = projected / norm2
+    e3 = _cross(e1, e2)
+    return _stack((e1, e2, e3), axis=-1)
+
+
+def _rotate_stiffness_chunk(
+    local_c21: Any,
+    orientation1: Any,
+    orientation2: Any,
+    *,
+    eps: float,
+):
+    rotation = _orthonormal_frames(orientation1, orientation2, eps=eps)
+    basis = _mandel_basis(like=local_c21)
+    rotated_basis = _einsum(
+        "niI,aIJ,nkJ->naik", rotation, basis, rotation
+    )
+    mandel_rotation = _einsum("bik,naik->nba", basis, rotated_basis)
+
+    weights = _mandel_weights(like=local_c21)
+    inverse_weights = 1.0 / weights
+    local_voigt = unpack_c21(local_c21)
+    local_mandel = (
+        local_voigt
+        * weights[None, :, None]
+        * weights[None, None, :]
+    )
+    global_mandel = _einsum(
+        "nij,njk,nlk->nil",
+        mandel_rotation,
+        local_mandel,
+        mandel_rotation,
+    )
+    global_voigt = (
+        global_mandel
+        * inverse_weights[None, :, None]
+        * inverse_weights[None, None, :]
+    )
+    return pack_voigt_c21(global_voigt)
+
+
+def rotate_stiffness_c21(
+    local_c21: Any,
+    orientation1: Any,
+    orientation2: Any,
+    *,
+    chunk_voxels: int = 65536,
+    eps: float = 1e-12,
+):
+    """Rotate per-voxel local C21 stiffness into global coordinates."""
+    arrays = (local_c21, orientation1, orientation2)
+    if not all(hasattr(value, "shape") for value in arrays):
+        raise ValueError("stiffness and orientation inputs must be arrays")
+    if not _same_array_backend(arrays) or not _same_torch_device(arrays):
+        raise ValueError("stiffness and orientations must share backend and device")
+    if local_c21.ndim != 2 or local_c21.shape[1] != 21:
+        raise ValueError("local_c21 must have shape (N, 21)")
+    count = int(local_c21.shape[0])
+    if orientation1.shape != (count, 3) or orientation2.shape != (count, 3):
+        raise ValueError("orientation arrays must have shape (N, 3)")
+    if not all(_all_finite(value) for value in arrays):
+        raise ValueError("stiffness and orientations must contain only finite values")
+    if chunk_voxels < 1:
+        raise ValueError("chunk_voxels must be >= 1")
+    if eps <= 0.0:
+        raise ValueError("eps must be positive")
+    if count == 0:
+        return _copy_array(local_c21)
+
+    chunks = []
+    for start in range(0, count, chunk_voxels):
+        stop = min(start + chunk_voxels, count)
+        chunks.append(
+            _rotate_stiffness_chunk(
+                local_c21[start:stop],
+                orientation1[start:stop],
+                orientation2[start:stop],
+                eps=eps,
+            )
+        )
+    return _concatenate(chunks, axis=0)
+
+
+def _coerce_c21_for_field(value: Any, orientation: SparseOrientationField):
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        value = np.asarray(value)
+        shape = value.shape
+    if tuple(shape) == (6, 6):
+        value = pack_voigt_c21(value)
+    elif tuple(shape) != (21,):
+        raise ValueError(
+            f"stiffness must have shape (21,) or (6, 6), got {shape}"
+        )
+    return _convert_float_array(
+        value,
+        orientation.storage,
+        device=orientation.device,
+        dtype=orientation.orientation1.dtype,
+        copy=False,
+    )
+
+
+def _validate_positive_definite(c21: Any, name: str) -> None:
+    matrix = unpack_c21(c21)
+    if _is_torch_tensor(matrix):
+        minimum = torch.linalg.eigvalsh(matrix).amin()
+        valid = bool((minimum > 0.0).item())
+    else:
+        valid = bool(np.linalg.eigvalsh(matrix).min() > 0.0)
+    if not valid:
+        raise ValueError(f"{name} stiffness must be positive definite")
+
+
+def build_stiffness_field(
+    data: Any,
+    *,
+    matrix_stiffness: Any,
+    default_yarn_stiffness: Any = None,
+    yarn_stiffness_by_id: Optional[dict] = None,
+    output: str = "sparse",
+    chunk_voxels: int = 65536,
+    validate_positive_definite: bool = False,
+    unit: Optional[str] = None,
+):
+    """Build rotated sparse C21 stiffness from voxel orientation data."""
+    orientation = getattr(data, "sparse_orientation", None)
+    if not isinstance(orientation, SparseOrientationField):
+        raise ValueError("data must contain a SparseOrientationField")
+    overrides = {} if yarn_stiffness_by_id is None else {
+        int(key): value for key, value in yarn_stiffness_by_id.items()
+    }
+
+    matrix_c21 = _coerce_c21_for_field(matrix_stiffness, orientation)
+    default_c21 = (
+        None
+        if default_yarn_stiffness is None
+        else _coerce_c21_for_field(default_yarn_stiffness, orientation)
+    )
+    override_c21 = {
+        yarn_id: _coerce_c21_for_field(value, orientation)
+        for yarn_id, value in sorted(overrides.items())
+    }
+    if validate_positive_definite:
+        _validate_positive_definite(matrix_c21, "matrix")
+        if default_c21 is not None:
+            _validate_positive_definite(default_c21, "default yarn")
+        for yarn_id, value in override_c21.items():
+            _validate_positive_definite(value, f"yarn {yarn_id}")
+
+    count = orientation.num_yarn_voxels
+    if orientation.storage == "torch":
+        float_dtype = orientation.orientation1.dtype
+        device = orientation.orientation1.device
+        local_c21 = torch.empty((count, 21), dtype=float_dtype, device=device)
+        material_ids = torch.zeros(
+            count, dtype=torch.int32, device=device
+        )
+        if default_c21 is not None:
+            local_c21[:] = default_c21
+            material_ids.fill_(1)
+    else:
+        float_dtype = orientation.orientation1.dtype
+        local_c21 = np.empty((count, 21), dtype=float_dtype)
+        material_ids = np.zeros(count, dtype=np.int32)
+        if default_c21 is not None:
+            local_c21[:] = default_c21
+            material_ids.fill(1)
+
+    for material_id, (yarn_id, value) in enumerate(
+        override_c21.items(), start=2
+    ):
+        mask = orientation.yarn_ids == yarn_id
+        local_c21[mask] = value
+        material_ids[mask] = material_id
+
+    missing = material_ids == 0
+    if _any_true(missing):
+        if _is_torch_tensor(orientation.yarn_ids):
+            missing_ids = torch.unique(
+                orientation.yarn_ids[missing]
+            ).detach().cpu().tolist()
+        else:
+            missing_ids = np.unique(orientation.yarn_ids[missing]).tolist()
+        raise ValueError(
+            f"missing yarn stiffness for yarn IDs {missing_ids}"
+        )
+
+    rotated_c21 = rotate_stiffness_c21(
+        local_c21,
+        orientation.orientation1,
+        orientation.orientation2,
+        chunk_voxels=chunk_voxels,
+    )
+    result = SparseStiffnessField(
+        matrix_c21=matrix_c21,
+        voxel_indices=_copy_array(orientation.voxel_indices),
+        yarn_ids=_copy_array(orientation.yarn_ids),
+        material_ids=material_ids,
+        yarn_c21=rotated_c21,
+        grid_shape=orientation.grid_shape,
+        unit=unit,
+        order=orientation.order,
+    )
+    output_normalized = str(output).lower()
+    if output_normalized == "sparse":
+        return result
+    if output_normalized == "dense":
+        return result.to_dense_c21()
+    raise ValueError('output must be "sparse" or "dense"')
+
+
 __all__ = [
     "VOIGT_COMPONENTS",
     "C21_INDICES",
@@ -565,4 +844,6 @@ __all__ = [
     "unpack_c21",
     "isotropic_stiffness_c21",
     "orthotropic_stiffness_c21",
+    "rotate_stiffness_c21",
+    "build_stiffness_field",
 ]

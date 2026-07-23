@@ -7,6 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 
 ROOT = Path(__file__).resolve().parent
 MODULE_PATH = ROOT / "TexGen" / "material_fields.py"
@@ -231,6 +236,230 @@ class SparseFieldContainerTest(unittest.TestCase):
                 yarn_c21=np.ones((2, 21)),
                 grid_shape=(1, 2, 2),
             )
+
+
+class StiffnessRotationTest(unittest.TestCase):
+    def setUp(self):
+        self.mf = load_material_fields()
+        self.assertTrue(
+            hasattr(self.mf, "rotate_stiffness_c21"),
+            "rotate_stiffness_c21 is not implemented",
+        )
+        self.assertTrue(
+            hasattr(self.mf, "build_stiffness_field"),
+            "build_stiffness_field is not implemented",
+        )
+
+    @staticmethod
+    def symmetric_positive_definite_matrix():
+        base = np.arange(1.0, 37.0).reshape(6, 6) / 36.0
+        return base @ base.T + 2.0 * np.eye(6)
+
+    @staticmethod
+    def rotation_z_90():
+        return np.array(
+            [
+                [0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+
+    @staticmethod
+    def rotate_with_explicit_fourth_order_tensor(matrix, rotation):
+        pairs = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
+        tensor = np.zeros((3, 3, 3, 3), dtype=np.float64)
+        for row, (i, j) in enumerate(pairs):
+            for column, (k, ell) in enumerate(pairs):
+                value = matrix[row, column]
+                tensor[i, j, k, ell] = value
+                tensor[j, i, k, ell] = value
+                tensor[i, j, ell, k] = value
+                tensor[j, i, ell, k] = value
+        rotated = np.einsum(
+            "iI,jJ,kK,lL,IJKL->ijkl",
+            rotation,
+            rotation,
+            rotation,
+            rotation,
+            tensor,
+        )
+        result = np.empty((6, 6), dtype=np.float64)
+        for row, (i, j) in enumerate(pairs):
+            for column, (k, ell) in enumerate(pairs):
+                result[row, column] = rotated[i, j, k, ell]
+        return result
+
+    def make_three_voxel_field(self, storage="numpy", device=None):
+        kwargs = {
+            "voxel_indices": np.arange(3, dtype=np.int64),
+            "yarn_ids": np.array([0, 7, 0], dtype=np.int32),
+            "orientation1": np.tile([1.0, 0.0, 0.0], (3, 1)),
+            "orientation2": np.tile([0.0, 1.0, 0.0], (3, 1)),
+            "grid_shape": (1, 1, 3),
+        }
+        field = self.mf.SparseOrientationField(**kwargs)
+        return field.to(storage, device=device) if storage != "numpy" else field
+
+    def test_identity_frame_preserves_general_c21(self):
+        local = self.mf.pack_voigt_c21(
+            self.symmetric_positive_definite_matrix()
+        )
+
+        result = self.mf.rotate_stiffness_c21(
+            local[None, :],
+            np.array([[1.0, 0.0, 0.0]]),
+            np.array([[0.0, 1.0, 0.0]]),
+            chunk_voxels=1,
+        )
+
+        np.testing.assert_allclose(result[0], local, rtol=1e-12, atol=1e-12)
+
+    def test_ninety_degree_frame_matches_fourth_order_reference(self):
+        local = self.mf.orthotropic_stiffness_c21(
+            150.0, 10.0, 12.0,
+            0.25, 0.20, 0.30,
+            5.0, 6.0, 4.0,
+        )
+
+        actual = self.mf.rotate_stiffness_c21(
+            local[None, :],
+            np.array([[0.0, 1.0, 0.0]]),
+            np.array([[-1.0, 0.0, 0.0]]),
+        )
+        expected = self.rotate_with_explicit_fourth_order_tensor(
+            self.mf.unpack_c21(local), self.rotation_z_90()
+        )
+
+        np.testing.assert_allclose(
+            self.mf.unpack_c21(actual[0]),
+            expected,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+    def test_rotation_is_chunk_size_invariant(self):
+        local = np.broadcast_to(
+            self.mf.pack_voigt_c21(
+                self.symmetric_positive_definite_matrix()
+            ),
+            (5, 21),
+        ).copy()
+        orientation1 = np.tile([1.0, 0.0, 0.0], (5, 1))
+        orientation2 = np.tile([0.0, 1.0, 0.0], (5, 1))
+
+        chunked = self.mf.rotate_stiffness_c21(
+            local, orientation1, orientation2, chunk_voxels=2
+        )
+        single = self.mf.rotate_stiffness_c21(
+            local, orientation1, orientation2, chunk_voxels=100
+        )
+
+        np.testing.assert_allclose(chunked, single, rtol=0.0, atol=0.0)
+
+    def test_rotation_rejects_collinear_frame(self):
+        local = self.mf.isotropic_stiffness_c21(70.0, 0.25)
+        with self.assertRaisesRegex(ValueError, "zero or collinear"):
+            self.mf.rotate_stiffness_c21(
+                local[None, :],
+                np.array([[1.0, 0.0, 0.0]]),
+                np.array([[2.0, 0.0, 0.0]]),
+            )
+
+    def test_builder_selects_default_and_per_yarn_materials(self):
+        data = type(
+            "VoxelData",
+            (),
+            {"sparse_orientation": self.make_three_voxel_field()},
+        )()
+
+        result = self.mf.build_stiffness_field(
+            data,
+            matrix_stiffness=np.ones(21),
+            default_yarn_stiffness=np.full(21, 2.0),
+            yarn_stiffness_by_id={7: np.full(21, 3.0)},
+            chunk_voxels=2,
+            unit="Pa",
+        )
+
+        self.assertEqual(result.yarn_c21.shape, (3, 21))
+        self.assertEqual(result.material_ids.tolist(), [1, 2, 1])
+        np.testing.assert_allclose(result.yarn_c21[0], 2.0)
+        np.testing.assert_allclose(result.yarn_c21[1], 3.0)
+        self.assertEqual(result.unit, "Pa")
+
+    def test_builder_requires_material_for_every_yarn(self):
+        data = type(
+            "VoxelData",
+            (),
+            {"sparse_orientation": self.make_three_voxel_field()},
+        )()
+        with self.assertRaisesRegex(ValueError, "missing.*0"):
+            self.mf.build_stiffness_field(
+                data,
+                matrix_stiffness=np.ones(21),
+                yarn_stiffness_by_id={7: np.full(21, 3.0)},
+            )
+
+    def test_builder_optional_positive_definite_validation(self):
+        data = type(
+            "VoxelData",
+            (),
+            {"sparse_orientation": self.make_three_voxel_field()},
+        )()
+        with self.assertRaisesRegex(ValueError, "positive definite"):
+            self.mf.build_stiffness_field(
+                data,
+                matrix_stiffness=-np.eye(6),
+                default_yarn_stiffness=np.eye(6),
+                validate_positive_definite=True,
+            )
+
+    @unittest.skipIf(torch is None, "torch is optional")
+    def test_torch_cpu_matches_numpy_and_preserves_device(self):
+        local = self.mf.pack_voigt_c21(
+            self.symmetric_positive_definite_matrix()
+        )
+        orientation1 = np.array([[0.0, 1.0, 0.0]])
+        orientation2 = np.array([[-1.0, 0.0, 0.0]])
+        expected = self.mf.rotate_stiffness_c21(
+            local[None, :], orientation1, orientation2
+        )
+
+        actual = self.mf.rotate_stiffness_c21(
+            torch.as_tensor(local[None, :], dtype=torch.float64),
+            torch.as_tensor(orientation1, dtype=torch.float64),
+            torch.as_tensor(orientation2, dtype=torch.float64),
+        )
+
+        self.assertEqual(actual.device.type, "cpu")
+        self.assertEqual(actual.dtype, torch.float64)
+        np.testing.assert_allclose(
+            actual.numpy(), expected, rtol=1e-10, atol=1e-10
+        )
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(),
+        "CUDA is optional",
+    )
+    def test_cuda_builder_keeps_outputs_on_gpu(self):
+        orientation = self.make_three_voxel_field(
+            storage="torch", device="cuda"
+        )
+        data = type(
+            "VoxelData",
+            (),
+            {"sparse_orientation": orientation},
+        )()
+
+        result = self.mf.build_stiffness_field(
+            data,
+            matrix_stiffness=np.ones(21),
+            default_yarn_stiffness=np.full(21, 2.0),
+        )
+
+        self.assertEqual(result.device, "cuda:0")
+        self.assertEqual(result.yarn_c21.device.type, "cuda")
 
 
 if __name__ == "__main__":
