@@ -668,6 +668,23 @@ class SimulationSampleDLPackTest(unittest.TestCase):
         torch is not None and torch.cuda.is_available(),
         "CUDA is not available",
     )
+    def test_cuda_device_alias_matches_resolved_tensor_device(self):
+        cuda_sample = self.sample.to("torch", device="cuda")
+        alias_voxels = replace(cuda_sample.voxels, device="cuda")
+
+        rebuilt = type(cuda_sample)(
+            voxels=alias_voxels,
+            orientation=alias_voxels.sparse_orientation,
+            stiffness=cuda_sample.stiffness,
+            materials=cuda_sample.materials,
+        )
+
+        self.assertEqual(rebuilt.device, str(cuda_sample.voxels.yarn_id.device))
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(),
+        "CUDA is not available",
+    )
     def test_nondefault_cuda_stream_observes_synchronized_producer_write(self):
         cuda_sample = self.sample.to("torch", device="cuda")
         field = cuda_sample.array("stiffness.yarn_c21")

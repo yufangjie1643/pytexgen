@@ -215,6 +215,25 @@ def _array_device(value: Any) -> str:
     return str(value.device) if _is_torch_tensor(value) else "cpu"
 
 
+def _devices_compatible(left: Any, right: Any) -> bool:
+    """Treat an unindexed Torch device as an alias for its resolved device."""
+    if torch is None:
+        return str(left) == str(right)
+    try:
+        left_device = torch.device(left)
+        right_device = torch.device(right)
+    except (RuntimeError, TypeError, ValueError):
+        return str(left) == str(right)
+    return bool(
+        left_device.type == right_device.type
+        and (
+            left_device.index is None
+            or right_device.index is None
+            or left_device.index == right_device.index
+        )
+    )
+
+
 def _array_equal(left: Any, right: Any) -> bool:
     if _is_torch_tensor(left):
         return _is_torch_tensor(right) and bool(torch.equal(left, right))
@@ -436,7 +455,7 @@ class SimulationSample:
 
     @property
     def device(self) -> str:
-        return self.voxels.device
+        return _array_device(self.voxels.yarn_id)
 
     @property
     def field_names(self) -> Tuple[str, ...]:
@@ -457,7 +476,7 @@ class SimulationSample:
             raise ValueError(
                 "VoxelGridData storage metadata does not match its arrays"
             )
-        if str(self.voxels.device) != expected_device:
+        if not _devices_compatible(self.voxels.device, expected_device):
             raise ValueError(
                 "VoxelGridData device metadata does not match its arrays"
             )
@@ -465,7 +484,10 @@ class SimulationSample:
             raise ValueError(
                 "all resident voxel arrays must use the same storage backend"
             )
-        if any(_array_device(value) != expected_device for value in arrays):
+        if any(
+            not _devices_compatible(_array_device(value), expected_device)
+            for value in arrays
+        ):
             raise ValueError(
                 "all resident voxel arrays must use the same device"
             )
