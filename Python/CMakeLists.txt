@@ -155,6 +155,13 @@ IF(BUILD_PYTHON_INTERFACE)
     # Python utility modules list
     # ========================================================================
     FILE(GLOB PYTHON_MODULE_FILES Lib/*.py)
+    set(PYTEXGEN_INTEROP_MODULE_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/gpu_voxelizer.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/material_fields.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/simulation_sample.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/simulation_io.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/acdm_solver.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/torch_periodic_mesher.py")
 
     # ========================================================================
     # Install targets
@@ -182,14 +189,9 @@ IF(BUILD_PYTHON_INTERFACE)
         install(FILES ${PYTHON_MODULE_FILES}
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
-        # Optional GPU voxelizer lives in the source compatibility package.
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/gpu_voxelizer.py"
-            DESTINATION ${PYTEXGEN_INSTALL_DIR})
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/material_fields.py"
-            DESTINATION ${PYTEXGEN_INSTALL_DIR})
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/acdm_solver.py"
-            DESTINATION ${PYTEXGEN_INSTALL_DIR})
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/torch_periodic_mesher.py"
+        # Optional GPU/interoperability modules live in the source
+        # compatibility package and are installed together.
+        install(FILES ${PYTEXGEN_INTEROP_MODULE_FILES}
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
         # On Windows, also install the TexGenCore DLL if built as shared
@@ -217,6 +219,8 @@ IF(BUILD_PYTHON_INTERFACE)
         INSTALL(FILES "${TEXGEN_LEGACY_INIT_PY}" "${TEXGEN_CORE_SWIG_PY}"
             DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
         INSTALL(FILES ${PYTHON_MODULE_FILES}
+            DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
+        INSTALL(FILES ${PYTEXGEN_INTEROP_MODULE_FILES}
             DESTINATION ${PYTHON_SITEPACKAGES_DIR}/TexGen)
 
         FILE(GLOB PYTHON_SAMPLE_SCRIPTS Scripts/*.py)

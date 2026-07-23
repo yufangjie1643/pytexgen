@@ -183,6 +183,71 @@ IDs, and rotated C21 values. Directory persistence produces raw `.npy` arrays
 that support `mmap_mode="r"`; a path ending in `.npz` produces one archive.
 Saving either form is an explicit GPU-to-CPU transfer boundary.
 
+## Simulation and Training Sample Contract
+
+`SimulationSample` composes the existing voxel, sparse direction, sparse C21,
+and material-table objects without copying their arrays:
+
+```python
+import numpy as np
+import torch
+
+from pytexgen.simulation_sample import (
+    MaterialTable,
+    voxelize_textile_simulation_sample,
+)
+
+materials = MaterialTable(
+    c21=np.stack([matrix, yarn]),
+    material_ids=np.array([0, 7], dtype=np.int32),
+    unit="Pa",
+)
+sample = voxelize_textile_simulation_sample(
+    textile,
+    materials=materials,
+    default_yarn_material_id=7,
+    nx=128, ny=128, nz=128,
+    backend="torch", device="cuda", output="backend",
+)
+
+field = sample.array("stiffness.yarn_c21")
+alias = torch.from_dlpack(field)
+assert alias.data_ptr() == field.data_ptr()
+```
+
+Stable names cover voxel yarn/physical-material/occupancy grids, sparse
+direction frames, sparse C21 rows, and the material table. Native resident
+fields are zero-copy. Derived occupancy/material grids and dense
+`layout="acdm"` require `copy=True`; unsupported implicit allocation raises
+instead of silently copying.
+
+The sample itself does not implement `__dlpack__` because it contains multiple
+arrays. Pass one result from `sample.array(...)` to Torch, JAX, CuPy, or Warp.
+CUDA stream ordering remains the array library's standard DLPack
+responsibility. Within one PyTorch process, callers that mutate an existing
+tensor on a different stream must establish the normal event dependency before
+consumption.
+
+Consolidated persistence stores sparse indices and yarn IDs once:
+
+```python
+from pytexgen.simulation_io import (
+    load_simulation_sample,
+    save_simulation_sample,
+)
+
+save_simulation_sample("weave_sample", sample)
+mmap_sample = load_simulation_sample("weave_sample", mmap_mode="r")
+cuda_sample = load_simulation_sample(
+    "weave_sample.npz", output="torch", device="cuda"
+)
+```
+
+The manifest records schema/version, filenames, shapes, dtypes, order, units,
+material names, generation metadata, and PyTexGen provenance. Directory arrays
+remain memory-mappable. Saving a CUDA sample is an explicit device-to-host
+boundary.
+
 When the same textile is voxelized repeatedly, cache the TexGen geometry
 snapshot once:
 
@@ -229,9 +294,9 @@ a second TexGen singleton. If the SWIG wrapper is regenerated, keep the
 `_fastdata_extract_snapshot_bundle_direct` shim in `_Core` or add an equivalent
 explicit export.
 
-`VoxelGridData.to_dlpack("yarn_id" | "material_id" | "occupancy")` exports a
-DLPack capsule through torch when a downstream tensor library wants to consume
-the voxel labels without an Abaqus text-file round trip.
+`VoxelGridData.to_dlpack("yarn_id" | "material_id" | "occupancy")` remains a
+legacy capsule helper. New integrations should pass the array returned by
+`SimulationSample.array(...)` directly to a DLPack consumer.
 
 ### Fastdata Pipeline Benchmark
 

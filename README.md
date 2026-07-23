@@ -230,6 +230,48 @@ Matrix voxels share one `matrix_c21` and have no direction entry. Dense views
 are created only when requested. Saving transfers CUDA tensors to CPU; keep
 `output="backend"` during computation to avoid an earlier copy.
 
+For solver and training integrations, use the validated sample contract so
+material identity is independent of yarn numbering:
+
+```python
+import numpy as np
+import torch
+
+from pytexgen.simulation_sample import (
+    MaterialTable,
+    voxelize_textile_simulation_sample,
+)
+from pytexgen.simulation_io import load_simulation_sample, save_simulation_sample
+
+materials = MaterialTable(
+    c21=np.stack([matrix_c21, yarn_c21]),
+    material_ids=np.array([0, 7], dtype=np.int32),
+    unit="Pa",
+    names=("matrix", "yarn"),
+)
+sample = voxelize_textile_simulation_sample(
+    textile,
+    materials=materials,
+    default_yarn_material_id=7,
+    nx=128, ny=128, nz=128,
+    backend="torch", device="cuda", output="backend",
+)
+
+physical_ids = sample.array("voxel.material_id", copy=True)
+yarn_c21_sparse = sample.array("stiffness.yarn_c21")
+torch_alias = torch.from_dlpack(yarn_c21_sparse)  # same CUDA allocation
+save_simulation_sample("sample", sample)          # explicit CPU boundary
+mmap_sample = load_simulation_sample("sample", mmap_mode="r")
+```
+
+`sample.array(..., copy=False)` never casts, moves, densifies, or relayouts.
+Use `copy=True` for derived grids and `layout="acdm"` for
+`(1,6,6,Nz,Ny,Nx)`. DLPack-capable consumers use the returned array directly;
+for example `jax.dlpack.from_dlpack(field)` or `warp.from_torch(field)` when
+those optional frameworks are installed. `VoxelGridData.material_id()` remains
+the legacy yarn-number mapping; `voxel.material_id` is the physical material
+field.
+
 Use torch when an accelerator is available:
 
 ```python
