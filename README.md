@@ -194,6 +194,42 @@ orientation1 = data.orientation1  # yarn tangent, shape: (nz, ny, nx, 3)
 orientation2 = data.orientation2  # yarn up vector, shape: (nz, ny, nx, 3)
 ```
 
+Build a sparse, fully GPU-resident material direction and stiffness field in
+one call:
+
+```python
+from pytexgen.material_fields import (
+    isotropic_stiffness_c21,
+    orthotropic_stiffness_c21,
+    save_material_field_bundle,
+    voxelize_textile_material_fields,
+)
+
+matrix_c21 = isotropic_stiffness_c21(E=3.5e9, nu=0.35)
+yarn_c21 = orthotropic_stiffness_c21(
+    150e9, 10e9, 10e9, 0.25, 0.25, 0.30, 5e9, 5e9, 3.8e9
+)
+data, stiffness = voxelize_textile_material_fields(
+    textile,
+    nx=128, ny=128, nz=128,
+    backend="torch", device="cuda", output="backend",
+    matrix_stiffness=matrix_c21,
+    default_yarn_stiffness=yarn_c21,
+    yarn_stiffness_by_id={3: 1.1 * yarn_c21},
+)
+
+dense_c21 = stiffness.to_dense_c21()  # (Nz, Ny, Nx, 21)
+acdm_c66 = stiffness.to_acdm()        # (1, 6, 6, Nz, Ny, Nx)
+save_material_field_bundle("material_fields", data.sparse_orientation, stiffness)
+```
+
+Engineering-Voigt order is `(xx, yy, zz, yz, xz, xy)`. C21 stores the
+row-major upper triangle:
+`(C11,C12,C13,C14,C15,C16,C22,C23,C24,C25,C26,C33,C34,C35,C36,C44,C45,C46,C55,C56,C66)`.
+Matrix voxels share one `matrix_c21` and have no direction entry. Dense views
+are created only when requested. Saving transfers CUDA tensors to CPU; keep
+`output="backend"` during computation to avoid an earlier copy.
+
 Use torch when an accelerator is available:
 
 ```python

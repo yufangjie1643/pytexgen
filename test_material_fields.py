@@ -3,8 +3,10 @@
 import importlib.util
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -354,6 +356,95 @@ class PersistenceTest(unittest.TestCase):
                 self.mf.load_material_field_bundle(
                     path, output="torch", mmap_mode="r"
                 )
+
+
+class OrchestrationTest(unittest.TestCase):
+    def setUp(self):
+        self.mf = load_material_fields()
+        self.assertTrue(
+            hasattr(self.mf, "voxelize_textile_material_fields"),
+            "voxelize_textile_material_fields is not implemented",
+        )
+
+    def test_one_call_forwards_gpu_voxelization_and_material_inputs(self):
+        orientation = self.mf.SparseOrientationField(
+            voxel_indices=np.array([1], dtype=np.int64),
+            yarn_ids=np.array([0], dtype=np.int32),
+            orientation1=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+            orientation2=np.array([[0.0, 1.0, 0.0]], dtype=np.float32),
+            grid_shape=(1, 1, 2),
+        )
+        voxel_data = types.SimpleNamespace(
+            sparse_orientation=orientation,
+            timings={"classify": 0.25},
+        )
+        calls = {}
+
+        def fake_voxelize(textile, **kwargs):
+            calls["voxelize"] = (textile, kwargs)
+            return voxel_data
+
+        expected_field = object()
+
+        def fake_build(data, **kwargs):
+            calls["build"] = (data, kwargs)
+            return expected_field
+
+        fake_module = types.ModuleType("TexGen.gpu_voxelizer")
+        fake_module.voxelize_textile_data = fake_voxelize
+        old_build = self.mf.build_stiffness_field
+        self.mf.build_stiffness_field = fake_build
+        self.addCleanup(
+            lambda: setattr(self.mf, "build_stiffness_field", old_build)
+        )
+
+        textile = object()
+        matrix = np.ones(21)
+        default_yarn = np.full(21, 2.0)
+        overrides = {3: np.full(21, 3.0)}
+        with mock.patch.dict(
+            sys.modules, {"TexGen.gpu_voxelizer": fake_module}
+        ):
+            data, field = self.mf.voxelize_textile_material_fields(
+                textile,
+                matrix_stiffness=matrix,
+                default_yarn_stiffness=default_yarn,
+                yarn_stiffness_by_id=overrides,
+                orientation_storage="sparse",
+                stiffness_output="sparse",
+                nx=32,
+                ny=24,
+                nz=16,
+                backend="torch",
+                device="cuda",
+                dtype="float32",
+            )
+
+        self.assertIs(data, voxel_data)
+        self.assertIs(field, expected_field)
+        self.assertIs(calls["voxelize"][0], textile)
+        self.assertEqual(calls["voxelize"][1]["backend"], "torch")
+        self.assertEqual(calls["voxelize"][1]["device"], "cuda")
+        self.assertEqual(calls["voxelize"][1]["nx"], 32)
+        self.assertTrue(calls["voxelize"][1]["include_orientations"])
+        self.assertEqual(
+            calls["voxelize"][1]["orientation_storage"], "sparse"
+        )
+        self.assertIs(calls["build"][0], voxel_data)
+        self.assertIs(calls["build"][1]["matrix_stiffness"], matrix)
+        self.assertIs(
+            calls["build"][1]["default_yarn_stiffness"], default_yarn
+        )
+        self.assertIs(calls["build"][1]["yarn_stiffness_by_id"], overrides)
+
+    def test_one_call_rejects_disabled_orientations(self):
+        with self.assertRaisesRegex(ValueError, "include_orientations"):
+            self.mf.voxelize_textile_material_fields(
+                object(),
+                matrix_stiffness=np.ones(21),
+                default_yarn_stiffness=np.ones(21),
+                include_orientations=False,
+            )
 
 
 class StiffnessRotationTest(unittest.TestCase):

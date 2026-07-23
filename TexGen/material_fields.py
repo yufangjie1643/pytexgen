@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
@@ -1046,6 +1047,64 @@ def load_material_field_bundle(
     return orientation, stiffness
 
 
+def _synchronize_field_device(field: Any) -> None:
+    if torch is None:
+        return
+    if _is_torch_tensor(field):
+        device = field.device
+    elif getattr(field, "storage", None) == "torch":
+        device = field.yarn_c21.device
+    else:
+        return
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
+
+
+def voxelize_textile_material_fields(
+    textile: Any,
+    *,
+    matrix_stiffness: Any,
+    default_yarn_stiffness: Any = None,
+    yarn_stiffness_by_id: Optional[dict] = None,
+    orientation_storage: str = "sparse",
+    stiffness_output: str = "sparse",
+    **voxel_kwargs,
+):
+    """Voxelize a textile and build its rotated engineering-Voigt field."""
+    requested_orientations = voxel_kwargs.pop("include_orientations", True)
+    if requested_orientations is not True:
+        raise ValueError(
+            "include_orientations=False is incompatible with material fields"
+        )
+    if str(orientation_storage).lower() != "sparse":
+        raise ValueError(
+            'orientation_storage must be "sparse" for material field building'
+        )
+
+    from TexGen.gpu_voxelizer import voxelize_textile_data
+
+    voxel_kwargs["include_orientations"] = True
+    voxel_kwargs["orientation_storage"] = "sparse"
+    data = voxelize_textile_data(textile, **voxel_kwargs)
+
+    build_kwargs = {
+        "matrix_stiffness": matrix_stiffness,
+        "default_yarn_stiffness": default_yarn_stiffness,
+        "yarn_stiffness_by_id": yarn_stiffness_by_id,
+        "output": stiffness_output,
+    }
+    if "chunk_voxels" in voxel_kwargs:
+        build_kwargs["chunk_voxels"] = voxel_kwargs["chunk_voxels"]
+
+    start = time.perf_counter()
+    field = build_stiffness_field(data, **build_kwargs)
+    _synchronize_field_device(field)
+    data.timings["stiffness_build"] = time.perf_counter() - start
+    return data, field
+
+
 __all__ = [
     "VOIGT_COMPONENTS",
     "C21_INDICES",
@@ -1059,4 +1118,5 @@ __all__ = [
     "build_stiffness_field",
     "save_material_field_bundle",
     "load_material_field_bundle",
+    "voxelize_textile_material_fields",
 ]

@@ -185,6 +185,8 @@ IF(BUILD_PYTHON_INTERFACE)
         # Optional GPU voxelizer lives in the source compatibility package.
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/gpu_voxelizer.py"
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/material_fields.py"
+            DESTINATION ${PYTEXGEN_INSTALL_DIR})
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/acdm_solver.py"
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/torch_periodic_mesher.py"

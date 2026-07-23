@@ -104,9 +104,11 @@ orientation1 = data.orientation1  # yarn tangent, shape (nz, ny, nx, 3)
 orientation2 = data.orientation2  # yarn up vector, shape (nz, ny, nx, 3)
 ```
 
-Matrix voxels contain zero direction vectors. To receive tensors, keep
-classification on the numpy path and request `output="torch"`; the container
-conversion preserves `orientation1` and `orientation2`.
+Dense storage fills matrix voxels with zero direction vectors. Both NumPy and
+Torch classifiers also support `orientation_storage="sparse"`, which puts only
+yarn-voxel directions in `data.sparse_orientation`. With
+`backend="torch", output="backend"`, these compact arrays remain on the
+selected CUDA/MPS/CPU device.
 
 `data.yarn_id` is the flat TexGen element-order array
 `ix + iy*nx + iz*nx*ny`. `data.to("numpy", dtype=...)` and
@@ -135,6 +137,51 @@ mmap_loaded = VoxelGridData.load_npy_dir("weave_64_npy", mmap_mode="r")
 `.npy` format stores `metadata.json` plus one raw array file per field, so large
 datasets can be loaded with `mmap_mode="r"` and avoid zip decompression CPU
 overhead during training.
+
+## Sparse Material Direction and Stiffness Fields
+
+The material-field workflow performs orientation capture, per-yarn material
+lookup, and stiffness rotation with the selected array backend. On CUDA, no
+NumPy conversion occurs until an explicit save or `output="numpy"` operation:
+
+```python
+from pytexgen.material_fields import (
+    isotropic_stiffness_c21,
+    orthotropic_stiffness_c21,
+    load_material_field_bundle,
+    save_material_field_bundle,
+    voxelize_textile_material_fields,
+)
+
+matrix = isotropic_stiffness_c21(3.5e9, 0.35)
+yarn = orthotropic_stiffness_c21(
+    150e9, 10e9, 10e9, 0.25, 0.25, 0.30, 5e9, 5e9, 3.8e9
+)
+data, field = voxelize_textile_material_fields(
+    textile,
+    nx=128, ny=128, nz=128,
+    backend="torch", device="cuda", output="backend",
+    matrix_stiffness=matrix,
+    default_yarn_stiffness=yarn,
+    yarn_stiffness_by_id={3: 1.1 * yarn},
+)
+
+c21_grid = field.to_dense_c21()  # (Nz, Ny, Nx, 21)
+c66_grid = field.to_dense_voigt() # (6, 6, Nz, Ny, Nx)
+acdm_grid = field.to_acdm()       # (1, 6, 6, Nz, Ny, Nx)
+
+save_material_field_bundle("fields", data.sparse_orientation, field)
+orientation, reloaded = load_material_field_bundle("fields", mmap_mode="r")
+```
+
+Engineering-Voigt component order is exactly
+`(xx, yy, zz, yz, xz, xy)`. C21 is the row-major upper triangle:
+`(C11,C12,C13,C14,C15,C16,C22,C23,C24,C25,C26,C33,C34,C35,C36,C44,C45,C46,C55,C56,C66)`.
+The matrix uses one shared `matrix_c21` and has no orientation entries; yarn
+voxels store sorted flat indices, yarn IDs, two direction vectors, material
+IDs, and rotated C21 values. Directory persistence produces raw `.npy` arrays
+that support `mmap_mode="r"`; a path ending in `.npz` produces one archive.
+Saving either form is an explicit GPU-to-CPU transfer boundary.
 
 When the same textile is voxelized repeatedly, cache the TexGen geometry
 snapshot once:
