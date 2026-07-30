@@ -155,10 +155,11 @@ IF(BUILD_PYTHON_INTERFACE)
     # Python utility modules list
     # ========================================================================
     FILE(GLOB PYTHON_MODULE_FILES Lib/*.py)
-    set(PYTEXGEN_INTEROP_MODULE_FILES
+    set(PYTEXGEN_GEOMETRY_MODULE_FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/gpu_voxelizer.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/batch.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/material_fields.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/material_fields.py")
+    set(PYTEXGEN_WORKFLOW_EXTENSION_FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/simulation_sample.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/simulation_io.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/acdm_solver.py"
@@ -166,6 +167,11 @@ IF(BUILD_PYTHON_INTERFACE)
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/training_data.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/training_io.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/torch_training.py")
+    if(TEXGEN_INSTALL_WORKFLOW_EXTENSIONS)
+        list(APPEND PYTEXGEN_GEOMETRY_MODULE_FILES
+            ${PYTEXGEN_WORKFLOW_EXTENSION_FILES})
+        MESSAGE(STATUS "Installing optional Python workflow extensions")
+    endif()
 
     # ========================================================================
     # Install targets
@@ -193,9 +199,9 @@ IF(BUILD_PYTHON_INTERFACE)
         install(FILES ${PYTHON_MODULE_FILES}
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
-        # Optional GPU/interoperability modules live in the source
-        # compatibility package and are installed together.
-        install(FILES ${PYTEXGEN_INTEROP_MODULE_FILES}
+        # The default Python surface stays focused on geometry preparation,
+        # voxelization, and material fields. Workflow modules are opt-in.
+        install(FILES ${PYTEXGEN_GEOMETRY_MODULE_FILES}
             DESTINATION ${PYTEXGEN_INSTALL_DIR})
 
         # On Windows, also install the TexGenCore DLL if built as shared

@@ -82,7 +82,7 @@ build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
 skip = "*-musllinux* *-win32 *_i686"
 
 # Test the wheel after building
-test-command = "python -c \"import pytexgen; print('pytexgen', pytexgen.__version__, 'loaded OK')\""
+test-command = "python -c \"import importlib.util, pytexgen, pytexgen.batch, pytexgen.material_fields; assert importlib.util.find_spec('pytexgen.training_data') is None; print('pytexgen', pytexgen.__version__, 'geometry package loaded OK')\""
 
 [tool.cibuildwheel.linux]
 archs = ["x86_64", "aarch64"]

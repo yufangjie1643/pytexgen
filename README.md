@@ -18,9 +18,8 @@ across Windows, Linux, and macOS.
 - Direct voxel data handoff with `VoxelGridData.to("numpy" | "torch")`,
   `save_npz(...)`, `load_npz(...)`, `save_npy_dir(...)`, and
   `load_npy_dir(...)`.
-- Optional Voxel-ACDM adapter for numpy/torch voxel grids.
-- Versioned sharded datasets with mmap loading, physics-aware C21
-  augmentation, integrity audits, and CUDA prefetch.
+- Prepared `.ptgb` geometry caches and bounded batch voxelization to raw
+  material, orientation, and C21 arrays.
 - 2x2 weave tetrahedral mesh and small numpy/scipy FEM example scripts.
 - Root `build.sh`, `build.bat`, and `build.ps1` helpers for uv-based local
   builds and installs.
@@ -35,7 +34,7 @@ across Windows, Linux, and macOS.
 | Python voxel backend | `pytexgen.gpu_voxelizer.voxelize_textile(...)` | OpenMP-free structured voxel output through numpy or torch |
 | Direct solver handoff | `pytexgen.gpu_voxelizer.voxelize_textile_data(...)` | Return numpy arrays or torch tensors without writing/parsing Abaqus files |
 | GPU-ready path | Optional `backend="torch"` with CUDA/MPS/CPU devices | Larger voxel grids can use torch acceleration without changing the TexGen C++ core |
-| Training data pipeline | `training_data`, `training_io`, and `torch_training` | Atomic sharding, group-safe splits, selective mmap reads, and overlapped CUDA transfer |
+| Batch voxelization | `prepare_geometry(...)` and `voxelize_files_batch(...)` | Reuse mmap-ready geometry and stream bounded production outputs |
 | Lightweight adaptive output | `adaptive=True` numpy mode | Exploratory non-uniform C3D8R voxel meshes without compiling p4est |
 | Performance pruning | Conservative AABB candidate pruning | Skips yarn/translation candidates that cannot intersect the current voxel chunk |
 | Tetra/FEM examples | `script/tetgen_2d_weave_tetra.py`, `script/tet_fem_solve.py` | End-to-end mesh generation, C3D4 export, PNG preview, and scipy sparse FEM smoke solve |
@@ -269,125 +268,6 @@ for voxelization; it is not a replacement for an editable TG3 model. See the
 work is streamed one geometry at a time while bounded background writers
 overlap the result transfer and disk output.
 
-For solver and training integrations, use the validated sample contract so
-material identity is independent of yarn numbering:
-
-```python
-import numpy as np
-import torch
-
-from pytexgen.simulation_sample import (
-    MaterialTable,
-    voxelize_textile_simulation_sample,
-)
-from pytexgen.simulation_io import load_simulation_sample, save_simulation_sample
-
-materials = MaterialTable(
-    c21=np.stack([matrix_c21, yarn_c21]),
-    material_ids=np.array([0, 7], dtype=np.int32),
-    unit="Pa",
-    names=("matrix", "yarn"),
-)
-sample = voxelize_textile_simulation_sample(
-    textile,
-    materials=materials,
-    default_yarn_material_id=7,
-    nx=128, ny=128, nz=128,
-    backend="torch", device="cuda", output="backend",
-)
-
-physical_ids = sample.array("voxel.material_id", copy=True)
-yarn_c21_sparse = sample.array("stiffness.yarn_c21")
-torch_alias = torch.from_dlpack(yarn_c21_sparse)  # same CUDA allocation
-save_simulation_sample("sample", sample)          # explicit CPU boundary
-mmap_sample = load_simulation_sample("sample", mmap_mode="r")
-```
-
-`sample.array(..., copy=False)` never casts, moves, densifies, or relayouts.
-Use `copy=True` for derived grids and `layout="acdm"` for
-`(1,6,6,Nz,Ny,Nx)`. DLPack-capable consumers use the returned array directly;
-for example `jax.dlpack.from_dlpack(field)` or `warp.from_torch(field)` when
-those optional frameworks are installed. `VoxelGridData.material_id()` remains
-the legacy yarn-number mapping; `voxel.material_id` is the physical material
-field.
-
-### Sharded Training Datasets
-
-Use the versioned training store for many labelled RVEs. It writes atomic,
-checksummed `.npy` shards, preserves ragged sparse fields, computes train-only
-statistics, and lets workers mmap only the fields requested by a model:
-
-```python
-from pytexgen.training_data import (
-    TrainingDatasetSchema, TrainingFieldSpec, VOXEL_ORDER,
-)
-from pytexgen.training_io import (
-    SimulationDataset, SimulationDatasetWriter, audit_simulation_dataset,
-)
-
-schema = TrainingDatasetSchema(
-    inputs=(TrainingFieldSpec(
-        "voxel.material_id", "input", "fixed", "int32",
-        (128, 128, 128), semantic="material_id_grid",
-    ),),
-    targets=(TrainingFieldSpec(
-        "effective_c21", "target", "fixed", "float64", (21,),
-        "Pa", "engineering_voigt_c21",
-    ),),
-    grid_shape=(128, 128, 128),
-    voxel_order=VOXEL_ORDER,
-    shard_size=32,
-    statistics_fields=("effective_c21",),
-)
-
-with SimulationDatasetWriter.create("training_set", schema=schema) as writer:
-    writer.append(
-        sample.to("numpy"),  # explicit CUDA-to-CPU publication boundary
-        targets={"effective_c21": c_eff_c21},
-        sample_id="rve-0001", group_id="parent-geometry-0001",
-        split="train",
-        provenance={
-            "solver_commit": "04abddc", "element_formulation": "periodic-c3d8",
-            "arithmetic_dtype": "float32", "tolerance": 1e-6,
-            "maximum_residual": 7e-7, "iteration_count": 84,
-            "wall_time_seconds": 1.42,
-            "target_units": {"effective_c21": "Pa"},
-        },
-    )
-
-report = audit_simulation_dataset("training_set", verify="sample")
-dataset = SimulationDataset(
-    "training_set", split="train",
-    inputs=("voxel.material_id",), targets=("effective_c21",),
-    verify="shard",
-)
-```
-
-`group_id` keeps a parent geometry and all its augmentations in one split.
-`deterministic_group_split(...)` creates reproducible group assignments, while
-`CubicRotation` applies one of 24 proper cube rotations consistently to voxel
-fields, direction vectors, global C21 fields, AABBs, and effective C21 labels.
-Units are mandatory for C21 data; label solver precision is recorded separately
-from the on-disk dtype.
-
-For PyTorch, selected arrays are collated into owned CPU tensors before pinning.
-CUDA is initialized only in the main process, and a dedicated stream overlaps
-host-to-device copies with model computation:
-
-```python
-from pytexgen.torch_training import CudaPrefetcher, make_simulation_dataloader
-
-loader = make_simulation_dataloader(
-    dataset, batch_size=8, shuffle=True, num_workers=2,
-    pin_memory=True, seed=17,
-)
-for batch in CudaPrefetcher(loader, device="cuda"):
-    features = (batch.inputs["voxel.material_id"] != 0).float().unsqueeze(1)
-    prediction = model(features)
-    loss = criterion(prediction, batch.targets["effective_c21"].float())
-    loss.backward()
-```
-
 Use torch when an accelerator is available:
 
 ```python
@@ -512,8 +392,29 @@ Useful CMake options:
 | `TEXGEN_ENABLE_OPENMP` | `OFF` | Enable optional C++ OpenMP loops |
 | `TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS` | `OFF` | Enable local CPU flags such as `-march=native` |
 | `TEXGEN_REGENERATE_SWIG` | `OFF` | Regenerate `Core.py` and `Core_wrap.cxx` from `Python/Core.i` |
+| `TEXGEN_INSTALL_WORKFLOW_EXTENSIONS` | `OFF` | Install source-only solver, training, and experimental mesher modules |
 
 SWIG is only required when `TEXGEN_REGENERATE_SWIG=ON`.
+The published wheel keeps this last option off so its Python API remains
+focused on textile geometry, meshing, voxelization, and material fields.
+
+## Publishing
+
+Build and validate an isolated release set without uploading:
+
+```bash
+./release.sh build
+./release.sh check
+```
+
+Artifacts and `SHA256SUMS` are written under `dist/release-<version>/`.
+The recommended public release path is a `v<version>` Git tag: the GitHub
+workflow builds the supported Windows wheels and sdist, then uses PyPI Trusted
+Publishing. As a manual fallback, `./release.sh upload` loads the ignored
+`.env`, requires a clean Git worktree, checks every artifact again, and only
+then uploads through Twine. Locally built `linux_*` wheels are validation
+artifacts and are skipped because they are not portable manylinux builds. Do
+not use both release paths for the same version.
 
 ## Testing And Benchmarks
 
@@ -539,19 +440,6 @@ Torch/CUDA benchmark when torch is installed:
 ```bash
 python bench_gpu_voxelizer_backends.py --include-torch --device cuda
 ```
-
-Checked training-store and CUDA-prefetch acceptance:
-
-```bash
-python bench_training_data.py \
-  --batch-size 8 --num-workers 4 --repeat 5 --device cuda \
-  --min-read-speedup 1.5 --min-prefetch-speedup 1.0 \
-  --json-out build/training_data_benchmark.json --check
-```
-
-This generates identical `64³` records in native shards and compressed NPZ,
-compares every value, audits checksums, measures cold/warm throughput and H2D
-wait, checks exact selected-byte accounting, and runs one finite 3D CNN step.
 
 Correctness-gated material direction/stiffness benchmark:
 
@@ -714,8 +602,8 @@ uv run python script/inp_viewer.py Saved_Weft_Knit_Composite/RVE/weft_knit_compo
 AI agents working with this repository can use the companion Codex skill
 [`use-pytexgen`](https://github.com/yufangjie1643/use-pytexgen). It summarizes
 the project interfaces for TexGen model creation, `.tg3`/Abaqus export,
-numpy/torch voxelization, direct `VoxelGridData` handoff, Voxel-ACDM coupling,
-and the repository scripts/tests.
+numpy/torch voxelization, PTGB batch preparation, material fields, and the
+repository scripts/tests.
 
 ## Project Layout
 
@@ -725,6 +613,8 @@ Python/Core.i            SWIG interface
 Python/Core.py           committed SWIG Python proxy
 Python/Core_wrap.cxx      committed SWIG C++ wrapper
 TexGen/gpu_voxelizer.py   portable numpy/torch voxelization backend
+TexGen/material_fields.py sparse orientation and stiffness fields
+TexGen/batch.py           PTGB preparation and batch voxelization
 src/pytexgen/             installed Python package
 script/                   TexGen examples, RVE export helpers, INP viewer, benchmarks
 docs/voxel_backends.md    backend selection and p4est notes

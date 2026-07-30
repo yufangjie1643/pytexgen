@@ -41,6 +41,7 @@ SET(BUILD_PROFILE OFF CACHE BOOL "Build profiling")
 SET(TEXGEN_ENABLE_OPENMP OFF CACHE BOOL "Enable OpenMP acceleration for C++ point-classification loops")
 SET(TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS OFF CACHE BOOL "Enable architecture-native compiler flags such as -march=native")
 SET(TEXGEN_REGENERATE_SWIG OFF CACHE BOOL "Regenerate Python SWIG wrappers instead of using committed generated files")
+SET(TEXGEN_INSTALL_WORKFLOW_EXTENSIONS OFF CACHE BOOL "Install non-core simulation, solver, mesher, and training workflow modules")
 
 # ============================================================================
 # Release-mode optimization flags

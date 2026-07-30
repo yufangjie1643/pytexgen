@@ -1,5 +1,8 @@
 # Voxel-ACDM Direct Solver Interface
 
+> 这是源码级工作流扩展，不包含在默认 PyTexGen wheel 中。自定义本地构建需显式启用
+> `TEXGEN_INSTALL_WORKFLOW_EXTENSIONS`。
+
 本文记录 pytexgen 到 `git@github.com:yufangjie1643/Voxel-ACDM.git` 的直接接口设计。目标是避免 TexGen `.inp/.eld/.ori` 文件往返，把 TexGen 体素结果直接传给 Voxel-ACDM 求解器。
 
 ## 当前支持范围

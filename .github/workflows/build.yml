@@ -32,22 +32,11 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install SWIG (Windows)
-        run: choco install swig -y
-
-      # ── 验证 SWIG 已安装 ──
-      - name: Verify SWIG
-        run: swig -version
-
       # ── 使用 cibuildwheel 构建 ──
-      - uses: pypa/cibuildwheel@v2.21
+      - uses: pypa/cibuildwheel@v3.4.1
         env:
           # Windows: only publish AMD64 wheels. Linux/macOS users build from sdist.
           CIBW_ARCHS_WINDOWS: "AMD64"
-
-          # ── 在每个 Python 环境构建前通过 pip 安装 swig ──
-          # 这样 swig 会直接装到当前构建用的 Python 环境中，所有平台通用
-          CIBW_BEFORE_BUILD: "pip install swig"
 
           # 开启详细日志，便于排查编译错误
           CIBW_BUILD_VERBOSITY: "3"
