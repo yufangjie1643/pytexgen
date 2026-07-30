@@ -366,6 +366,37 @@ class VoxelizerBackendTest(unittest.TestCase):
             field.yarn_ids, data.yarn_id[field.voxel_indices]
         )
 
+    def test_torch_float64_classifier_preserves_dtype(self):
+        if self.voxelizer.torch is None:
+            self.skipTest("torch is optional")
+        snapshot = synthetic_snapshot(self.voxelizer, dtype=np.float64)
+        bundle = self.voxelizer.SnapshotBundle.from_snapshots(
+            [snapshot],
+            self.aabb.copy(),
+        )
+
+        data = self.voxelizer.voxelize_snapshot_bundle_data(
+            bundle,
+            nx=4,
+            ny=4,
+            nz=4,
+            backend="torch",
+            device="cpu",
+            dtype="float64",
+            output="backend",
+            include_orientations=True,
+            orientation_storage="sparse",
+            chunk_voxels=16,
+            verbose=False,
+        )
+
+        self.assertEqual(data.yarn_id.dtype, self.voxelizer.torch.int32)
+        self.assertEqual(
+            data.sparse_orientation.orientation1.dtype,
+            self.voxelizer.torch.float64,
+        )
+        self.assertEqual(data.sparse_orientation.num_yarn_voxels, 16)
+
     def test_torch_classifier_rejects_end_caps_and_uses_surface_depth(self):
         if self.voxelizer.torch is None:
             self.skipTest("torch is optional")

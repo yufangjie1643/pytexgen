@@ -1545,7 +1545,12 @@ def _classify_voxels_torch(centers: torch.Tensor,
         C = pts.shape[0]
         chunk_lo = pts.amin(dim=0)
         chunk_hi = pts.amax(dim=0)
-        best_dist = torch_mod.full((C,), float("inf"), device=device)
+        best_dist = torch_mod.full(
+            (C,),
+            float("inf"),
+            device=device,
+            dtype=centers.dtype,
+        )
         best_yarn = torch_mod.full((C,), -1, device=device, dtype=torch_mod.int32)
         if include_orientations:
             best_orientation1 = torch_mod.zeros(

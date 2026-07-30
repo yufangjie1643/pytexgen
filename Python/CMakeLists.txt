@@ -157,6 +157,7 @@ IF(BUILD_PYTHON_INTERFACE)
     FILE(GLOB PYTHON_MODULE_FILES Lib/*.py)
     set(PYTEXGEN_INTEROP_MODULE_FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/gpu_voxelizer.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/batch.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/material_fields.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/simulation_sample.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/simulation_io.py"

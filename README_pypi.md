@@ -13,7 +13,7 @@ University of Nottingham. This project keeps the core TexGen modelling API
 available from Python while making the package easier to install, test, and use
 across Windows, Linux, and macOS.
 
-## Version 1.1.1 Highlights
+## Version 1.2.0 Highlights
 
 - Direct voxel data handoff with `VoxelGridData.to("numpy" | "torch")`,
   `save_npz(...)`, `load_npz(...)`, `save_npy_dir(...)`, and
@@ -232,6 +232,41 @@ row-major upper triangle:
 Matrix voxels share one `matrix_c21` and have no direction entry. Dense views
 are created only when requested. Saving transfers CUDA tensors to CPU; keep
 `output="backend"` during computation to avoid an earlier copy.
+
+### Batch Voxelization
+
+Keep `.tg3` as the editable model and prepare a memory-mappable `.ptgb` cache
+for repeated production runs:
+
+```python
+from pytexgen.batch import MaterialSpec, prepare_geometry, voxelize_files_batch
+
+prepare_geometry("models/plain.tg3", "prepared/plain.ptgb")
+
+materials = MaterialSpec(
+    matrix_c21=matrix_c21,
+    default_yarn_c21=yarn_c21,
+    unit="Pa",
+)
+report = voxelize_files_batch(
+    ["prepared/plain.ptgb", "models/twill.tg3"],
+    resolution=(128, 128, 128),
+    output_dir="voxel_output",
+    fields=("material_id", "orientation", "stiffness_c21"),
+    materials=materials,
+    device="cuda",
+    dtype="float32",
+    batch_size="auto",
+    memory_budget_bytes=12 << 30,
+)
+```
+
+Each input produces one directory containing `metadata.json` and uncompressed
+`.npy` arrays. Shapes are `(Nz, Ny, Nx)`, `(Nz, Ny, Nx, 3, 3)`, and
+`(Nz, Ny, Nx, 21)` respectively. PTGB v1 stores only flattened geometry needed
+for voxelization; it is not a replacement for an editable TG3 model. GPU work
+is streamed one geometry at a time while bounded background writers overlap
+the result transfer and disk output.
 
 For solver and training integrations, use the validated sample contract so
 material identity is independent of yarn numbering:
