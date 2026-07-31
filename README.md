@@ -362,9 +362,17 @@ the official p4est octree path, build locally with p4est/sc libraries and
 Prerequisites:
 
 - Python 3.9+
+- Python development headers (`Python.h`)
 - CMake 3.17+
 - A C++11 compiler
 - `scikit-build-core`
+
+For published releases, users only run `pip install pytexgen`. Pip selects a
+matching wheel when one exists. On an unsupported OS/Python/CPU combination it
+automatically falls back to the sdist, creates an isolated build environment,
+and invokes scikit-build-core. The backend supplies CMake and Ninja through pip
+when suitable system versions are unavailable. Source fallback still requires
+the device to provide Python development headers and a C++ compiler.
 
 Install from a checkout:
 
@@ -412,9 +420,11 @@ verifies the geometry, batch voxelization, and material-field imports. Use
 `--venv PATH` to select another environment location, or
 `--current-environment` to install into the interpreter running the installer.
 
-A system C++ compiler is still required: Visual Studio Build Tools on Windows,
-Xcode Command Line Tools on macOS, or GCC/Clang on Linux. These platform
-toolchains cannot be installed portably through pip.
+A system C++ compiler and Python development headers are still required:
+Visual Studio Build Tools plus a full CPython installation on Windows, Xcode
+Command Line Tools on macOS, or GCC/Clang plus the matching Python development
+package on Linux. These platform components cannot be installed portably
+through pip.
 
 ## Publishing
 

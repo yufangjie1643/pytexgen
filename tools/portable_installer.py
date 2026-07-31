@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import zipfile
 from pathlib import Path
@@ -75,6 +76,28 @@ def compiler_hint() -> str:
     if sys.platform == "darwin":
         return "Run 'xcode-select --install' to install Apple's C++ toolchain."
     return "Install GCC/G++ or Clang with your operating system package manager."
+
+
+def python_headers_hint() -> str:
+    if sys.platform == "win32":
+        return "Use the full CPython installer, which includes Python.h and import libraries."
+    if sys.platform == "darwin":
+        return "Use the python.org or Homebrew CPython distribution with development headers."
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return (
+        f"Install the Python development package (for example python{version}-dev "
+        "on Debian/Ubuntu), or use a complete python.org/uv CPython distribution."
+    )
+
+
+def check_python_headers() -> None:
+    include_dir = sysconfig.get_path("include")
+    python_header = Path(include_dir) / "Python.h" if include_dir else None
+    if python_header is None or not python_header.is_file():
+        raise InstallerError(
+            "Python development headers were not found for this interpreter. "
+            + python_headers_hint()
+        )
 
 
 def check_native_toolchain() -> None:
@@ -274,6 +297,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"Interpreter: CPython {platform.python_version()}"
         )
         check_native_toolchain()
+        check_python_headers()
         python_executable, venv_dir = prepare_python(
             arguments.current_environment,
             arguments.venv,
@@ -289,7 +313,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     except InstallerError as error:
         print(f"\nInstaller error: {error}", file=sys.stderr, flush=True)
-        print(compiler_hint(), file=sys.stderr, flush=True)
         return 1
 
 

@@ -61,6 +61,12 @@ pip install "pytexgen[progress]"  # add tqdm progress bars
 pip install "pytexgen[examples]"  # add scipy/matplotlib for example scripts
 ```
 
+Pip automatically selects a compatible wheel for the current Python, OS, and
+CPU. If no matching wheel exists, it falls back to the source distribution and
+builds PyTexGen through scikit-build-core. CMake, Ninja, NumPy, and the Python
+build dependencies are resolved through pip as needed; source fallback still
+requires a system C++ compiler and Python development headers (`Python.h`).
+
 For CUDA, install a torch wheel that matches your Python version, GPU driver,
 and CUDA runtime first, then install pytexgen. The `gpu` extra intentionally does
 not pin a CUDA wheel because PyTorch publishes different packages for different
@@ -361,6 +367,7 @@ the official p4est octree path, build locally with p4est/sc libraries and
 Prerequisites:
 
 - Python 3.9+
+- Python development headers (`Python.h`)
 - CMake 3.17+
 - A C++11 compiler
 - `scikit-build-core`
