@@ -6,9 +6,9 @@ cd "$repository_dir"
 
 action="${1:-check}"
 case "$action" in
-    build|check|upload) ;;
+    build|installer|check|upload) ;;
     *)
-        echo "Usage: $0 [build|check|upload]" >&2
+        echo "Usage: $0 [build|installer|check|upload]" >&2
         exit 2
         ;;
 esac
@@ -44,10 +44,14 @@ check_artifacts() {
     uvx twine check "${artifacts[@]}"
     (
         cd "$release_dir"
-        sha256sum \
-            pytexgen-"$version".tar.gz \
-            pytexgen-"$version"-*.whl \
-            > SHA256SUMS
+        checksum_artifacts=(
+            pytexgen-"$version".tar.gz
+            pytexgen-"$version"-*.whl
+        )
+        if [[ -f pytexgen-"$version"-installer.pyz ]]; then
+            checksum_artifacts+=(pytexgen-"$version"-installer.pyz)
+        fi
+        sha256sum "${checksum_artifacts[@]}" > SHA256SUMS
     )
     echo "Release artifacts checked: $release_dir"
 }
@@ -58,6 +62,17 @@ if [[ "$action" == "build" ]]; then
     mkdir -p "$release_tmp"
     TMPDIR="$release_tmp" \
         "$python_executable" -m build --no-isolation --outdir "$release_dir"
+    "$python_executable" tools/build_portable_installer.py
+    check_artifacts
+    exit 0
+fi
+
+if [[ "$action" == "installer" ]]; then
+    if [[ ! -f "$release_dir/pytexgen-$version.tar.gz" ]]; then
+        echo "Source distribution not found. Run: $0 build" >&2
+        exit 1
+    fi
+    "$python_executable" tools/build_portable_installer.py
     check_artifacts
     exit 0
 fi

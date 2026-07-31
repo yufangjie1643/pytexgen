@@ -398,6 +398,24 @@ SWIG is only required when `TEXGEN_REGENERATE_SWIG=ON`.
 The published wheel keeps this last option off so its Python API remains
 focused on textile geometry, meshing, voxelization, and material fields.
 
+### Portable Source Installer
+
+The release bundle includes a single-file source installer for CPython 3.9+:
+
+```bash
+python pytexgen-1.2.0-installer.pyz
+```
+
+It creates `./.pytexgen-venv`, installs the Python build dependencies plus
+CMake and Ninja with pip, compiles the embedded sdist, installs PyTexGen, and
+verifies the geometry, batch voxelization, and material-field imports. Use
+`--venv PATH` to select another environment location, or
+`--current-environment` to install into the interpreter running the installer.
+
+A system C++ compiler is still required: Visual Studio Build Tools on Windows,
+Xcode Command Line Tools on macOS, or GCC/Clang on Linux. These platform
+toolchains cannot be installed portably through pip.
+
 ## Publishing
 
 Build and validate an isolated release set without uploading:
@@ -406,6 +424,10 @@ Build and validate an isolated release set without uploading:
 ./release.sh build
 ./release.sh check
 ```
+
+`./release.sh build` also creates the portable source installer. Use
+`./release.sh installer` only when rebuilding that installer from an existing
+sdist.
 
 Artifacts and `SHA256SUMS` are written under `dist/release-<version>/`.
 The recommended public release path is a `v<version>` Git tag: the GitHub

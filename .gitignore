@@ -33,6 +33,7 @@ _test_one/
 
 # Python virtual env
 .venv/
+.pytexgen-venv/
 .env
 
 # Claude settings
