@@ -30,8 +30,10 @@ namespace TexGen
 	{
 	public:
 		CSlaveNode(XYZ Position = XYZ(), XYZ Tangent = XYZ(), XYZ Up = XYZ());
+		CSlaveNode(const CSlaveNode &CopyMe);
 		CSlaveNode(TiXmlElement &Element);
 		~CSlaveNode(void);
+		CSlaveNode &operator=(const CSlaveNode &CopyMe);
 
 		void PopulateTiXmlElement(TiXmlElement &Element, OUTPUT_TYPE OutputType) const;
 

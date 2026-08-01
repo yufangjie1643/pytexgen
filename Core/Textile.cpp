@@ -22,10 +22,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "Domain.h"
 #include "TexGen.h"
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 using namespace TexGen;
 
 #define TOL 1e-10
@@ -467,7 +463,6 @@ void CTextile::GetPointInformation(const vector<XYZ> &Points, vector<POINT_INFO>
 		}
 		if (!bYarnOverlapsPoints)
 			continue;
-		#pragma omp parallel for schedule(dynamic, 256) firstprivate(Translations)
 		for (int i = 0; i < nPoints; ++i)
 		{
 			POINT_INFO LocalInfo;
@@ -537,7 +532,6 @@ void CTextile::GetPointInformation(const vector<XYZ> &Points, vector<POINT_INFO>
 	if (!bYarnOverlapsPoints)
 		return;
 	const int nPoints = static_cast<int>(Points.size());
-	#pragma omp parallel for schedule(dynamic, 256) firstprivate(Translations)
 	for (int i = 0; i < nPoints; ++i)
 	{
 		POINT_INFO LocalInfo;
@@ -1274,7 +1268,6 @@ bool CTextile::SetResolution(int iNumSectionPoints, int iNumSlaveNodes)
 	}
 	return true;
 }
-
 
 
 

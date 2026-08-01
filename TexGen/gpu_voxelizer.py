@@ -5,8 +5,8 @@ Drop-in replacement for ``CRectangularVoxelMesh.SaveVoxelMesh(...)`` that:
   1. Takes a fully-built ``CTextile`` from TexGen (all refine / interference /
      section-mesh work already done by TexGen's C++ core).
   2. Snapshots each yarn's slave-node frame + section polygon into plain arrays.
-  3. Classifies every voxel center by "point-in-swept-polygon" test using a
-     portable numpy CPU backend or an optional torch backend.
+  3. Either calls TexGen's original C++ point classifier exactly, or classifies
+     with the faster approximate numpy/torch swept-polygon implementation.
   4. Writes an Abaqus ``.inp`` file compatible with TexGen's own output format
      (hex elements + per-element yarn index).
 
@@ -49,6 +49,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 DEFAULT_NUMPY_CHUNK_VOXELS = 8192
+DEFAULT_NUMPY_EXACT_CHUNK_VOXELS = 32768
 
 
 def _progress_iter(iterable: Iterable[Any],
@@ -90,6 +91,19 @@ try:
     from .material_fields import SparseOrientationField
 except ImportError:
     from TexGen.material_fields import SparseOrientationField
+
+try:
+    from .numpy_exact import (
+        NumpyExactGeometry,
+        classify_numpy_exact_chunked,
+        extract_numpy_exact_geometry,
+    )
+except ImportError:
+    from TexGen.numpy_exact import (
+        NumpyExactGeometry,
+        classify_numpy_exact_chunked,
+        extract_numpy_exact_geometry,
+    )
 
 # BUILD_TYPE bitmask constants from CYarn. SWIG exposes them as CYarn.SURFACE etc.
 # Fallback to raw values if the enum binding differs.
@@ -365,6 +379,7 @@ class VoxelGridData:
     aabb_pruning: bool = True
     storage: str = "numpy"
     order: str = "ix + iy*nx + iz*nx*ny"
+    classification: str = "tensor"
 
     @property
     def shape(self) -> Tuple[int, int, int]:
@@ -492,6 +507,7 @@ class VoxelGridData:
             aabb_pruning=self.aabb_pruning,
             storage="numpy",
             order=self.order,
+            classification=self.classification,
         )
 
     def to_torch(self, device: Optional[str] = None,
@@ -556,6 +572,7 @@ class VoxelGridData:
             aabb_pruning=self.aabb_pruning,
             storage="torch",
             order=self.order,
+            classification=self.classification,
         )
 
     def save_npz(self, path: str,
@@ -580,6 +597,7 @@ class VoxelGridData:
             "dtype": np.asarray(self.dtype),
             "storage": np.asarray(self.storage),
             "order": np.asarray(self.order),
+            "classification": np.asarray(self.classification),
             "timings_json": np.asarray(json.dumps(self.timings)),
         }
         if include_centers and self.centers is not None:
@@ -667,6 +685,7 @@ class VoxelGridData:
             "dtype": self.dtype,
             "storage": self.storage,
             "order": self.order,
+            "classification": self.classification,
             "workers": int(self.workers),
             "timings": dict(self.timings),
             "arrays": {
@@ -752,6 +771,11 @@ class VoxelGridData:
                 aabb_pruning=bool(data["aabb_pruning"].item()),
                 storage="numpy",
                 order=str(data["order"].item()),
+                classification=(
+                    str(data["classification"].item())
+                    if "classification" in data.files
+                    else "tensor"
+                ),
             )
 
         if output == "torch":
@@ -851,6 +875,7 @@ class VoxelGridData:
             aabb_pruning=bool(metadata.get("aabb_pruning", True)),
             storage="numpy",
             order=str(metadata.get("order", "ix + iy*nx + iz*nx*ny")),
+            classification=str(metadata.get("classification", "tensor")),
         )
 
         if output == "torch":
@@ -1497,7 +1522,8 @@ def _classify_voxels_torch(centers: torch.Tensor,
     progress : bool or callable, default=False
         Show a tqdm progress bar over voxel chunks when true.
     include_orientations : bool, default=False
-        Capture the winning yarn tangent and up vector for every yarn voxel.
+        Capture the winning yarn tangent and TexGen secondary material
+        direction for every yarn voxel.
     orientation_storage : {"dense", "sparse"}, default="dense"
         Return full per-voxel direction arrays or compact arrays containing
         only yarn voxels.
@@ -1681,7 +1707,7 @@ def _classify_voxels_torch(centers: torch.Tensor,
                             upd[:, None], tan, best_orientation1
                         )
                         best_orientation2 = torch_mod.where(
-                            upd[:, None], up, best_orientation2
+                            upd[:, None], sid, best_orientation2
                         )
                 else:
                     upd = inside & (dist < best_dist[active_idx])
@@ -1691,7 +1717,7 @@ def _classify_voxels_torch(centers: torch.Tensor,
                         best_yarn[target] = y_idx
                         if include_orientations:
                             best_orientation1[target] = tan[upd]
-                            best_orientation2[target] = up[upd]
+                            best_orientation2[target] = sid[upd]
 
         yarn_id[v0:v1] = best_yarn
         if include_orientations and orientation_storage == "dense":
@@ -1969,7 +1995,7 @@ def _classify_voxel_chunk_bundle_numpy(
                 best_yarn[update] = y_idx
                 if include_orientations:
                     orientation1[update] = tan[update]
-                    orientation2[update] = up[update]
+                    orientation2[update] = sid[update]
             else:
                 update = inside & (dist < best_dist[active_idx])
                 target = active_idx[update]
@@ -1977,7 +2003,7 @@ def _classify_voxel_chunk_bundle_numpy(
                 best_yarn[target] = y_idx
                 if include_orientations:
                     orientation1[target] = tan[update]
-                    orientation2[target] = up[update]
+                    orientation2[target] = sid[update]
 
     if include_orientations:
         return best_yarn, orientation1, orientation2
@@ -2071,7 +2097,7 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
                 best_yarn[update] = y_idx
                 if include_orientations:
                     orientation1[update] = tan[update]
-                    orientation2[update] = up[update]
+                    orientation2[update] = sid[update]
             else:
                 update = inside & (dist < best_dist[active_idx])
                 target = active_idx[update]
@@ -2079,7 +2105,7 @@ def _classify_voxel_chunk_numpy(pts: np.ndarray,
                 best_yarn[target] = y_idx
                 if include_orientations:
                     orientation1[target] = tan[update]
-                    orientation2[target] = up[update]
+                    orientation2[target] = sid[update]
 
     if include_orientations:
         return best_yarn, orientation1, orientation2
@@ -3240,6 +3266,284 @@ def voxelize_snapshot_bundle_data(bundle: SnapshotBundle,
     return _coerce_voxel_grid_output(data, output, device=device)
 
 
+def voxelize_textile_exact_data(textile: CTextile,
+                                nx: int = 64, ny: int = 64, nz: int = 64,
+                                backend: str = "numpy",
+                                device: Optional[str] = None,
+                                dtype: str = "float32",
+                                workers: Optional[int] = None,
+                                verbose: bool = True,
+                                include_centers: bool = False,
+                                include_orientations: bool = False,
+                                orientation_storage: str = "dense",
+                                output: str = "backend",
+                                tolerance: float = 1e-9) -> VoxelGridData:
+    """Voxelize with TexGen's original point classifier and no text files.
+
+    Classification executes in the compiled C++ core with portable C++ standard
+    threads, releases the Python GIL, and uses the same layer ordering,
+    tolerance, yarn geometry, and overlap resolution as
+    ``CRectangularVoxelMesh.SaveVoxelMesh``. NumPy arrays are returned directly;
+    ``backend="torch"`` transfers the exact result to the selected Torch device
+    (including CUDA) after CPU classification. No OpenMP runtime is required.
+
+    ``dtype`` controls floating output storage only. TexGen classification is
+    always evaluated in the core's native double precision.
+    """
+    backend = str(backend).lower()
+    output = str(output).lower()
+    orientation_storage = _validate_orientation_storage(orientation_storage)
+    if output not in {"backend", "numpy", "torch"}:
+        raise ValueError('output must be one of "backend", "numpy", or "torch"')
+    _validate_voxelizer_args(
+        nx, ny, nz, backend, dtype, 1,
+        adaptive_levels=0, max_adaptive_cells=nx * ny * nz,
+    )
+    if workers is not None and int(workers) < 1:
+        raise ValueError("workers must be >= 1 or None")
+    tolerance = float(tolerance)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("tolerance must be finite and non-negative")
+
+    backend_cfg = _resolve_backend(
+        backend, device, dtype, workers, adaptive=False
+    )
+    provider = _load_fastdata_provider()
+    voxelizer = None if provider is None else getattr(
+        provider, "voxelize_exact", None
+    )
+    if voxelizer is None:
+        raise RuntimeError(
+            "exact TexGen voxelization requires the compiled _fastdata provider; "
+            "rebuild or reinstall pytexgen"
+        )
+
+    storage_code = 0
+    if include_orientations:
+        storage_code = 1 if orientation_storage == "dense" else 2
+    requested_workers = 0 if workers is None else int(workers)
+
+    start = time.perf_counter()
+    raw = voxelizer(
+        textile, int(nx), int(ny), int(nz), storage_code,
+        requested_workers, tolerance,
+    )
+    classify_time = time.perf_counter() - start
+
+    np_dtype = np.dtype(dtype)
+    yarn_id = np.asarray(raw["yarn_id"], dtype=np.int32)
+    aabb = np.asarray(raw["aabb"], dtype=np_dtype)
+    expected = int(nx) * int(ny) * int(nz)
+    if yarn_id.shape != (expected,) or aabb.shape != (2, 3):
+        raise RuntimeError("compiled exact voxelizer returned malformed arrays")
+
+    orientation1 = None
+    orientation2 = None
+    sparse_orientation = None
+    if include_orientations and orientation_storage == "dense":
+        orientation1 = np.asarray(
+            raw["orientation1"], dtype=np_dtype
+        ).reshape(nz, ny, nx, 3)
+        orientation2 = np.asarray(
+            raw["orientation2"], dtype=np_dtype
+        ).reshape(nz, ny, nx, 3)
+    elif include_orientations:
+        sparse_orientation = SparseOrientationField(
+            voxel_indices=np.asarray(raw["voxel_indices"], dtype=np.int64),
+            yarn_ids=np.asarray(raw["orientation_yarn_ids"], dtype=np.int32),
+            orientation1=np.asarray(raw["orientation1"], dtype=np_dtype),
+            orientation2=np.asarray(raw["orientation2"], dtype=np_dtype),
+            grid_shape=(nz, ny, nx),
+        )
+
+    centers = None
+    if include_centers:
+        centers = _structured_voxel_centers(
+            aabb[0], aabb[1], nx, ny, nz, dtype=np_dtype
+        )
+
+    actual_workers = int(raw.get("workers", 1))
+    if verbose:
+        print(
+            f"[voxelizer] classified {expected:,} voxels with exact TexGen/"
+            f"{actual_workers} workers in {classify_time:.3f}s"
+        )
+
+    data = VoxelGridData(
+        yarn_id=yarn_id,
+        aabb=aabb,
+        resolution=(nx, ny, nz),
+        backend=backend_cfg.backend,
+        device="cpu",
+        workers=actual_workers,
+        dtype=dtype,
+        timings=dict(extract=0.0, pack=0.0, classify=classify_time),
+        centers=centers,
+        orientation1=orientation1,
+        orientation2=orientation2,
+        sparse_orientation=sparse_orientation,
+        aabb_pruning=True,
+        storage="numpy",
+        classification="exact",
+    )
+
+    target_storage = backend_cfg.backend if output == "backend" else output
+    if target_storage == "torch":
+        target_device = (
+            backend_cfg.device
+            if backend_cfg.backend == "torch" and device is None
+            else device
+        )
+        return data.to("torch", device=target_device, copy=False)
+    return data
+
+
+def voxelize_numpy_exact_geometry_data(
+    geometry: NumpyExactGeometry,
+    nx: int = 64,
+    ny: int = 64,
+    nz: int = 64,
+    backend: str = "numpy",
+    device: Optional[str] = None,
+    dtype: str = "float32",
+    chunk_voxels: int = DEFAULT_NUMPY_EXACT_CHUNK_VOXELS,
+    workers: Optional[int] = None,
+    verbose: bool = True,
+    include_centers: bool = False,
+    include_orientations: bool = False,
+    orientation_storage: str = "dense",
+    output: str = "backend",
+    progress: Any = False,
+    tolerance: float = 1e-9,
+) -> VoxelGridData:
+    """Voxelize a reusable pure-NumPy exact geometry snapshot.
+
+    The classification calculation is always float64, matching TexGen's C++
+    scalar precision. ``dtype`` controls only returned floating-array storage.
+    A Torch backend therefore means CPU NumPy classification followed by a
+    transfer to the requested device; it does not require CUDA kernels.
+    """
+    backend = str(backend).lower()
+    output = str(output).lower()
+    orientation_storage = _validate_orientation_storage(orientation_storage)
+    if output not in {"backend", "numpy", "torch"}:
+        raise ValueError('output must be one of "backend", "numpy", or "torch"')
+    _validate_voxelizer_args(
+        nx,
+        ny,
+        nz,
+        backend,
+        dtype,
+        chunk_voxels,
+        adaptive_levels=0,
+        max_adaptive_cells=nx * ny * nz,
+    )
+    if not isinstance(geometry, NumpyExactGeometry):
+        raise TypeError("geometry must be a NumpyExactGeometry")
+    if geometry.num_yarns == 0:
+        raise RuntimeError("No yarns in numpy_exact geometry")
+    backend_cfg = _resolve_backend(
+        backend, device, dtype, workers, adaptive=False
+    )
+
+    centers64 = _structured_voxel_centers(
+        geometry.aabb[0], geometry.aabb[1], nx, ny, nz, dtype=np.float64
+    )
+    start = time.perf_counter()
+    classified = classify_numpy_exact_chunked(
+        centers64,
+        geometry,
+        chunk_voxels=chunk_voxels,
+        workers=workers,
+        tolerance=tolerance,
+        include_orientations=include_orientations,
+        progress=progress,
+    )
+    if include_orientations:
+        yarn_id, orientation1_flat, orientation2_flat, actual_workers = classified
+    else:
+        yarn_id, actual_workers = classified
+        orientation1_flat = None
+        orientation2_flat = None
+    classify_time = time.perf_counter() - start
+
+    np_dtype = np.dtype(dtype)
+    aabb = np.asarray(geometry.aabb, dtype=np_dtype)
+    centers = centers64.astype(np_dtype, copy=False) if include_centers else None
+    orientation1 = None
+    orientation2 = None
+    sparse_orientation = None
+    if include_orientations:
+        orientation1_flat = orientation1_flat.astype(np_dtype, copy=False)
+        orientation2_flat = orientation2_flat.astype(np_dtype, copy=False)
+        if orientation_storage == "dense":
+            orientation1 = orientation1_flat.reshape(nz, ny, nx, 3)
+            orientation2 = orientation2_flat.reshape(nz, ny, nx, 3)
+        else:
+            sparse_orientation = _sparse_orientation_from_dense(
+                yarn_id,
+                orientation1_flat,
+                orientation2_flat,
+                (nz, ny, nx),
+            )
+
+    if verbose:
+        print(
+            f"[voxelizer] classified {centers64.shape[0]:,} voxels with "
+            f"numpy_exact/{actual_workers} workers in {classify_time:.3f}s"
+        )
+    data = VoxelGridData(
+        yarn_id=yarn_id,
+        aabb=aabb,
+        resolution=(nx, ny, nz),
+        backend=backend_cfg.backend,
+        device="cpu",
+        workers=actual_workers,
+        dtype=dtype,
+        timings=dict(extract=0.0, pack=0.0, classify=classify_time),
+        centers=centers,
+        orientation1=orientation1,
+        orientation2=orientation2,
+        sparse_orientation=sparse_orientation,
+        aabb_pruning=True,
+        storage="numpy",
+        classification="numpy_exact",
+    )
+    target_storage = backend_cfg.backend if output == "backend" else output
+    if target_storage == "torch":
+        target_device = (
+            backend_cfg.device
+            if backend_cfg.backend == "torch" and device is None
+            else device
+        )
+        return data.to("torch", device=target_device, copy=False)
+    return data
+
+
+def voxelize_textile_numpy_exact_data(
+    textile: CTextile,
+    nx: int = 64,
+    ny: int = 64,
+    nz: int = 64,
+    **kwargs: Any,
+) -> VoxelGridData:
+    """Extract then voxelize a textile with the portable NumPy exact path."""
+    verbose = bool(kwargs.get("verbose", True))
+    start = time.perf_counter()
+    geometry = extract_numpy_exact_geometry(textile)
+    extract_time = time.perf_counter() - start
+    if verbose:
+        print(
+            f"[voxelizer] extracted numpy_exact geometry for "
+            f"{geometry.num_yarns} yarns in {extract_time:.3f}s"
+        )
+    data = voxelize_numpy_exact_geometry_data(
+        geometry, nx=nx, ny=ny, nz=nz, **kwargs
+    )
+    data.timings["extract"] = extract_time
+    return data
+
+
 def voxelize_textile_data(textile: CTextile,
                           nx: int = 64, ny: int = 64, nz: int = 64,
                           backend: str = "numpy",
@@ -3253,7 +3557,9 @@ def voxelize_textile_data(textile: CTextile,
                           orientation_storage: str = "dense",
                           output: str = "backend",
                           aabb_pruning: bool = True,
-                          progress: Any = False) -> VoxelGridData:
+                          progress: Any = False,
+                          classification: str = "tensor",
+                          exact_tolerance: float = 1e-9) -> VoxelGridData:
     """Voxelize a built CTextile and return direct numpy/torch data.
 
     This path skips Abaqus ``.inp`` generation. It is intended for solvers that
@@ -3267,7 +3573,7 @@ def voxelize_textile_data(textile: CTextile,
     nx, ny, nz : int
         Voxel resolution along each axis of the domain AABB.
     backend : {"numpy", "auto", "torch"}
-        Classification backend. ``numpy`` is the default OpenMP-free CPU path.
+        Array/classification backend. ``numpy`` is the default CPU path.
         ``auto`` may pick torch when an accelerator is available. ``torch`` can
         leave ``yarn_id`` on the selected device when ``output="backend"``.
     device : {"cuda", "mps", "cpu", None}
@@ -3277,7 +3583,10 @@ def voxelize_textile_data(textile: CTextile,
     chunk_voxels : int
         Voxels processed per batch.
     workers : int or None
-        Number of numpy worker threads. Ignored by torch classification.
+        Number of NumPy workers for tensor classification, or portable C++
+        standard-thread workers for exact classification. Ignored by Torch
+        tensor classification. Exact mode automatically uses up to eight
+        workers when omitted.
     verbose : bool
         Print per-phase timing.
     include_centers : bool
@@ -3286,7 +3595,8 @@ def voxelize_textile_data(textile: CTextile,
     include_orientations : bool
         Include ``orientation1`` and ``orientation2`` grids with shape
         ``(nz, ny, nx, 3)``. ``orientation1`` is the yarn tangent and
-        ``orientation2`` is the yarn up vector at the nearest yarn node.
+        ``orientation2`` is normalized ``cross(tangent, up)``, matching the
+        secondary material direction in TexGen's Abaqus ``.ori`` export.
         Matrix voxels are filled with zero vectors in dense storage.
     orientation_storage : {"dense", "sparse"}
         ``dense`` returns full direction grids. ``sparse`` stores directions
@@ -3302,6 +3612,14 @@ def voxelize_textile_data(textile: CTextile,
     progress : bool or callable
         Show tqdm progress bars over classifier chunks when true. ``tqdm`` is
         imported lazily and is not required unless this is enabled.
+    classification : {"tensor", "exact", "numpy_exact"}
+        ``exact`` calls TexGen's original C++ classifier and reproduces the
+        legacy rectangular voxel mesh without ``.eld/.ori`` files. ``tensor``
+        selects the high-throughput approximate numpy/torch classifier.
+        ``numpy_exact`` reproduces supported TexGen geometry using portable
+        NumPy only and rejects unsupported interpolation/section types.
+    exact_tolerance : float
+        Surface tolerance passed to TexGen when ``classification="exact"``.
 
     Returns
     -------
@@ -3312,9 +3630,56 @@ def voxelize_textile_data(textile: CTextile,
     """
     backend = backend.lower()
     output = output.lower()
+    classification = str(classification).lower()
+    if classification not in {"tensor", "exact", "numpy_exact"}:
+        raise ValueError(
+            'classification must be "tensor", "exact", or "numpy_exact"'
+        )
     orientation_storage = _validate_orientation_storage(orientation_storage)
     if output not in {"backend", "numpy", "torch"}:
         raise ValueError('output must be one of "backend", "numpy", or "torch"')
+
+    if classification == "exact":
+        return voxelize_textile_exact_data(
+            textile,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            backend=backend,
+            device=device,
+            dtype=dtype,
+            workers=workers,
+            verbose=verbose,
+            include_centers=include_centers,
+            include_orientations=include_orientations,
+            orientation_storage=orientation_storage,
+            output=output,
+            tolerance=exact_tolerance,
+        )
+    if classification == "numpy_exact":
+        numpy_exact_chunk = (
+            DEFAULT_NUMPY_EXACT_CHUNK_VOXELS
+            if chunk_voxels == DEFAULT_NUMPY_CHUNK_VOXELS
+            else chunk_voxels
+        )
+        return voxelize_textile_numpy_exact_data(
+            textile,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            backend=backend,
+            device=device,
+            dtype=dtype,
+            chunk_voxels=numpy_exact_chunk,
+            workers=workers,
+            verbose=verbose,
+            include_centers=include_centers,
+            include_orientations=include_orientations,
+            orientation_storage=orientation_storage,
+            output=output,
+            progress=progress,
+            tolerance=exact_tolerance,
+        )
 
     _validate_voxelizer_args(
         nx, ny, nz, backend, dtype, chunk_voxels,
@@ -3686,6 +4051,9 @@ def voxelize_textile(textile: CTextile,
 __all__ = [
     "voxelize_textile",
     "voxelize_textile_data",
+    "voxelize_textile_exact_data",
+    "voxelize_textile_numpy_exact_data",
+    "voxelize_numpy_exact_geometry_data",
     "voxelize_snapshots_data",
     "voxelize_snapshot_bundle_data",
     "extract_snapshots",
@@ -3696,4 +4064,6 @@ __all__ = [
     "AdaptiveVoxelCells",
     "VoxelGridData",
     "VoxelizationCache",
+    "NumpyExactGeometry",
+    "extract_numpy_exact_geometry",
 ]

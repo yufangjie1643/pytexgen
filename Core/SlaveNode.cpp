@@ -19,6 +19,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #include "PrecompiledHeaders.h"
 #include "SlaveNode.h"
+#include <memory>
 using namespace TexGen;
 
 CSlaveNode::CSlaveNode(XYZ Position, XYZ Tangent, XYZ Up)
@@ -28,6 +29,40 @@ CSlaveNode::CSlaveNode(XYZ Position, XYZ Tangent, XYZ Up)
 ,m_2DSectionMesh(NULL)
 ,m_SectionMesh(NULL)
 {
+}
+
+CSlaveNode::CSlaveNode(const CSlaveNode &CopyMe)
+: CNode(CopyMe)
+, m_2DSectionPoints(CopyMe.m_2DSectionPoints)
+, m_SectionPoints(CopyMe.m_SectionPoints)
+, m_2DSectionMesh(
+	CopyMe.m_2DSectionMesh ? new CMesh(*CopyMe.m_2DSectionMesh) : NULL)
+, m_SectionMesh(CopyMe.m_SectionMesh ? new CMesh(*CopyMe.m_SectionMesh) : NULL)
+, m_T(CopyMe.m_T)
+, m_iIndex(CopyMe.m_iIndex)
+{
+}
+
+CSlaveNode &CSlaveNode::operator=(const CSlaveNode &CopyMe)
+{
+	if (this == &CopyMe)
+		return *this;
+
+	std::unique_ptr<CMesh> New2DMesh(
+		CopyMe.m_2DSectionMesh ? new CMesh(*CopyMe.m_2DSectionMesh) : NULL);
+	std::unique_ptr<CMesh> NewSectionMesh(
+		CopyMe.m_SectionMesh ? new CMesh(*CopyMe.m_SectionMesh) : NULL);
+
+	CNode::operator=(CopyMe);
+	m_2DSectionPoints = CopyMe.m_2DSectionPoints;
+	m_SectionPoints = CopyMe.m_SectionPoints;
+	m_T = CopyMe.m_T;
+	m_iIndex = CopyMe.m_iIndex;
+	delete m_2DSectionMesh;
+	delete m_SectionMesh;
+	m_2DSectionMesh = New2DMesh.release();
+	m_SectionMesh = NewSectionMesh.release();
+	return *this;
 }
 
 CSlaveNode::~CSlaveNode(void)
@@ -187,7 +222,6 @@ void CSlaveNode::Translate(XYZ Vector)
 	}
 	m_SectionMesh->Translate(Vector);
 }
-
 
 
 

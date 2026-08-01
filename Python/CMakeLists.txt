@@ -39,7 +39,7 @@ IF(BUILD_PYTHON_INTERFACE)
     # Wheel builds use committed generated files by default so users and CI do
     # not need a system SWIG install.  Set TEXGEN_REGENERATE_SWIG=ON only when
     # Core.i or wrapped C++ APIs change. If Core_wrap.cxx is regenerated, keep
-    # the _fastdata_extract_snapshot_bundle_direct hook near the method table.
+    # the _fastdata_* direct hooks near the method table.
     # ========================================================================
     set(TEXGEN_CORE_SWIG_PY "${CMAKE_CURRENT_SOURCE_DIR}/Core.py")
     set(TEXGEN_CORE_SWIG_CXX "${CMAKE_CURRENT_SOURCE_DIR}/Core_wrap.cxx")
@@ -126,6 +126,8 @@ IF(BUILD_PYTHON_INTERFACE)
     # Link to TexGenCore and Python
     TARGET_LINK_LIBRARIES(_Core TexGenCore)
     TARGET_LINK_LIBRARIES(_Core Python::Module)
+    FIND_PACKAGE(Threads REQUIRED)
+    TARGET_LINK_LIBRARIES(_Core Threads::Threads)
     target_include_directories(_Core PRIVATE "${TEXGEN_NUMPY_INCLUDE_DIR}")
     target_compile_features(_Core PRIVATE cxx_std_11)
 
@@ -157,6 +159,7 @@ IF(BUILD_PYTHON_INTERFACE)
     FILE(GLOB PYTHON_MODULE_FILES Lib/*.py)
     set(PYTEXGEN_GEOMETRY_MODULE_FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/gpu_voxelizer.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/numpy_exact.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/batch.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../TexGen/material_fields.py")
     set(PYTEXGEN_WORKFLOW_EXTENSION_FILES

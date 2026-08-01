@@ -18,9 +18,9 @@ except ImportError:  # pragma: no cover - Python < 3.8 compatibility guard
     _dist_version = None
 
 try:
-    __version__ = _dist_version("pytexgen") if _dist_version else "1.2.0"
+    __version__ = _dist_version("pytexgen") if _dist_version else "1.2.1"
 except _PackageNotFoundError:
-    __version__ = "1.2.0"
+    __version__ = "1.2.1"
 
 _CORE_IMPORT_ERROR = None
 _CORE_AVAILABLE = False

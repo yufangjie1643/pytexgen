@@ -50,8 +50,10 @@ namespace TexGen
 	friend class CTextile;
 	public:
 		CYarn(void);
+		CYarn(const CYarn &CopyMe);
 		CYarn(TiXmlElement &Element);
 		~CYarn(void);
+		CYarn &operator=(const CYarn &CopyMe);
 
 		enum BUILD_TYPE
 		{
@@ -545,5 +547,4 @@ namespace TexGen
 
 
 };	// namespace TexGen
-
 

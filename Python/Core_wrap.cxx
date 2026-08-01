@@ -138236,6 +138236,14 @@ fail:
 /* pytexgen fastdata hook: keep this adjacent to the SWIG method table because
    SWIG_ConvertPtr and SWIGTYPE_p_TexGen__CTextile are wrapper-local symbols. */
 extern "C" PyObject* TexGenCore_ExtractSnapshotBundleDirect(TexGen::CTextile* textile);
+extern "C" PyObject* TexGenCore_VoxelizeExactDirect(
+  TexGen::CTextile* textile,
+  int nx,
+  int ny,
+  int nz,
+  int orientation_storage,
+  int workers,
+  double tolerance);
 
 SWIGINTERN PyObject *_wrap__fastdata_extract_snapshot_bundle_direct(PyObject *self, PyObject *args) {
   TexGen::CTextile *arg1 = (TexGen::CTextile *) 0 ;
@@ -138255,9 +138263,69 @@ fail:
   return NULL;
 }
 
+SWIGINTERN PyObject *_wrap__fastdata_voxelize_exact_direct(PyObject *self, PyObject *args) {
+  TexGen::CTextile *arg1 = (TexGen::CTextile *) 0 ;
+  void *argp1 = 0 ;
+  int res1 = 0 ;
+  long dimensions[3] = {0, 0, 0};
+  long orientation_storage = 0;
+  long workers = 0;
+  double tolerance = 0.0;
+  PyObject *swig_obj[7] ;
+
+  (void)self;
+  if (!SWIG_Python_UnpackTuple(args, "_fastdata_voxelize_exact_direct", 7, 7, swig_obj)) SWIG_fail;
+  res1 = SWIG_ConvertPtr(swig_obj[0], &argp1,SWIGTYPE_p_TexGen__CTextile, 0 |  0 );
+  if (!SWIG_IsOK(res1)) {
+    SWIG_exception_fail(SWIG_ArgError(res1), "in method '" "_fastdata_voxelize_exact_direct" "', argument " "1"" of type '" "TexGen::CTextile *""'");
+  }
+  arg1 = reinterpret_cast< TexGen::CTextile * >(argp1);
+
+  for (int index = 0; index < 3; ++index) {
+    dimensions[index] = PyLong_AsLong(swig_obj[index + 1]);
+    if ((dimensions[index] == -1 && PyErr_Occurred())
+        || dimensions[index] <= 0
+        || dimensions[index] > 2147483647L) {
+      if (!PyErr_Occurred()) {
+        PyErr_SetString(PyExc_ValueError, "voxel dimensions must be positive 32-bit integers");
+      }
+      SWIG_fail;
+    }
+  }
+  orientation_storage = PyLong_AsLong(swig_obj[4]);
+  if (orientation_storage == -1 && PyErr_Occurred()) SWIG_fail;
+  if (orientation_storage < 0 || orientation_storage > 2) {
+    PyErr_SetString(PyExc_ValueError, "orientation storage must be 0, 1, or 2");
+    SWIG_fail;
+  }
+  workers = PyLong_AsLong(swig_obj[5]);
+  if ((workers == -1 && PyErr_Occurred())
+      || workers < 0
+      || workers > 2147483647L) {
+    if (!PyErr_Occurred()) {
+      PyErr_SetString(PyExc_ValueError, "workers must be a non-negative 32-bit integer");
+    }
+    SWIG_fail;
+  }
+  tolerance = PyFloat_AsDouble(swig_obj[6]);
+  if (tolerance == -1.0 && PyErr_Occurred()) SWIG_fail;
+
+  return TexGenCore_VoxelizeExactDirect(
+    arg1,
+    static_cast<int>(dimensions[0]),
+    static_cast<int>(dimensions[1]),
+    static_cast<int>(dimensions[2]),
+    static_cast<int>(orientation_storage),
+    static_cast<int>(workers),
+    tolerance);
+fail:
+  return NULL;
+}
+
 
 static PyMethodDef SwigMethods[] = {
 	 { "_fastdata_extract_snapshot_bundle_direct", _wrap__fastdata_extract_snapshot_bundle_direct, METH_VARARGS, NULL},
+	 { "_fastdata_voxelize_exact_direct", _wrap__fastdata_voxelize_exact_direct, METH_VARARGS, NULL},
 	 { "delete_SwigPyIterator", _wrap_delete_SwigPyIterator, METH_O, NULL},
 	 { "SwigPyIterator_value", _wrap_SwigPyIterator_value, METH_O, NULL},
 	 { "SwigPyIterator_incr", _wrap_SwigPyIterator_incr, METH_VARARGS, NULL},
@@ -142432,4 +142500,3 @@ SWIGINTERN int SWIG_mod_exec(PyObject *m) {
   SWIG_Python_SetConstant(d, "RAVANDI_2021",SWIG_From_int(static_cast< int >(TexGen::RAVANDI_2021)));
   return 0;
 }
-

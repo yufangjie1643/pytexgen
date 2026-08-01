@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "pytexgen"
-version = "1.2.0"
+version = "1.2.1"
 description = "Python bindings for the TexGen textile geometry modeller"
 readme = "README_pypi.md"
 license = {text = "GPL-2.0-or-later"}
@@ -60,7 +60,6 @@ cmake.args = [
     "-DBUILD_DOCUMENTATION=OFF",
     "-DBUILD_PROFILE=OFF",
     "-DBUILD_SHARED=OFF",
-    "-DTEXGEN_ENABLE_OPENMP=OFF",
     "-DTEXGEN_ENABLE_NATIVE_OPTIMIZATIONS=OFF",
     "-DTEXGEN_REGENERATE_SWIG=OFF",
 ]

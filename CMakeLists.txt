@@ -38,7 +38,6 @@ SET(BUILD_CASCADE_EXPORT OFF CACHE BOOL "Build module to export geometry to Open
 SET(BUILD_SHARED OFF CACHE BOOL "Build shared libraries (set OFF for wheel packaging)")
 SET(BUILD_DOCUMENTATION OFF CACHE BOOL "Build documentation using doxygen")
 SET(BUILD_PROFILE OFF CACHE BOOL "Build profiling")
-SET(TEXGEN_ENABLE_OPENMP OFF CACHE BOOL "Enable OpenMP acceleration for C++ point-classification loops")
 SET(TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS OFF CACHE BOOL "Enable architecture-native compiler flags such as -march=native")
 SET(TEXGEN_REGENERATE_SWIG OFF CACHE BOOL "Regenerate Python SWIG wrappers instead of using committed generated files")
 SET(TEXGEN_INSTALL_WORKFLOW_EXTENSIONS OFF CACHE BOOL "Install non-core simulation, solver, mesher, and training workflow modules")
@@ -83,20 +82,6 @@ IF(WIN32)
     SET(REAL_OUTPUT_PATH ${TexGen_BINARY_DIR}/$(OutDir))
 ELSE()
     SET(REAL_OUTPUT_PATH ${TexGen_BINARY_DIR})
-ENDIF()
-
-# ============================================================================
-# OpenMP (optional; Python numpy/torch voxelization is the default acceleration path)
-# ============================================================================
-IF(TEXGEN_ENABLE_OPENMP)
-    FIND_PACKAGE(OpenMP)
-    IF(OpenMP_CXX_FOUND)
-        MESSAGE(STATUS "OpenMP enabled: ${OpenMP_CXX_FLAGS}")
-    ELSE()
-        MESSAGE(WARNING "TEXGEN_ENABLE_OPENMP=ON but OpenMP was not found - build will be single-threaded")
-    ENDIF()
-ELSE()
-    MESSAGE(STATUS "OpenMP disabled (TEXGEN_ENABLE_OPENMP=OFF)")
 ENDIF()
 
 IF(BUILD_GUI)

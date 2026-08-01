@@ -32,6 +32,7 @@ try:
         SnapshotBundle,
         extract_snapshot_bundle,
         voxelize_snapshot_bundle_data,
+        voxelize_textile_data,
     )
 except ImportError:
     from TexGen.Core import DeleteTextile, GetTextiles, ReadFromXML
@@ -39,6 +40,7 @@ except ImportError:
         SnapshotBundle,
         extract_snapshot_bundle,
         voxelize_snapshot_bundle_data,
+        voxelize_textile_data,
     )
 
 
@@ -118,6 +120,7 @@ class BatchVoxelizationReport:
     fields: Tuple[str, ...]
     device: str
     dtype: str
+    classification: str = "tensor"
 
     @property
     def succeeded(self) -> int:
@@ -373,8 +376,8 @@ def load_prepared_geometry(
     return SnapshotBundle(**arrays)
 
 
-def _load_tg3_bundle(path: Path, textile_name: Optional[str]) -> SnapshotBundle:
-    """Load one TG3 textile without deleting unrelated registry entries."""
+def _with_tg3_textile(path: Path, textile_name: Optional[str], operation):
+    """Run an operation on one TG3 textile while safely owning its registry entry."""
     try:
         root = ET.parse(path).getroot()
     except (ET.ParseError, OSError) as error:
@@ -422,20 +425,29 @@ def _load_tg3_bundle(path: Path, textile_name: Optional[str]) -> SnapshotBundle:
                 raise ValueError(
                     f"TexGen did not load textiles {missing} from {path}"
                 )
-            bundle = extract_snapshot_bundle(textiles[selected_name])
-            detached = SnapshotBundle(
-                **{
-                    name: np.array(getattr(bundle, name), copy=True)
-                    for name in _PTGB_ARRAY_NAMES
-                }
-            )
-            setattr(detached, "_textile_name", selected_name)
-            return detached
+            return selected_name, operation(textiles[selected_name])
         finally:
             current_names = set(GetTextiles())
             for loaded_name in file_names:
                 if loaded_name in current_names:
                     DeleteTextile(loaded_name)
+
+
+def _load_tg3_bundle(path: Path, textile_name: Optional[str]) -> SnapshotBundle:
+    """Load one TG3 textile without deleting unrelated registry entries."""
+
+    def detach(textile):
+        bundle = extract_snapshot_bundle(textile)
+        return SnapshotBundle(
+            **{
+                name: np.array(getattr(bundle, name), copy=True)
+                for name in _PTGB_ARRAY_NAMES
+            }
+        )
+
+    selected_name, detached = _with_tg3_textile(path, textile_name, detach)
+    setattr(detached, "_textile_name", selected_name)
+    return detached
 
 
 def prepare_geometry(
@@ -618,6 +630,8 @@ def voxelize_files_batch(
     overwrite: bool = False,
     on_error: str = "raise",
     verify_ptgb: str = "header",
+    classification: str = "tensor",
+    workers: Optional[int] = None,
 ) -> BatchVoxelizationReport:
     """Stream a collection of TG3/PTGB files through the voxelizer.
 
@@ -644,6 +658,13 @@ def voxelize_files_batch(
         raise ValueError('on_error must be "raise" or "collect"')
     if verify_ptgb not in {"header", "checksum"}:
         raise ValueError('verify_ptgb must be "header" or "checksum"')
+    classification = str(classification).lower()
+    if classification not in {"tensor", "exact", "numpy_exact"}:
+        raise ValueError(
+            'classification must be "tensor", "exact", or "numpy_exact"'
+        )
+    if workers is not None and int(workers) < 1:
+        raise ValueError("workers must be >= 1 or None")
     if batch_size == "auto":
         max_in_flight = 2
     else:
@@ -671,6 +692,11 @@ def voxelize_files_batch(
             raise FileNotFoundError(source)
         if source.suffix.lower() not in {".tg3", ".ptgb"}:
             raise ValueError(f"unsupported geometry input {source}")
+        if classification in {"exact", "numpy_exact"} and source.suffix.lower() != ".tg3":
+            raise ValueError(
+                f"classification={classification!r} requires TG3 inputs; PTGB "
+                "v1 stores only the approximate tensor-classifier geometry"
+            )
     names = [source.stem for source in sources]
     if len(set(names)) != len(names):
         raise ValueError("input stems must be unique within one batch")
@@ -728,25 +754,57 @@ def voxelize_files_batch(
             item_started = time.perf_counter()
             try:
                 load_started = time.perf_counter()
-                bundle = _load_geometry_source(source, verify_ptgb)
-                load_seconds = time.perf_counter() - load_started
+                if classification in {"exact", "numpy_exact"}:
+                    def classify_live_textile(textile):
+                        loaded_seconds = time.perf_counter() - load_started
+                        voxel_started = time.perf_counter()
+                        live_data = voxelize_textile_data(
+                            textile,
+                            nx=nx,
+                            ny=ny,
+                            nz=nz,
+                            backend=backend,
+                            device=None if backend == "numpy" else device,
+                            dtype=dtype,
+                            chunk_voxels=chunk_voxels,
+                            workers=workers,
+                            verbose=False,
+                            include_orientations=need_orientation,
+                            orientation_storage="sparse",
+                            output="backend",
+                            classification=classification,
+                        )
+                        return (
+                            live_data,
+                            loaded_seconds,
+                            time.perf_counter() - voxel_started,
+                        )
 
-                voxel_started = time.perf_counter()
-                data = voxelize_snapshot_bundle_data(
-                    bundle,
-                    nx=nx,
-                    ny=ny,
-                    nz=nz,
-                    backend=backend,
-                    device=None if backend == "numpy" else device,
-                    dtype=dtype,
-                    chunk_voxels=chunk_voxels,
-                    verbose=False,
-                    include_orientations=need_orientation,
-                    orientation_storage="sparse",
-                    output="backend",
-                )
-                voxel_seconds = time.perf_counter() - voxel_started
+                    _selected_name, live_result = _with_tg3_textile(
+                        source, None, classify_live_textile
+                    )
+                    data, load_seconds, voxel_seconds = live_result
+                else:
+                    bundle = _load_geometry_source(source, verify_ptgb)
+                    load_seconds = time.perf_counter() - load_started
+
+                    voxel_started = time.perf_counter()
+                    data = voxelize_snapshot_bundle_data(
+                        bundle,
+                        nx=nx,
+                        ny=ny,
+                        nz=nz,
+                        backend=backend,
+                        device=None if backend == "numpy" else device,
+                        dtype=dtype,
+                        chunk_voxels=chunk_voxels,
+                        workers=workers,
+                        verbose=False,
+                        include_orientations=need_orientation,
+                        orientation_storage="sparse",
+                        output="backend",
+                    )
+                    voxel_seconds = time.perf_counter() - voxel_started
                 sparse_orientation = data.sparse_orientation
 
                 material_field = None
@@ -824,6 +882,7 @@ def voxelize_files_batch(
                     "grid_shape_zyx": list(grid_shape),
                     "dtype": dtype,
                     "device": str(device),
+                    "classification": classification,
                     "fields": list(requested_fields),
                     "array_files": {
                         name: f"{name}.npy" for name in arrays
@@ -887,6 +946,7 @@ def voxelize_files_batch(
         fields=requested_fields,
         device=str(device),
         dtype=dtype,
+        classification=classification,
     )
 
 

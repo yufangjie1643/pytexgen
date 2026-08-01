@@ -13,8 +13,10 @@ University of Nottingham. This project keeps the core TexGen modelling API
 available from Python while making the package easier to install, test, and use
 across Windows, Linux, and macOS.
 
-## Version 1.2.0 Highlights
+## Version 1.2.1 Highlights
 
+- Exact direct and batch TG3 voxelization through TexGen's authoritative C++
+  classifier, parallelized with portable C++11 threads and no OpenMP runtime.
 - Direct voxel data handoff with `VoxelGridData.to("numpy" | "torch")`,
   `save_npz(...)`, `load_npz(...)`, `save_npy_dir(...)`, and
   `load_npy_dir(...)`.
@@ -30,7 +32,7 @@ across Windows, Linux, and macOS.
 |---|---|---|
 | Python packaging | `pyproject.toml` + `scikit-build-core` build path | Users can install with normal `pip` workflows instead of hand-driving CMake/SWIG |
 | Stable wheel builds | Pre-generated `Python/Core.py` and `Python/Core_wrap.cxx` | Normal builds do not require a local SWIG install |
-| Cross-platform defaults | GUI, renderer, OpenMP, native CPU flags, and p4est are off by default | Fewer Windows/MSVC/MinGW, OpenMP runtime, and older-CPU build failures |
+| Cross-platform defaults | GUI, renderer, native CPU flags, and p4est are off by default; CPU parallelism uses C++11 threads | Fewer Windows/MSVC/MinGW, runtime, and older-CPU build failures |
 | Python voxel backend | `pytexgen.gpu_voxelizer.voxelize_textile(...)` | OpenMP-free structured voxel output through numpy or torch |
 | Direct solver handoff | `pytexgen.gpu_voxelizer.voxelize_textile_data(...)` | Return numpy arrays or torch tensors without writing/parsing Abaqus files |
 | GPU-ready path | Optional `backend="torch"` with CUDA/MPS/CPU devices | Larger voxel grids can use torch acceleration without changing the TexGen C++ core |
@@ -177,6 +179,56 @@ loaded = VoxelGridData.load_npz("voxel_data.npz")
 mmap_loaded = VoxelGridData.load_npy_dir("voxel_data_npy", mmap_mode="r")
 ```
 
+For reference-compatible production data, select the original TexGen
+classifier without creating `.inp/.eld/.ori` files:
+
+```python
+exact = voxelize_textile_data(
+    textile,
+    nx=128, ny=128, nz=128,
+    classification="exact",
+    workers=8,                    # portable C++ std::thread workers
+    include_orientations=True,
+    orientation_storage="sparse",
+)
+```
+
+`classification="exact"` calls `CTextile.GetPointInformation` on the same
+z-layers and in the same element order as `CRectangularVoxelMesh`. It evaluates
+geometry in C++ double precision, releases the Python GIL, and has no OpenMP
+dependency. `backend="torch", device="cuda"` transfers this exact result to
+CUDA for subsequent stiffness/material operations; classification itself stays
+in the authoritative TexGen CPU core. Use `classification="tensor"` for the
+faster approximate NumPy/Torch classifier.
+
+For an OpenMP-free classifier whose hot loop is pure NumPy, extract an exact
+array snapshot once and reuse it:
+
+```python
+from pytexgen.gpu_voxelizer import (
+    extract_numpy_exact_geometry,
+    voxelize_numpy_exact_geometry_data,
+)
+
+geometry = extract_numpy_exact_geometry(textile)  # one-time TexGen/SWIG step
+data = voxelize_numpy_exact_geometry_data(
+    geometry,
+    nx=128, ny=128, nz=128,
+    workers=4,
+    chunk_voxels=32768,
+    include_orientations=True,
+    orientation_storage="sparse",
+)
+```
+
+The equivalent one-call form is
+`voxelize_textile_data(..., classification="numpy_exact")`. Classification
+uses only NumPy and Python standard-library threads; SciPy is not required.
+Bezier, cubic, and linear centre lines plus constant, node-interpolated
+(including mid-node), or position-interpolated sections are reproduced.
+Adjusted centre lines currently raise `NotImplementedError` instead of falling
+back to an approximation.
+
 Use `.npz` for a compact single-file artifact. Use `save_npy_dir(...)` when
 large training runs should avoid zip decompression overhead or memory-map
 individual arrays such as `yarn_id`, `orientation1`, and `orientation2`.
@@ -193,7 +245,7 @@ data = voxelize_textile_data(
 )
 
 orientation1 = data.orientation1  # yarn tangent, shape: (nz, ny, nx, 3)
-orientation2 = data.orientation2  # yarn up vector, shape: (nz, ny, nx, 3)
+orientation2 = data.orientation2  # TexGen secondary material axis, shape: (nz, ny, nx, 3)
 ```
 
 Build a sparse, fully GPU-resident material direction and stiffness field in
@@ -215,6 +267,7 @@ data, stiffness = voxelize_textile_material_fields(
     textile,
     nx=128, ny=128, nz=128,
     backend="torch", device="cuda", output="backend",
+    classification="exact",
     matrix_stiffness=matrix_c21,
     default_yarn_stiffness=yarn_c21,
     yarn_stiffness_by_id={3: 1.1 * yarn_c21},
@@ -268,6 +321,11 @@ for voxelization; it is not a replacement for an editable TG3 model. See the
 work is streamed one geometry at a time while bounded background writers
 overlap the result transfer and disk output.
 
+For TexGen-reference output, pass only original `.tg3` inputs together with
+`classification="exact"` or `classification="numpy_exact"`. PTGB v1 intentionally
+stores lossy flattened geometry for the faster tensor classifier and therefore
+cannot be used by either exact mode.
+
 Use torch when an accelerator is available:
 
 ```python
@@ -307,6 +365,8 @@ those guarantees.
 | Path | Entry point | Dependencies | Best use |
 |---|---|---|---|
 | TexGen C++ structured voxels | `CRectangularVoxelMesh.SaveVoxelMesh(...)` | bundled TexGen core | Reference-compatible structured output |
+| Exact direct data | `voxelize_textile_data(..., classification="exact")` | bundled TexGen core | Reference-compatible NumPy/Torch data without text files or OpenMP |
+| NumPy exact data | `voxelize_textile_data(..., classification="numpy_exact")` | NumPy | Portable compatible classifier with reusable array geometry |
 | Python numpy backend | `voxelize_textile(..., backend="numpy")` | `numpy` | Portable CPU voxelization without OpenMP |
 | Python torch backend | `voxelize_textile(..., backend="torch")` | `torch` | CUDA/MPS/torch CPU acceleration for larger grids |
 | Direct solver data | `voxelize_textile_data(...)` | `numpy`, optional `torch` | Structured arrays/tensors without `.inp` file round trip |
@@ -349,7 +409,7 @@ Intentional differences in the default pip/wheel build:
 - `COctreeVoxelMesh` is not exposed by default because it depends on p4est/sc.
 - The GUI, renderer, cascade export, examples, and documentation targets are not
   part of the core Python wheel.
-- OpenMP and architecture-native compiler flags are opt-in rather than default.
+- CPU voxel parallelism uses the C++11 standard thread library; architecture-native compiler flags remain opt-in.
 - SWIG regeneration is opt-in; generated wrappers are committed for normal
   installs.
 
@@ -397,7 +457,6 @@ Useful CMake options:
 | `BUILD_RENDERER` | `OFF` | Build the OpenGL renderer |
 | `BUILD_GUI` | `OFF` | Build the wxWidgets GUI |
 | `BUILD_SHARED` | `OFF` | Build shared libraries instead of static wheel libraries |
-| `TEXGEN_ENABLE_OPENMP` | `OFF` | Enable optional C++ OpenMP loops |
 | `TEXGEN_ENABLE_NATIVE_OPTIMIZATIONS` | `OFF` | Enable local CPU flags such as `-march=native` |
 | `TEXGEN_REGENERATE_SWIG` | `OFF` | Regenerate `Core.py` and `Core_wrap.cxx` from `Python/Core.i` |
 | `TEXGEN_INSTALL_WORKFLOW_EXTENSIONS` | `OFF` | Install source-only solver, training, and experimental mesher modules |
@@ -411,7 +470,7 @@ focused on textile geometry, meshing, voxelization, and material fields.
 The release bundle includes a single-file source installer for CPython 3.9+:
 
 ```bash
-python pytexgen-1.2.0-installer.pyz
+python pytexgen-1.2.1-installer.pyz
 ```
 
 It creates `./.pytexgen-venv`, installs the Python build dependencies plus

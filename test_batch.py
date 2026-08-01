@@ -245,6 +245,100 @@ class PreparedGeometryTest(unittest.TestCase):
             self.assertEqual(loaded.sections.shape[1], 2)
             self.assertEqual(set(tg.GetTextiles()), {resident_name})
 
+    def test_exact_tg3_batch_matches_direct_texgen_classifier(self):
+        import pytexgen as tg
+        from pytexgen.gpu_voxelizer import voxelize_textile_data
+
+        tg.DeleteTextiles()
+        self.addCleanup(tg.DeleteTextiles)
+        textile = tg.CTextileWeave2D(2, 2, 1.0, 0.2, True)
+        textile.SetYarnWidths(0.8)
+        textile.SetYarnHeights(0.1)
+        textile.AssignDefaultDomain()
+
+        resolution = (8, 6, 4)
+        expected = voxelize_textile_data(
+            textile,
+            *resolution,
+            classification="exact",
+            workers=1,
+            verbose=False,
+        ).grid.copy()
+        name = tg.AddTextile(textile)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "exact.tg3"
+            output = root / "outputs"
+            tg.SaveToXML(str(source), name, tg.OUTPUT_STANDARD)
+            tg.DeleteTextile(name)
+
+            report = self.batch.voxelize_files_batch(
+                [source],
+                resolution=resolution,
+                output_dir=output,
+                fields=("yarn_id", "orientation"),
+                device="cpu",
+                dtype="float64",
+                classification="exact",
+                workers=4,
+            )
+
+            self.assertEqual(report.succeeded, 1)
+            self.assertEqual(report.classification, "exact")
+            actual = np.load(output / "exact" / "yarn_id.npy")
+            np.testing.assert_array_equal(actual, expected)
+            metadata = json.loads(
+                (output / "exact" / "metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(metadata["classification"], "exact")
+
+            numpy_exact_output = root / "numpy_exact_outputs"
+            numpy_exact_report = self.batch.voxelize_files_batch(
+                [source],
+                resolution=resolution,
+                output_dir=numpy_exact_output,
+                fields=("yarn_id", "orientation"),
+                device="cpu",
+                dtype="float64",
+                classification="numpy_exact",
+                workers=2,
+                chunk_voxels=73,
+            )
+            self.assertEqual(numpy_exact_report.succeeded, 1)
+            self.assertEqual(
+                numpy_exact_report.classification, "numpy_exact"
+            )
+            np.testing.assert_array_equal(
+                np.load(numpy_exact_output / "exact" / "yarn_id.npy"),
+                expected,
+            )
+
+            prepared = root / "exact.ptgb"
+            self.batch.save_prepared_geometry(
+                synthetic_bundle(self.batch), prepared
+            )
+            with self.assertRaisesRegex(ValueError, "requires TG3"):
+                self.batch.voxelize_files_batch(
+                    [prepared],
+                    resolution=resolution,
+                    output_dir=root / "rejected",
+                    fields=("yarn_id",),
+                    device="cpu",
+                    classification="exact",
+                )
+            with self.assertRaisesRegex(ValueError, "requires TG3"):
+                self.batch.voxelize_files_batch(
+                    [prepared],
+                    resolution=resolution,
+                    output_dir=root / "numpy_exact_rejected",
+                    fields=("yarn_id",),
+                    device="cpu",
+                    classification="numpy_exact",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,11 +8,17 @@
 #include "../Core/TexGen.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -58,6 +64,41 @@ struct FlatBundle {
     std::vector<double> translations;
     std::vector<long long> translation_offsets{0};
     std::vector<double> aabb;
+};
+
+enum ExactOrientationStorage {
+    EXACT_ORIENTATION_NONE = 0,
+    EXACT_ORIENTATION_DENSE = 1,
+    EXACT_ORIENTATION_SPARSE = 2,
+};
+
+struct ExactVoxelData {
+    std::vector<int> yarn_id;
+    std::vector<long long> voxel_indices;
+    std::vector<int> orientation_yarn_ids;
+    std::vector<double> orientation1;
+    std::vector<double> orientation2;
+    std::vector<double> aabb;
+    int workers = 1;
+};
+
+class AllowThreads {
+public:
+    AllowThreads() : state_(PyEval_SaveThread()) {}
+    ~AllowThreads() { PyEval_RestoreThread(state_); }
+
+    AllowThreads(const AllowThreads&) = delete;
+    AllowThreads& operator=(const AllowThreads&) = delete;
+
+private:
+    PyThreadState* state_;
+};
+
+struct ExactLayerOrientationData {
+    std::vector<long long> voxel_indices;
+    std::vector<int> yarn_ids;
+    std::vector<double> orientation1;
+    std::vector<double> orientation2;
 };
 
 double norm3(double x, double y, double z) {
@@ -273,6 +314,10 @@ bool dict_set_steal(PyObject* dict, const char* key, PyObject* value) {
     return status == 0;
 }
 
+bool dict_set_long(PyObject* dict, const char* key, long value) {
+    return dict_set_steal(dict, key, PyLong_FromLong(value));
+}
+
 PyObject* bundle_to_dict(const FlatBundle& bundle) {
     static_assert(sizeof(long long) == 8, "offset arrays require int64 storage");
 
@@ -315,6 +360,329 @@ PyObject* bundle_to_dict(const FlatBundle& bundle) {
     return dict.release();
 }
 
+void validate_exact_voxel_args(int nx,
+                               int ny,
+                               int nz,
+                               int orientation_storage,
+                               int workers,
+                               double tolerance) {
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+        throw std::invalid_argument("voxel dimensions must be positive");
+    }
+    if (orientation_storage < EXACT_ORIENTATION_NONE
+        || orientation_storage > EXACT_ORIENTATION_SPARSE) {
+        throw std::invalid_argument(
+            "orientation storage must be 0 (none), 1 (dense), or 2 (sparse)");
+    }
+    if (workers < 0) {
+        throw std::invalid_argument("workers must be non-negative");
+    }
+    if (!std::isfinite(tolerance) || tolerance < 0.0) {
+        throw std::invalid_argument("tolerance must be finite and non-negative");
+    }
+
+    const std::size_t x = static_cast<std::size_t>(nx);
+    const std::size_t y = static_cast<std::size_t>(ny);
+    const std::size_t z = static_cast<std::size_t>(nz);
+    const std::size_t max_size = std::numeric_limits<std::size_t>::max();
+    if (x > max_size / y || x * y > max_size / z) {
+        throw std::overflow_error("voxel dimensions overflow addressable memory");
+    }
+    const std::size_t total = x * y * z;
+    if (total > static_cast<std::size_t>(
+                    std::numeric_limits<npy_intp>::max())
+        || total > static_cast<std::size_t>(
+                       std::numeric_limits<long long>::max())) {
+        throw std::overflow_error("voxel count exceeds supported array indexing");
+    }
+    if (orientation_storage != EXACT_ORIENTATION_NONE
+        && total > max_size / 3) {
+        throw std::overflow_error("orientation array size overflows addressable memory");
+    }
+}
+
+ExactVoxelData voxelize_exact(TexGen::CTextile& textile,
+                              int nx,
+                              int ny,
+                              int nz,
+                              int orientation_storage,
+                              int workers,
+                              double tolerance) {
+    validate_exact_voxel_args(
+        nx, ny, nz, orientation_storage, workers, tolerance);
+
+    TexGen::CDomain* domain = textile.GetDomain();
+    if (!domain) {
+        throw std::invalid_argument("textile has no assigned domain");
+    }
+
+    const std::pair<TexGen::XYZ, TexGen::XYZ> bounds =
+        domain->GetMesh().GetAABB();
+    const TexGen::XYZ lo = bounds.first;
+    const TexGen::XYZ hi = bounds.second;
+    const TexGen::XYZ spacing(
+        (hi.x - lo.x) / static_cast<double>(nx),
+        (hi.y - lo.y) / static_cast<double>(ny),
+        (hi.z - lo.z) / static_cast<double>(nz));
+    if (!(spacing.x > 0.0) || !(spacing.y > 0.0) || !(spacing.z > 0.0)
+        || !std::isfinite(spacing.x) || !std::isfinite(spacing.y)
+        || !std::isfinite(spacing.z)) {
+        throw std::invalid_argument("textile domain must have finite positive extents");
+    }
+
+    const std::size_t layer_size =
+        static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny);
+    const std::size_t total = layer_size * static_cast<std::size_t>(nz);
+
+    ExactVoxelData output;
+    output.yarn_id.assign(total, -1);
+    output.aabb = {lo.x, lo.y, lo.z, hi.x, hi.y, hi.z};
+    if (orientation_storage == EXACT_ORIENTATION_DENSE) {
+        output.orientation1.assign(total * 3, 0.0);
+        output.orientation2.assign(total * 3, 0.0);
+    }
+
+    unsigned int default_workers = std::thread::hardware_concurrency();
+    if (default_workers == 0) {
+        default_workers = 1;
+    }
+    const unsigned int automatic_worker_limit = 8;
+    const int configured_workers = workers > 0
+        ? workers
+        : static_cast<int>(std::min<unsigned int>(
+              std::min(default_workers, automatic_worker_limit),
+              static_cast<unsigned int>(std::numeric_limits<int>::max())));
+    const int actual_workers = std::max(1, std::min(configured_workers, nz));
+    output.workers = actual_workers;
+
+    // Complete lazy geometry construction once. Copies retain the exact
+    // double-precision caches but own their slave-node mesh allocations.
+    std::vector<TexGen::XYZ> warmup_points(
+        1, TexGen::XYZ(
+            lo.x + 0.5 * spacing.x,
+            lo.y + 0.5 * spacing.y,
+            lo.z + 0.5 * spacing.z));
+    std::vector<TexGen::POINT_INFO> warmup_information;
+    textile.GetPointInformation(warmup_points, warmup_information, tolerance);
+
+    // TexGen caches section/interpolation data inside nominally const point
+    // queries. Never share a CTextile across workers: each worker owns an
+    // exact in-memory copy with independent mutable caches. Worker zero uses
+    // the caller's textile; the remaining workers use virtual deep copies.
+    std::vector<std::unique_ptr<TexGen::CTextile> > worker_textiles;
+    worker_textiles.reserve(static_cast<std::size_t>(actual_workers - 1));
+    for (int index = 1; index < actual_workers; ++index) {
+        std::unique_ptr<TexGen::CTextile> copy(textile.Copy());
+        if (!copy) {
+            throw std::runtime_error("TexGen failed to copy textile for worker");
+        }
+        worker_textiles.push_back(std::move(copy));
+    }
+
+    std::vector<ExactLayerOrientationData> sparse_layers;
+    if (orientation_storage == EXACT_ORIENTATION_SPARSE) {
+        sparse_layers.resize(static_cast<std::size_t>(nz));
+    }
+
+    std::atomic<int> next_layer(0);
+    std::atomic<bool> stop(false);
+    std::mutex failure_mutex;
+    std::exception_ptr failure;
+
+    const auto process_layer = [&](TexGen::CTextile& worker_textile,
+                                   int z,
+                                   std::vector<TexGen::XYZ>& centers,
+                                   std::vector<TexGen::POINT_INFO>& information) {
+        const double center_z =
+            lo.z + spacing.z * static_cast<double>(z) + 0.5 * spacing.z;
+        for (int y = 0; y < ny; ++y) {
+            const double center_y =
+                lo.y + spacing.y * static_cast<double>(y) + 0.5 * spacing.y;
+            for (int x = 0; x < nx; ++x) {
+                const double center_x =
+                    lo.x + spacing.x * static_cast<double>(x) + 0.5 * spacing.x;
+                centers[static_cast<std::size_t>(x)
+                        + static_cast<std::size_t>(y) * static_cast<std::size_t>(nx)] =
+                    TexGen::XYZ(center_x, center_y, center_z);
+            }
+        }
+
+        information.clear();
+        worker_textile.GetPointInformation(centers, information, tolerance);
+        if (information.size() != layer_size) {
+            throw std::runtime_error(
+                "TexGen GetPointInformation returned an unexpected result size");
+        }
+
+        const std::size_t layer_start = static_cast<std::size_t>(z) * layer_size;
+        ExactLayerOrientationData* sparse =
+            orientation_storage == EXACT_ORIENTATION_SPARSE
+            ? &sparse_layers[static_cast<std::size_t>(z)]
+            : nullptr;
+        for (std::size_t local = 0; local < layer_size; ++local) {
+            const TexGen::POINT_INFO& info = information[local];
+            const std::size_t flat = layer_start + local;
+            output.yarn_id[flat] = info.iYarnIndex;
+            if (info.iYarnIndex < 0 || orientation_storage == EXACT_ORIENTATION_NONE) {
+                continue;
+            }
+
+            if (orientation_storage == EXACT_ORIENTATION_DENSE) {
+                const std::size_t base = flat * 3;
+                const TexGen::XYZ secondary = normalized(
+                    cross(info.Orientation, info.Up));
+                output.orientation1[base] = info.Orientation.x;
+                output.orientation1[base + 1] = info.Orientation.y;
+                output.orientation1[base + 2] = info.Orientation.z;
+                output.orientation2[base] = secondary.x;
+                output.orientation2[base + 1] = secondary.y;
+                output.orientation2[base + 2] = secondary.z;
+            } else {
+                sparse->voxel_indices.push_back(static_cast<long long>(flat));
+                sparse->yarn_ids.push_back(info.iYarnIndex);
+                append_vec3(sparse->orientation1, info.Orientation);
+                append_vec3(
+                    sparse->orientation2,
+                    normalized(cross(info.Orientation, info.Up)));
+            }
+        }
+    };
+
+    const auto worker_loop = [&](int worker_index) {
+        try {
+            TexGen::CTextile& worker_textile = worker_index == 0
+                ? textile
+                : *worker_textiles[static_cast<std::size_t>(worker_index - 1)];
+            std::vector<TexGen::XYZ> centers(layer_size);
+            std::vector<TexGen::POINT_INFO> information;
+            while (!stop.load(std::memory_order_relaxed)) {
+                const int z = next_layer.fetch_add(1, std::memory_order_relaxed);
+                if (z >= nz) {
+                    break;
+                }
+                process_layer(worker_textile, z, centers, information);
+            }
+        } catch (...) {
+            stop.store(true, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(failure_mutex);
+            if (!failure) {
+                failure = std::current_exception();
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(actual_workers - 1));
+    try {
+        for (int index = 1; index < actual_workers; ++index) {
+            threads.emplace_back(worker_loop, index);
+        }
+    } catch (...) {
+        stop.store(true, std::memory_order_relaxed);
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        throw;
+    }
+    worker_loop(0);
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
+
+    if (orientation_storage == EXACT_ORIENTATION_SPARSE) {
+        std::size_t occupied = 0;
+        for (const ExactLayerOrientationData& layer : sparse_layers) {
+            occupied += layer.voxel_indices.size();
+        }
+        output.voxel_indices.reserve(occupied);
+        output.orientation_yarn_ids.reserve(occupied);
+        output.orientation1.reserve(occupied * 3);
+        output.orientation2.reserve(occupied * 3);
+        for (ExactLayerOrientationData& layer : sparse_layers) {
+            output.voxel_indices.insert(
+                output.voxel_indices.end(),
+                layer.voxel_indices.begin(),
+                layer.voxel_indices.end());
+            output.orientation_yarn_ids.insert(
+                output.orientation_yarn_ids.end(),
+                layer.yarn_ids.begin(),
+                layer.yarn_ids.end());
+            output.orientation1.insert(
+                output.orientation1.end(),
+                layer.orientation1.begin(),
+                layer.orientation1.end());
+            output.orientation2.insert(
+                output.orientation2.end(),
+                layer.orientation2.begin(),
+                layer.orientation2.end());
+        }
+    }
+    return output;
+}
+
+PyObject* exact_voxel_data_to_dict(const ExactVoxelData& data,
+                                   int nx,
+                                   int ny,
+                                   int nz,
+                                   int orientation_storage) {
+    static_assert(sizeof(int) == 4, "exact yarn ids require 32-bit int storage");
+    static_assert(sizeof(long long) == 8, "exact voxel indices require int64 storage");
+
+    PyRef dict(PyDict_New());
+    if (!dict) {
+        return nullptr;
+    }
+    const Py_ssize_t total = static_cast<Py_ssize_t>(data.yarn_id.size());
+    if (!dict_set_steal(
+            dict.get(), "yarn_id",
+            array_from_vector(data.yarn_id, NPY_INT32, total, 0))
+        || !dict_set_steal(
+            dict.get(), "aabb",
+            array_from_vector(data.aabb, NPY_DOUBLE, 2, 3))
+        || !dict_set_long(dict.get(), "nx", nx)
+        || !dict_set_long(dict.get(), "ny", ny)
+        || !dict_set_long(dict.get(), "nz", nz)) {
+        return nullptr;
+    }
+
+    if (orientation_storage == EXACT_ORIENTATION_DENSE) {
+        if (!dict_set_steal(
+                dict.get(), "orientation1",
+                array_from_vector(data.orientation1, NPY_DOUBLE, total, 3))
+            || !dict_set_steal(
+                dict.get(), "orientation2",
+                array_from_vector(data.orientation2, NPY_DOUBLE, total, 3))) {
+            return nullptr;
+        }
+    } else if (orientation_storage == EXACT_ORIENTATION_SPARSE) {
+        const Py_ssize_t occupied =
+            static_cast<Py_ssize_t>(data.voxel_indices.size());
+        if (!dict_set_steal(
+                dict.get(), "voxel_indices",
+                array_from_vector(data.voxel_indices, NPY_INT64, occupied, 0))
+            || !dict_set_steal(
+                dict.get(), "orientation_yarn_ids",
+                array_from_vector(
+                    data.orientation_yarn_ids, NPY_INT32, occupied, 0))
+            || !dict_set_steal(
+                dict.get(), "orientation1",
+                array_from_vector(data.orientation1, NPY_DOUBLE, occupied, 3))
+            || !dict_set_steal(
+                dict.get(), "orientation2",
+                array_from_vector(data.orientation2, NPY_DOUBLE, occupied, 3))) {
+            return nullptr;
+        }
+    }
+
+    if (!dict_set_long(dict.get(), "workers", data.workers)) {
+        return nullptr;
+    }
+    return dict.release();
+}
+
 }  // namespace
 
 extern "C" PyObject* TexGenCore_ExtractSnapshotBundleDirect(TexGen::CTextile* textile) {
@@ -343,6 +711,40 @@ extern "C" PyObject* TexGenCore_ExtractSnapshotBundleDirect(TexGen::CTextile* te
         }
         append_domain_aabb(*domain, bundle);
         return bundle_to_dict(bundle);
+    } catch (const std::exception& exc) {
+        PyErr_SetString(PyExc_RuntimeError, exc.what());
+        return nullptr;
+    }
+}
+
+extern "C" PyObject* TexGenCore_VoxelizeExactDirect(
+    TexGen::CTextile* textile,
+    int nx,
+    int ny,
+    int nz,
+    int orientation_storage,
+    int workers,
+    double tolerance) {
+    if (!textile) {
+        PyErr_SetString(PyExc_TypeError, "expected a non-null CTextile pointer");
+        return nullptr;
+    }
+    if (!ensure_numpy_api()) {
+        return nullptr;
+    }
+
+    try {
+        ExactVoxelData data;
+        {
+            AllowThreads allow_threads;
+            data = voxelize_exact(
+                *textile, nx, ny, nz, orientation_storage, workers, tolerance);
+        }
+        return exact_voxel_data_to_dict(
+            data, nx, ny, nz, orientation_storage);
+    } catch (const std::bad_alloc&) {
+        PyErr_NoMemory();
+        return nullptr;
     } catch (const std::exception& exc) {
         PyErr_SetString(PyExc_RuntimeError, exc.what());
         return nullptr;

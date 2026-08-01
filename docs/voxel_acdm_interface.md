@@ -177,7 +177,7 @@ data.shape      = (Nz, Ny, Nx)
 data.voxel_size = (dx, dy, dz)
 data.grid       = (Nz, Ny, Nx)
 data.orientation1 = (Nz, Ny, Nx, 3)  # optional yarn tangent
-data.orientation2 = (Nz, Ny, Nx, 3)  # optional yarn up vector
+data.orientation2 = (Nz, Ny, Nx, 3)  # optional TexGen secondary material axis
 ```
 
 因此适配层只做布局确认和 phase id 映射，不需要重新排列体素顺序。

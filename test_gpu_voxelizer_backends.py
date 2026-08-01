@@ -207,7 +207,7 @@ class VoxelizerBackendTest(unittest.TestCase):
         )
         np.testing.assert_allclose(
             data.orientation2[yarn_mask],
-            np.broadcast_to([0.0, 0.0, 1.0], data.orientation2[yarn_mask].shape),
+            np.broadcast_to([0.0, -1.0, 0.0], data.orientation2[yarn_mask].shape),
         )
         np.testing.assert_allclose(
             data.orientation1[~yarn_mask],
@@ -325,7 +325,7 @@ class VoxelizerBackendTest(unittest.TestCase):
             [1.0, 0.0, 0.0], dtype=data.orientation1.dtype
         )
         expected2 = self.voxelizer.torch.tensor(
-            [0.0, 0.0, 1.0], dtype=data.orientation2.dtype
+            [0.0, -1.0, 0.0], dtype=data.orientation2.dtype
         )
         self.voxelizer.torch.testing.assert_close(
             data.orientation1[yarn_mask],

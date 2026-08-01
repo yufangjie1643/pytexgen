@@ -59,11 +59,6 @@ endif()
 TARGET_LINK_LIBRARIES(TexGenCore triangle triangle-api Octree TinyXML CSparse tetgenlib)
 TARGET_COMPILE_DEFINITIONS(TexGenCore PUBLIC STATIC_BUILD)
 
-# Link OpenMP only when explicitly enabled.
-IF(TEXGEN_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
-    TARGET_LINK_LIBRARIES(TexGenCore OpenMP::OpenMP_CXX)
-ENDIF()
-
 # ============================================================================
 # p4est/sc support - enables COctreeVoxelMesh
 #

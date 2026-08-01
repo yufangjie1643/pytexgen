@@ -9,6 +9,8 @@ geometry preparation, material-field construction, and batch export.
 | Path | Entry point | Best use |
 | --- | --- | --- |
 | TexGen C++ | `CRectangularVoxelMesh.SaveVoxelMesh(...)` | Reference-compatible Abaqus output |
+| Exact direct | `voxelize_textile_data(..., classification="exact")` | Reference-compatible arrays without text files |
+| NumPy exact | `voxelize_textile_data(..., classification="numpy_exact")` | Portable compatible classification with reusable array geometry |
 | NumPy | `voxelize_textile_data(..., backend="numpy")` | Portable CPU arrays |
 | Torch | `voxelize_textile_data(..., backend="torch")` | CUDA, MPS, or Torch CPU arrays |
 | Adaptive NumPy | `voxelize_textile(..., adaptive=True)` | Exploratory non-uniform C3D8R meshes |
@@ -28,12 +30,44 @@ data = voxelize_textile_data(
     nz=64,
     backend="numpy",
     workers=4,
+    chunk_voxels=32768,
     output="numpy",
 )
 
 yarn_ids = data.grid
 material_ids = data.material_id()
 ```
+
+Set `classification="exact"` when output must reproduce TexGen's original
+rectangular voxel classifier. This mode evaluates the same z-layers through
+`CTextile.GetPointInformation`, uses portable C++ standard threads, and does
+not require OpenMP. The default `classification="tensor"` mode is an
+approximation designed for accelerator throughput.
+
+The portable compatibility path separates extraction from classification:
+
+```python
+from pytexgen.gpu_voxelizer import (
+    extract_numpy_exact_geometry,
+    voxelize_numpy_exact_geometry_data,
+)
+
+geometry = extract_numpy_exact_geometry(textile)
+data = voxelize_numpy_exact_geometry_data(
+    geometry,
+    nx=128,
+    ny=128,
+    nz=64,
+    workers=4,
+    include_orientations=True,
+    orientation_storage="sparse",
+)
+```
+
+After the one-time TexGen/SWIG extraction, the geometry snapshot contains only
+NumPy arrays and classification calls no native TexGen method. SciPy is not a
+dependency. Supported interpolation and section semantics are validated at
+extraction; unsupported geometry raises `NotImplementedError`.
 
 Structured arrays use `(Nz, Ny, Nx, ...)` shapes. Flat voxel order is:
 
@@ -55,6 +89,7 @@ data = voxelize_textile_data(
     backend="torch",
     device="cuda",
     output="backend",
+    classification="exact",
 )
 ```
 
@@ -140,10 +175,29 @@ One directory is written per source, using uncompressed `.npy` arrays and a
 bounded background writers overlap disk output with subsequent work. See
 [PTGB v1](ptgb_v1.md) for the byte-level cache format.
 
+For reference-compatible production output, batch the original TG3 files:
+
+```python
+report = voxelize_files_batch(
+    ["plain.tg3", "twill.tg3"],
+    resolution=(128, 128, 128),
+    output_dir="exact_voxel_output",
+    fields=("material_id", "orientation", "stiffness_c21"),
+    materials=materials,
+    classification="numpy_exact",
+    workers=4,
+    device="cuda",
+)
+```
+
+Both `exact` and `numpy_exact` classification require `.tg3` input because PTGB v1 contains the
+flattened, lossy geometry intended for the approximate tensor classifier.
+
 ## Performance Controls
 
 - `chunk_voxels` bounds the center-classification working set.
-- `workers` controls NumPy chunk workers and is clamped to available chunks.
+- `workers` controls NumPy chunks or exact C++ standard-thread workers and is
+  clamped to available work.
 - `aabb_pruning=True` skips yarn translations that cannot intersect a chunk.
 - `orientation_storage="sparse"` avoids dense matrix-voxel directions.
 - `batch_size` bounds pending output writes rather than stacking unrelated

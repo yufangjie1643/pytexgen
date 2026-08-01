@@ -37,6 +37,50 @@ CYarn::CYarn(void)
 	AssignDefaults();
 }
 
+CYarn::CYarn(const CYarn &CopyMe)
+: CPropertiesYarn(CopyMe)
+, m_MasterNodes(CopyMe.m_MasterNodes)
+, m_pInterpolation(CopyMe.m_pInterpolation)
+, m_pYarnSection(CopyMe.m_pYarnSection)
+, m_pFibreDistribution(CopyMe.m_pFibreDistribution)
+, m_Repeats(CopyMe.m_Repeats)
+, m_iNumSlaveNodes(CopyMe.m_iNumSlaveNodes)
+, m_iNumSectionPoints(CopyMe.m_iNumSectionPoints)
+, m_bEquiSpacedSectionMesh(CopyMe.m_bEquiSpacedSectionMesh)
+, m_iNeedsBuilding(CopyMe.m_iNeedsBuilding)
+, m_SlaveNodes(CopyMe.m_SlaveNodes)
+, m_AABB(CopyMe.m_AABB)
+, m_SectionAABBs(CopyMe.m_SectionAABBs)
+, m_SectionLengths(CopyMe.m_SectionLengths)
+{
+	// CSlaveNode deep-copies its owning meshes, so all mutable geometry caches
+	// are independent from the source yarn.
+}
+
+CYarn &CYarn::operator=(const CYarn &CopyMe)
+{
+	if (this == &CopyMe)
+		return *this;
+
+	CPropertiesYarn::operator=(CopyMe);
+	m_MasterNodes = CopyMe.m_MasterNodes;
+	m_pInterpolation = CopyMe.m_pInterpolation;
+	m_pYarnSection = CopyMe.m_pYarnSection;
+	m_pFibreDistribution = CopyMe.m_pFibreDistribution;
+	m_Repeats = CopyMe.m_Repeats;
+	m_iNumSlaveNodes = CopyMe.m_iNumSlaveNodes;
+	m_iNumSectionPoints = CopyMe.m_iNumSectionPoints;
+	m_bEquiSpacedSectionMesh = CopyMe.m_bEquiSpacedSectionMesh;
+
+	m_iNeedsBuilding = CopyMe.m_iNeedsBuilding;
+	m_SlaveNodes = CopyMe.m_SlaveNodes;
+	m_AABB = CopyMe.m_AABB;
+	m_SectionAABBs = CopyMe.m_SectionAABBs;
+	m_SectionLengths = CopyMe.m_SectionLengths;
+	m_pParent = static_cast<const CTextile*>(NULL);
+	return *this;
+}
+
 CYarn::~CYarn(void)
 {
 }
@@ -1353,8 +1397,8 @@ bool CYarn::PointInsideYarn(const XYZ &Point, XYZ *pTangent, XY *pLoc, double* p
 	CSlaveNode N;
 	double u;
 	// BuildYarnIfNeeded(SURFACE) has already initialised interpolation caches.
-	// Reinitialising here mutates shared interpolation state and is unsafe when
-	// PointInsideYarn is called from OpenMP point loops.
+	// Reinitialising here mutates interpolation state and is unsafe when point
+	// queries run concurrently.
 
 	YARN_POSITION_INFORMATION YarnPositionInfo;
 	YarnPositionInfo.SectionLengths = m_SectionLengths;
@@ -1998,8 +2042,5 @@ bool CYarn::ConvertToInterpNodes()
 	AssignSection( NewYarnSection );
 	return true;
 }
-
-
-
 
 
